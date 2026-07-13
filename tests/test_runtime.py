@@ -8,11 +8,37 @@ from pathlib import Path
 
 import pytest
 
+from agent.context import ContextBuildRequest, ContextBuilder, ContextPackage
 from agent.deepseek import ChatResponse
 from agent.memory import MemoryStore
 from agent.project import ProjectManager
+from agent.prompt import PromptBuilder
 from agent.runtime import AgentRuntime
 from agent.tools import ToolManager
+
+
+class RecordingContextBuilder(ContextBuilder):
+    def __init__(self, config) -> None:
+        super().__init__(config)
+        self.packages: list[ContextPackage] = []
+
+    def build_package(self, request: ContextBuildRequest) -> ContextPackage:
+        package = super().build_package(request)
+        self.packages.append(package)
+        return package
+
+
+class RecordingPromptBuilder(PromptBuilder):
+    def __init__(self) -> None:
+        self.packages: list[ContextPackage] = []
+
+    def build_initial(self, package: ContextPackage) -> list[dict[str, object]]:
+        self.packages.append(package)
+        return super().build_initial(package)
+
+    def build_resume(self, package: ContextPackage) -> list[dict[str, object]]:
+        self.packages.append(package)
+        return super().build_resume(package)
 
 
 class FakeClient:
@@ -65,6 +91,37 @@ class RecordingClient(FakeClient):
             reasoning_effort=reasoning_effort,
             model=model,
         )
+
+
+def test_runtime_builds_context_package_before_initial_and_resume_prompt(tmp_path: Path, make_config) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    config = make_config()
+    project = ProjectManager(config).resolve_project(root)
+    memory = MemoryStore(config)
+    context_builder = RecordingContextBuilder(config)
+    prompt_builder = RecordingPromptBuilder()
+    runtime = AgentRuntime(
+        config=config,
+        project=project,
+        memory=memory,
+        tools=ToolManager(config, project, memory, yolo=True),
+        client=FakeClient(
+            [
+                {"role": "assistant", "content": "initial complete"},
+                {"role": "assistant", "content": "resume complete"},
+            ]
+        ),
+        context_builder=context_builder,
+        prompt_builder=prompt_builder,
+    )
+
+    assert runtime.run("explain this project") == "initial complete"
+    assert runtime.resume("continue", runtime.last_session_id) == "resume complete"
+
+    assert [package.phase for package in context_builder.packages] == ["initial", "resume"]
+    assert prompt_builder.packages == context_builder.packages
+    assert all(isinstance(package, ContextPackage) for package in prompt_builder.packages)
 
 
 def tool_message(call_id: str, name: str, arguments: dict) -> dict:

@@ -2,8 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from .context import ContextBuilder, ContextPackage, ContextSnapshot
-from .state import AgentState
+from .context import ContextPackage
 
 
 SYSTEM_PROMPT = """You are Deep Agent, a project-centric CLI coding agent powered only by DeepSeek.
@@ -32,115 +31,25 @@ Operating rules:
 
 
 class PromptBuilder:
-    def build_initial(
-        self,
-        package: ContextPackage | None = None,
-        *,
-        state: AgentState | None = None,
-        context: ContextSnapshot | None = None,
-        memory_context: str = "",
-        capability_summary: str = "",
-    ) -> list[dict[str, Any]]:
-        if package is not None:
-            return self._messages_from_package(package)
-        if state is None or context is None:
-            raise TypeError("build_initial requires a ContextPackage")
-        # Compatibility for v0.8 callers. New Runtime code must pass a package.
-        runtime_context = self._runtime_context(state, context, memory_context, capability_summary)
-        return [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "system", "content": runtime_context},
-            {"role": "user", "content": state.user_request},
-        ]
+    """Render model messages from one already-selected Context Package.
+
+    Context discovery, selection, truncation, and Resume compaction belong to
+    :class:`ContextBuilder`. Keeping this renderer package-only prevents Prompt
+    code from becoming a second, implicit context-loading path.
+    """
+
+    def build_initial(self, package: ContextPackage) -> list[dict[str, Any]]:
+        return self._messages_from_package(package)
 
     def build_resume(self, package: ContextPackage) -> list[dict[str, Any]]:
         return self._messages_from_package(package)
 
-    def append_resume(
-        self,
-        messages: list[dict[str, Any]] | None = None,
-        *,
-        package: ContextPackage | None = None,
-        state: AgentState | None = None,
-        context: ContextSnapshot | None = None,
-        memory_context: str = "",
-        capability_summary: str = "",
-    ) -> list[dict[str, Any]]:
-        if package is not None:
-            return self.build_resume(package)
-        if state is None or context is None:
-            raise TypeError("append_resume requires a ContextPackage")
-        # Compatibility for v0.8 checkpoints. Outcome selection now lives in
-        # ContextBuilder and is not part of the package-based Prompt renderer.
-        previous = ContextBuilder.previous_outcome(messages or [])
-        refreshed = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {
-                "role": "system",
-                "content": "Session resumed from a compact checkpoint. The previous raw tool transcript was "
-                "removed to keep Prompt growth bounded. Use AgentState and Execution Context as the source of truth."
-                + ("\n\n## Previous Outcome\n\n" + previous if previous else "")
-                + "\n\n"
-                + self._runtime_context(state, context, memory_context, capability_summary),
-            },
-        ]
-        refreshed.append({"role": "user", "content": state.user_request})
-        return refreshed
-
     @staticmethod
     def _messages_from_package(package: ContextPackage) -> list[dict[str, Any]]:
+        if not isinstance(package, ContextPackage):
+            raise TypeError("PromptBuilder requires a ContextPackage")
         return [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "system", "content": package.rendered},
             {"role": "user", "content": package.user_request},
         ]
-
-    @staticmethod
-    def _runtime_context(
-        state: AgentState,
-        context: ContextSnapshot,
-        memory_context: str,
-        capability_summary: str,
-    ) -> str:
-        execution = state.execution_context
-        strategy = state.task_strategy or {}
-        plan_lines = [
-            f"- `{step.id}` {step.status}; deps={','.join(step.dependencies) or '-'}; "
-            f"retries={step.retry_count}/{step.max_retries}; parallel={str(step.allow_parallel).lower()}; "
-            f"done_when={step.completion_criteria or '-'}"
-            for step in state.plan
-        ]
-        execution_lines = (
-            [
-                f"- Current directory: `{execution.current_directory}`",
-                f"- Git branch: `{execution.git_branch or 'not detected'}`",
-                f"- Current plan step: `{execution.current_plan_id or 'none'}`",
-                f"- Current queue: `{execution.current_queue_id or 'none'}`",
-                f"- Recent tool: `{execution.recent_tool or 'none'}`",
-                f"- Recent error: `{execution.recent_error[:500] or 'none'}`",
-                f"- Current snapshot: `{execution.current_snapshot or 'none'}`",
-                f"- Modified files: `{', '.join(execution.modified_files[-20:]) or 'none'}`",
-                f"- Prompt phase: `{execution.prompt_phase}`",
-            ]
-            if execution
-            else ["- No execution context was restored."]
-        )
-        return "\n\n".join(
-            [
-                "## Agent State\n"
-                f"- Session: `{state.session_id}`\n"
-                f"- Turn: `{state.turn}`\n"
-                f"- Working directory: `{state.working_directory}`\n"
-                f"- Git branch: `{state.git_branch or 'not detected'}`\n"
-                f"- Execution mode: `{strategy.get('mode', 'standard')}`\n"
-                f"- Thinking: `{str(bool(strategy.get('thinking_enabled', False))).lower()}`\n"
-                f"- Reasoning effort: `{strategy.get('reasoning_effort') or 'default'}`\n"
-                f"- Chunked context: `{str(bool(strategy.get('chunked_context', False))).lower()}`\n"
-                f"- Plan required: `{str(bool(strategy.get('require_plan', False))).lower()}`",
-                "## Task Graph\n\n" + "\n".join(plan_lines or ["No task graph has been published."]),
-                "## Execution Context\n\n" + "\n".join(execution_lines),
-                context.rendered,
-                "## Relevant Long-Term Memory\n\n" + memory_context,
-                "## Registered Tool Capabilities\n\n" + capability_summary,
-            ]
-        )

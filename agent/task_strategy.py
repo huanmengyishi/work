@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-import re
+import warnings
 from dataclasses import dataclass
 from typing import Any
 
 from .config import AppConfig
 from .model_router import ModelRoute, ModelRouter
+from .task_plan import TaskPlanFactory
 from .task_router import TASK_MODES, TaskRoute, TaskRouter
 
 
@@ -14,7 +15,7 @@ __all__ = ["TASK_MODES", "TaskStrategy", "TaskStrategySelector"]
 
 @dataclass(frozen=True)
 class TaskStrategy:
-    """Legacy combined policy kept for runtime and third-party compatibility."""
+    """Deprecated v0.8 DTO kept for saved-state and third-party compatibility."""
 
     mode: str
     score: int
@@ -39,12 +40,24 @@ class TaskStrategy:
 
 
 class TaskStrategySelector:
-    """Compatibility facade over the v0.9 TaskRouter and ModelRouter."""
+    """Deprecated compatibility facade; TaskRouter is the only classifier.
+
+    New code must compose ``TaskRouter``, ``ModelRouter``, and
+    ``TaskPlanFactory`` directly.  This class contains no scoring or
+    classification rules and will be removed after the v1 compatibility
+    window.
+    """
 
     def __init__(self, config: AppConfig) -> None:
+        warnings.warn(
+            "TaskStrategySelector is deprecated; use TaskRouter, ModelRouter, and TaskPlanFactory directly",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         self.config = config
         self.task_router = TaskRouter(config)
         self.model_router = ModelRouter(config)
+        self.plan_factory = TaskPlanFactory()
 
     def select(
         self,
@@ -95,53 +108,16 @@ class TaskStrategySelector:
         return task, self.model_router.route(task)
 
     def initial_plan(self, prompt: str, strategy: TaskStrategy | TaskRoute) -> list[dict[str, Any]]:
-        if not strategy.require_plan:
-            return []
-        change_task = bool(
-            re.search(
-                r"\b(fix|implement|change|edit|debug|build|write|refactor|migrate)\b|"
-                r"修复|实现|修改|编辑|调试|构建|编写|重构|迁移",
-                prompt,
-                re.IGNORECASE,
+        if isinstance(strategy, TaskRoute):
+            route = strategy
+        else:
+            warnings.warn(
+                "TaskStrategy planning compatibility re-routes the prompt; pass TaskRoute to avoid duplicate work",
+                DeprecationWarning,
+                stacklevel=2,
             )
-        )
-        middle_title = "Implement bounded changes" if change_task else "Synthesize the inspected evidence"
-        middle_done = (
-            "Requested changes are applied through the managed file workflow."
-            if change_task
-            else "Findings are reconciled across all inspected chunks without unsupported claims."
-        )
-        return [
-            {
-                "id": "scope",
-                "title": "Map the request, constraints, and relevant project areas",
-                "status": "in_progress",
-                "max_retries": 1,
-                "completion_criteria": "Scope, constraints, and bounded inspection targets are explicit.",
-            },
-            {
-                "id": "inspect-chunks",
-                "title": "Inspect relevant text or code in bounded chunks",
-                "dependencies": ["scope"],
-                "max_retries": 2,
-                "allow_parallel": strategy.mode == "deep",
-                "completion_criteria": "Each relevant chunk has evidence and unresolved questions recorded.",
-            },
-            {
-                "id": "implement" if change_task else "synthesize",
-                "title": middle_title,
-                "dependencies": ["inspect-chunks"],
-                "max_retries": 2,
-                "completion_criteria": middle_done,
-            },
-            {
-                "id": "verify",
-                "title": "Verify the result and reconcile it with the original request",
-                "dependencies": ["implement" if change_task else "synthesize"],
-                "max_retries": 1,
-                "completion_criteria": "Checks pass and the final answer states evidence, limits, and remaining risk.",
-            },
-        ]
+            route = self.task_router.route(prompt, explicit_mode=strategy.mode)
+        return self.plan_factory.build(route)
 
     @staticmethod
     def _thinking_enabled(value: Any) -> bool:

@@ -3,10 +3,12 @@
 Project-centric DeepSeek CLI agent for WSL. The Agent is installed as a tool;
 the directory where `agent` is started is the workspace.
 
-Current version: `0.9.0`. The runtime locally classifies task type, scale, risk,
-and execution mode; selects a DeepSeek-only capability tier; and builds one
-bounded `ContextPackage` before Prompt rendering. DeepSeek thinking can stream
-to the terminal with elapsed time, current plan step, and tool progress.
+Current version: `0.9.1`. The core interface chain is now covered by executable
+contract tests. ContextBuilder is the only model-context entry, PromptBuilder
+only renders a `ContextPackage`, AgentState validates its frozen schema, and a
+minimal versioned Event Bus exposes stable publish/subscribe semantics.
+DeepSeek thinking can stream to the terminal with elapsed time, current plan
+step, and tool progress.
 
 Version `0.7.0` adds bounded Python/JavaScript/TypeScript diagnostics, richer
 Tree-sitter module and import relationships, Memory lifecycle maintenance,
@@ -32,6 +34,10 @@ Version `0.9.0` replaces loose Prompt inputs with structured Task and Model
 routes plus a unified Context Package. Resume routing is monotonic: a short
 continuation cannot downgrade the saved task mode or DeepSeek tier, while a
 higher-risk continuation can upgrade them.
+
+Version `0.9.1` stabilizes these interfaces for the v1.0 freeze. TaskRouter is
+the only classifier, starter plans consume a `TaskRoute`, and ModelRouter adds
+an explainable low/balanced/high cost class while remaining DeepSeek-only.
 
 ## Quick Start
 
@@ -85,7 +91,8 @@ tree, a project directory, or Git.
 ```text
 CLI
   -> AgentRuntime
-     -> TaskRouter -> ModelRouter (DeepSeek only)
+     -> TaskRouter -> TaskPlanFactory
+     -> ModelRouter (DeepSeek only, cost-aware)
      -> AgentState + SessionManager
      -> ContextBuilder -> ContextPackage -> PromptBuilder
      -> DeepSeekClient (selected DeepSeek model)
@@ -98,7 +105,8 @@ CLI
 
 Implemented V3 modules:
 
-- `AgentState`: serializable project, session, plan, tool, and progress state.
+- `AgentState`: validated, versioned project/session/plan/tool state with frozen
+  identity fields.
 - `SessionManager`: JSON checkpoints, Markdown summaries, and resume support.
 - `ContextBuilder`: README/AGENTS/config discovery and cached `index.json`.
 - `ContextPackage`: one bounded entry for task, project, session, semantic,
@@ -106,12 +114,16 @@ Implemented V3 modules:
 - `PromptBuilder`: renders the system policy, one Context Package, and request.
 - `ToolCapabilityRegistry`: dynamic schemas, permissions, timeouts, formats, and availability.
 - `PermissionManager`: centralized capability, cwd, timeout, and dangerous-command policy.
-- `EventBus`: decoupled runtime, logging, and memory events.
+- `EventBus`: versioned synchronous events, correlation IDs, unsubscribe, and
+  isolated subscriber errors. It is not yet a durable broker.
 - `MemoryPipeline`: idempotent Summary and Lesson/Bug/Decision persistence.
 - `PlanManager`: model-maintained plans without an extra mandatory model request.
-- `TaskRouter`: local type/scale/risk and simple/standard/large/deep routing.
+- `TaskRouter`: the only local type/scale/risk and mode classifier.
+- `TaskPlanFactory`: builds starter plans from `TaskRoute` without reclassifying
+  Prompt text.
 - `ModelRouter`: local fast/standard/deep routing across configured DeepSeek
-  model names; non-DeepSeek providers are rejected.
+  model names with low/balanced/high cost classes; non-DeepSeek providers are
+  rejected.
 
 ## Commands
 
@@ -214,6 +226,29 @@ Their model overrides default to `null`, so fast, standard, and deep all fall
 back to `model.model` until the user explicitly supplies valid DeepSeek model
 names. With adaptive thinking enabled, fast disables thinking, standard uses
 `high`, and deep uses `max` reasoning effort.
+
+The local cost-aware policy chooses the least expensive tier that still meets
+the classified task: simple low-risk requests use `low`, ordinary and large
+read-only work use `balanced`, and deep/high-risk/architecture/refactor or
+repeated-failure work uses `high`. This is a routing estimate, not a billing
+measurement. Explicit tier configuration still takes priority.
+
+## Frozen Interfaces And Minimal Events
+
+The v0.9.1 contract marker is in `agent/contracts.py`, and
+`tests/test_interface_contracts.py` verifies the public chain:
+
+```text
+CLI -> Runtime -> AgentState -> Prompt -> Capability -> Permission
+ContextBuilder -> ContextPackage -> PromptBuilder
+```
+
+PromptBuilder accepts only one `ContextPackage`; it does not load files or take
+separate State, Memory, or capability text. `Event` serializes
+`schema_version/id/name/timestamp/project_id/session_id/run_id/payload`.
+EventBus remains synchronous and process-local: it isolates handler failures
+but does not provide replay, durable delivery, or cross-process ordering. See
+`docs/architecture-v0.9.1.md` for extension rules.
 
 The Context Package budget counts the bounded user request plus fully rendered
 sections, including headings and separators. The fixed system prompt, active
@@ -342,15 +377,19 @@ cd ~/AI-Agent
 ```
 
 The repository includes `.github/workflows/test.yml` for Python 3.11, 3.12,
-and 3.13. It uses `actions/checkout@v5` and `actions/setup-python@v6`, then runs
-Ruff, all 113 pytest cases, and compileall for pushes to `main`, pull requests,
-and manual dispatch. Hosted run `29257906807` passed on all three Python
-versions for the v0.9.0 release.
+and 3.13. It uses `actions/checkout@v5` and `actions/setup-python@v6` (current
+Node.js runtime, no Node.js 20 deprecation), then runs Ruff, all 130 pytest
+cases, and compileall for pushes to `main`, pull requests, and manual dispatch.
+The v0.9.1 hosted run is verified during release publication.
 
 A runnable Chinese walkthrough is available at
 `user-docs/实用案例-v0.9.0/README.md`. Its order-summary project intentionally
 starts with two failing business-rule tests so users can observe simple,
 standard, large, deep, Thinking, and Resume behavior on a real repair task.
+An offline interface example at
+`user-docs/实用案例-v0.9.1/interface-routing-demo.py` demonstrates cost-aware
+routing, TaskRoute-only plan creation, event correlation, and subscriber error
+isolation without using an API key.
 
 See `docs/implementation.md` for architecture, extension rules, Docker proxy,
 OCR, memory, and maintenance details.
@@ -359,10 +398,9 @@ OCR, memory, and maintenance details.
 
 ```bash
 cd ~/AI-Agent
-git switch --detach v0.8.0
+git switch --detach v0.9.0
 .venv/bin/pip install -e .
 ```
 
-Return with `git switch main`. v0.9.0 config migration only adds missing
-defaults and preserves existing values; v0.8.0 ignores the new routing and
-Context Package keys.
+Return with `git switch main`. v0.9.1 has no destructive config migration and
+preserves existing values, Session files, Memory, and project data.

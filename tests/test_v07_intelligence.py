@@ -6,7 +6,7 @@ import subprocess
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from agent.context import ContextBuilder
+from agent.context import ContextBuildRequest, ContextBuilder
 from agent.daemon import ProjectDaemon
 from agent.memory import MemoryStore
 from agent.project import ProjectManager
@@ -253,13 +253,18 @@ def test_resume_prompt_compacts_raw_history(tmp_path: Path, make_config) -> None
         {"role": "assistant", "content": "Previous task completed."},
     ]
 
-    messages = PromptBuilder().append_resume(
-        history,
-        state=state,
-        context=context,
-        memory_context="none",
-        capability_summary="none",
+    package = ContextBuilder(config).build_package(
+        ContextBuildRequest(
+            snapshot=context,
+            state=state,
+            memory_context="none",
+            capability_summary="none",
+            prior_messages=history,
+            phase="resume",
+            max_chars=12_000,
+        )
     )
+    messages = PromptBuilder().build_resume(package)
 
     assert len(messages) == 3
     assert messages[0]["content"] == SYSTEM_PROMPT

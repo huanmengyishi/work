@@ -1,6 +1,6 @@
-# DeepSeek Agent V3 使用说明（0.9.0）
+# DeepSeek Agent V3 使用说明（0.9.1）
 
-更新时间：2026-07-13
+更新时间：2026-07-14
 
 ## 1. 系统定位
 
@@ -232,6 +232,40 @@ context:
 
 三个档位默认都安全回落到 `model.model`。程序不会猜测或内置未经当前 API 验证的“快速模型”名称；只有确认某个 DeepSeek 模型可用后，才应填写对应 `*_model`。`provider` 不是 `deepseek` 时会直接拒绝启动。ContextPackage 预算包含有界的用户请求，但不包含固定 System Prompt、单独发送的 Tool Schema 和后续 ToolResult；这些输入仍由各自上限控制。超过 `runtime.max_user_request_chars` 的粘贴输入会被拒绝，并提示先保存为项目文件，再由 large/deep 模式完整分块读取，避免静默丢失大段正文。
 
+### 0.9.1：核心接口稳定化
+
+0.9.1 不做大规模 Runtime 重构，而是为 v1.0 冻结现有边界：
+
+```text
+CLI -> Runtime -> AgentState -> Prompt -> Capability -> Permission
+ContextBuilder -> ContextPackage -> PromptBuilder
+```
+
+关键变化：
+
+- ContextBuilder 是进入模型前唯一的上下文选择入口。
+- PromptBuilder 只接受一个 `ContextPackage`，不再接收 State、Snapshot、Memory 或能力摘要等分散参数，也不读取文件。
+- AgentState 增加 schema 常量、`validate()` 和冻结身份字段；旧 Session 可兼容恢复，未来未知 schema 会明确拒绝。
+- TaskRouter 是唯一分类器；计划模板只消费 TaskRoute，不再重复扫描 Prompt。旧 `TaskStrategySelector` 仅作 deprecated 兼容层。
+- Model Router 增加可解释成本级别：简单低风险为 `low`，普通及大型只读任务为 `balanced`，deep/高风险/架构重构/重复失败为 `high`。这只是本地资源选择提示，不是实际账单统计。
+- Event Bus 增加稳定事件字段、`run_id`、订阅取消和订阅者异常隔离。当前仍是进程内同步总线，不提供持久化重放或跨进程保证。
+
+DeepSeek 仍是唯一 Provider。没有加入 OpenAI、Anthropic 或其他模型；三个档位仍只使用用户配置并确认可用的 DeepSeek 模型名。
+
+外部扩展若还调用旧 `PromptBuilder.append_resume()`，或向 `build_initial()` 传入分散参数，需要改为先构建 ContextPackage。程序仓库内部调用已全部迁移。
+
+### Event Bus 后续开发要点
+
+0.9.1 先稳定事件模型，不把 Session、Memory 和工具副作用一次性迁移。新增订阅者时：
+
+1. 事件名使用 `task.finished`、`tool.started` 这类稳定命名，不把 ID 编进名称。
+2. 用 `project_id/session_id/run_id` 做关联；旧 payload 中的 `run_id` 可通过 `effective_run_id` 兼容。
+3. payload 必须小、有界、可序列化，不得写入 Key、Cookie、密码、完整模型消息或无界工具输出。
+4. 订阅者在发布线程内同步运行，必须快且有界；通过 `cancel = subscribe(...)` 保存取消回调，组件销毁时执行 `cancel()`。
+5. 当前 `publish()` 返回不代表已持久化或一定会重试。若业务不允许丢失/重复，先设计 Durable Journal，不能直接依赖进程内 Event Bus。
+
+推荐迁移顺序是“指标/审计等观察性副作用 -> 增加幂等键 -> 双路对比 -> 切换单个模块”。不应从 Session 提交或文件写入开始。更详细的发布者规则、订阅者模板、崩溃窗口和未实施边界见 `docs/architecture-v0.9.1.md`。
+
 ## 5. 安全文件修改与回滚
 
 Agent 的源码修改流程：
@@ -417,10 +451,10 @@ agent health --reset
 
 能力状态：Available、Unavailable、Need Config、Disabled、Broken。Unavailable/Broken 能力不会放入模型 Tool Schema 和 Prompt 能力摘要。
 
-当前 0.9.0 验收：
+当前 0.9.1 本地验收：
 
 ```text
-113 tests passed（含真实 PTY）
+130 tests passed（含真实 PTY）
 Ruff check passed
 Ruff format check passed
 compileall passed
@@ -429,8 +463,9 @@ Task/Model 路由、失败升级、Resume 单调保持 passed
 DeepSeek streaming/tool-call assembly passed
 网络重试与部分流禁止重放 passed
 路径、符号链接、Queue 并发、Docker 参数与进程组超时回归 passed
-GitHub Actions 运行 29257906807：Python 3.11 / 3.12 / 3.13 全部 passed
-Actions：checkout@v5、setup-python@v6，无 Node.js 20 弃用警告
+Interface Contract、Event、AgentState、ContextPackage、路由与 Permission 顺序 passed
+GitHub Actions：Python 3.11 / 3.12 / 3.13；发布后核验运行号
+Actions：checkout@v5、setup-python@v6，使用当前 Node.js runtime，无 Node.js 20 弃用警告
 ```
 
 ## 13. 参考工程取舍
@@ -457,6 +492,7 @@ Actions：checkout@v5、setup-python@v6，无 Node.js 20 弃用警告
 
 ```text
 实用案例-v0.9.0/
+实用案例-v0.9.1/
 ```
 
 其中 `order-summary-demo/` 是一个带真实 CSV、业务规则、故意保留缺陷和回归测试的小型订单汇总项目。先阅读 `实用案例-v0.9.0/README.md`，再依次体验 simple 解释、standard Bug 修复、large 全项目分析、deep 财务/安全审计与 `/resume`。案例基线的 2 个测试应当失败，这是用于观察 Agent 定位和修复过程的预期状态，不属于 Deep Agent 主项目测试失败。
@@ -469,6 +505,14 @@ python3 -m unittest discover -s tests -v
 agent
 ```
 
+0.9.1 的 `interface-routing-demo.py` 不需要 API Key，可直接观察
+TaskRouter、cost-aware ModelRouter、TaskRoute-only 计划工厂和 Event Bus：
+
+```bash
+cd ~/AI-Agent
+PYTHONPATH=. .venv/bin/python user-docs/实用案例-v0.9.1/interface-routing-demo.py
+```
+
 ## 16. 风险与回滚
 
 - `show_thinking` 展示的是 DeepSeek API 返回的 reasoning 内容，可能较长；可在配置中关闭。
@@ -479,8 +523,8 @@ agent
 
 ```bash
 cd ~/AI-Agent
-git switch --detach v0.8.0
+git switch --detach v0.9.0
 .venv/bin/pip install -e .
 ```
 
-恢复最新版执行 `git switch main`。0.9.0 的新增配置是 add-only，0.8.0 会忽略不认识的键；回滚不会删除 Session、Memory 或项目数据。
+恢复最新版执行 `git switch main`。0.9.1 没有破坏性配置迁移；回滚不会删除 Session、Memory 或项目数据。若有外部代码已切换到新的 PromptBuilder 单 Package 接口，回滚后还需同步恢复该外部调用代码。

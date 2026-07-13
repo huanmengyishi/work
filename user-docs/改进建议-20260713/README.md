@@ -1,8 +1,14 @@
-# Deep Agent v0.8.0 后续改进建议
+# Deep Agent v0.9.1 后续改进建议
 
 日期：2026-07-13
 
-本目录只放本轮没有直接实施、需要单独设计或用户决策的改进方向。已复现缺陷已经在 v0.8.0 修复，不重复列入“建议”。
+本目录只放当前没有直接实施、需要单独设计或用户决策的改进方向。v0.9.1 已完成接口稳定化；用户已要求在其发布闭环之后另版实施 Event Bus 整体迁移。
+
+## 已完成
+
+1. GitHub Actions 已恢复并采用 Python 3.11/3.12/3.13 矩阵。
+2. Actions 已升级为 `checkout@v5` 与 `setup-python@v6`，不再使用 Node.js 20 action runtime。
+3. ContextPackage、Task/Model Router、Interface Contract、最小 Event schema 和 AgentState validate 已在 v0.9.1 落地。
 
 ## P1：下一补丁优先
 
@@ -10,7 +16,7 @@
 2. 工具调用 Journal：在有副作用工具执行前持久化 intent，执行后持久化 result；Resume 按 request_id 对账，解决 SIGKILL 落在“工具成功、checkpoint 未写”窗口时的重复执行风险。
 3. Session revision/CAS：本轮已用 per-session flock 拒绝并发 Resume；后续若要允许协作 turn，需要显式 revision、冲突提示和合并协议。
 4. MCP/外部输入累计字节：本轮已有页数、工具数量、重复 cursor、HTTP/文档/下载上限；后续增加所有协议响应的累计序列化字节预算。
-5. GitHub Actions：为发布凭据补 `workflow` scope 后提交已验证的 Python 3.11/3.12/3.13 Ruff + pytest + compileall 工作流。
+5. Event Bus 整体迁移：必须在 v0.9.1 完整发布之后另建版本；先列出 Session、Memory、Audit、Metrics 等副作用，再逐项迁移、双写验证和去除旧路径。
 
 ## P2：规模化能力
 

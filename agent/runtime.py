@@ -13,8 +13,9 @@ from .project import Project
 from .prompt import PromptBuilder
 from .session import SessionManager
 from .state import AgentState
+from .task_plan import TaskPlanFactory
 from .task_router import TaskRoute, TaskRouter, more_capable_task_route
-from .task_strategy import TaskStrategy, TaskStrategySelector
+from .task_strategy import TaskStrategy
 from .tools import ToolManager
 from .unicode_text import normalize_unicode_text
 
@@ -44,9 +45,9 @@ class AgentRuntime:
         self.prompt_builder = prompt_builder or PromptBuilder()
         self.sessions = sessions or SessionManager(project)
         self.progress_handler = progress_handler
-        self.strategy_selector = TaskStrategySelector(config)
         self.task_router = TaskRouter(config)
         self.model_router = ModelRouter(config)
+        self.task_plan_factory = TaskPlanFactory()
         self.last_session_id: str | None = None
         self.tools.set_event_bus(self.events)
         if config.get("events.jsonl_log", True):
@@ -94,7 +95,7 @@ class AgentRuntime:
         state.task_route = task_route.to_dict()
         state.model_route = model_route.to_dict()
         state.task_strategy = strategy.to_dict()
-        plan = initial_plan or self.strategy_selector.initial_plan(prompt, strategy)
+        plan = initial_plan or self.task_plan_factory.build(task_route)
         if plan:
             self.tools.plan_manager.replace(state, plan)
         if state.execution_context:
@@ -168,7 +169,7 @@ class AgentRuntime:
         state.model_route = model_route.to_dict()
         state.task_strategy = strategy.to_dict()
         if strategy.require_plan and not state.plan:
-            self.tools.plan_manager.replace(state, self.strategy_selector.initial_plan(prompt, strategy))
+            self.tools.plan_manager.replace(state, self.task_plan_factory.build(task_route))
         package = self._build_context_package(
             state=state,
             snapshot=context,
@@ -202,6 +203,7 @@ class AgentRuntime:
             {"run_id": state.run_id, "prompt": state.user_request},
             project_id=self.project.id,
             session_id=state.session_id,
+            run_id=state.run_id,
         )
         strategy = self._strategy_from_state(state)
         model_route = ModelRoute.from_dict(state.model_route)
@@ -229,6 +231,7 @@ class AgentRuntime:
                     },
                     project_id=self.project.id,
                     session_id=state.session_id,
+                    run_id=state.run_id,
                 )
                 self._progress(
                     "model.requested",
@@ -275,6 +278,7 @@ class AgentRuntime:
                     {"run_id": state.run_id, "round": round_number, "tool_call_count": len(tool_calls)},
                     project_id=self.project.id,
                     session_id=state.session_id,
+                    run_id=state.run_id,
                 )
                 if not tool_calls:
                     final = str(message.get("content") or "").strip()
@@ -376,6 +380,7 @@ class AgentRuntime:
             },
             project_id=self.project.id,
             session_id=state.session_id,
+            run_id=state.run_id,
         )
 
     def _progress(self, event: str, state: AgentState, **payload: Any) -> None:

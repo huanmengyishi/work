@@ -1,10 +1,24 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
-from typing import Any
+from dataclasses import asdict, dataclass, field, fields
+from datetime import datetime
+from typing import Any, ClassVar
 
+from .contracts import (
+    AGENT_STATE_FROZEN_FIELDS,
+    AGENT_STATE_SCHEMA_VERSION,
+    AGENT_STATE_SERIALIZED_FIELDS,
+)
+from .model_router import COST_CLASSES, MODEL_TIERS
 from .project import Project
+from .task_router import TASK_MODES, TASK_RISKS, TASK_SCALES, TASK_TYPES
 from .timeutil import utc_now_iso
+
+
+PLAN_STEP_STATUSES = frozenset({"pending", "in_progress", "completed", "failed", "skipped"})
+AGENT_STATUSES = frozenset({"initialized", "running", "completed", "failed"})
+PROMPT_PHASES = frozenset({"initial", "running", "resumed", "completed", "failed", "interrupted"})
+CONTEXT_PHASES = frozenset({"initial", "resume", "recovery"})
 
 
 @dataclass
@@ -32,6 +46,29 @@ class PlanStep:
             allow_parallel=bool(value.get("allow_parallel", False)),
             completion_criteria=str(value.get("completion_criteria") or ""),
         )
+
+    def validate(self) -> "PlanStep":
+        _non_empty_string(self.id, "plan step id")
+        _non_empty_string(self.title, f"plan step {self.id} title")
+        if len(self.id) > 80:
+            raise ValueError(f"plan step id is too long: {self.id}")
+        if self.status not in PLAN_STEP_STATUSES:
+            raise ValueError(f"invalid plan step status for {self.id}: {self.status}")
+        if not _is_non_negative_int(self.retry_count):
+            raise ValueError(f"plan step retry_count must be a non-negative integer: {self.id}")
+        if not _is_non_negative_int(self.max_retries):
+            raise ValueError(f"plan step max_retries must be a non-negative integer: {self.id}")
+        if self.retry_count > self.max_retries and self.status == "pending":
+            raise ValueError(f"pending plan step retry_count exceeds max_retries: {self.id}")
+        if not isinstance(self.dependencies, list) or not all(
+            isinstance(item, str) and item for item in self.dependencies
+        ):
+            raise ValueError(f"plan step dependencies must be non-empty strings: {self.id}")
+        if len(self.dependencies) != len(set(self.dependencies)):
+            raise ValueError(f"plan step dependencies must be unique: {self.id}")
+        if self.id in self.dependencies:
+            raise ValueError(f"plan step cannot depend on itself: {self.id}")
+        return self
 
 
 @dataclass
@@ -62,9 +99,34 @@ class ExecutionContext:
             last_checkpoint_at=str(value.get("last_checkpoint_at") or utc_now_iso()),
         )
 
+    def validate(self) -> "ExecutionContext":
+        _non_empty_string(self.current_directory, "execution_context.current_directory")
+        if self.prompt_phase not in PROMPT_PHASES:
+            raise ValueError(f"invalid execution_context.prompt_phase: {self.prompt_phase}")
+        if not isinstance(self.modified_files, list) or not all(
+            isinstance(item, str) and item for item in self.modified_files
+        ):
+            raise ValueError("execution_context.modified_files must contain non-empty strings")
+        if len(self.modified_files) != len(set(self.modified_files)):
+            raise ValueError("execution_context.modified_files must be unique")
+        _validate_iso_timestamp(self.last_checkpoint_at, "execution_context.last_checkpoint_at")
+        return self
+
 
 @dataclass
 class AgentState:
+    """Serializable runtime state with a versioned, validation-backed schema.
+
+    ``FROZEN_FIELDS`` identify the Session identity that Resume must preserve.
+    Mutable execution fields (request, routes, plan, progress, and result) may
+    evolve between turns after ``validate_frozen_fields`` succeeds.
+    """
+
+    SCHEMA_VERSION: ClassVar[int] = AGENT_STATE_SCHEMA_VERSION
+    SERIALIZED_FIELDS: ClassVar[tuple[str, ...]] = AGENT_STATE_SERIALIZED_FIELDS
+    FROZEN_FIELDS: ClassVar[tuple[str, ...]] = AGENT_STATE_FROZEN_FIELDS
+    _frozen_baseline: dict[str, Any] = field(init=False, repr=False, compare=False)
+
     session_id: str
     project: dict[str, Any]
     user_request: str
@@ -89,7 +151,10 @@ class AgentState:
     error: str = ""
     created_at: str = field(default_factory=utc_now_iso)
     updated_at: str = field(default_factory=utc_now_iso)
-    schema_version: int = 2
+    schema_version: int = AGENT_STATE_SCHEMA_VERSION
+
+    def __post_init__(self) -> None:
+        self._frozen_baseline = self.frozen_values()
 
     @classmethod
     def create(
@@ -121,10 +186,12 @@ class AgentState:
                 current_directory=str(project.root),
                 git_branch=git_branch,
             ),
-        )
+        ).validate()
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "AgentState":
+        if not isinstance(value, dict):
+            raise TypeError("AgentState record must be a dictionary")
         plan = [PlanStep.from_dict(item) for item in value.get("plan", []) if isinstance(item, dict)]
         working_directory = str(value.get("working_directory") or "")
         git_branch = value.get("git_branch")
@@ -134,8 +201,8 @@ class AgentState:
             working_directory=working_directory,
             git_branch=git_branch,
         )
-        return cls(
-            session_id=str(value["session_id"]),
+        state = cls(
+            session_id=str(value.get("session_id") or ""),
             project=dict(value.get("project") or {}),
             user_request=str(value.get("user_request") or ""),
             working_directory=working_directory,
@@ -161,6 +228,199 @@ class AgentState:
             updated_at=str(value.get("updated_at") or utc_now_iso()),
             schema_version=max(1, int(value.get("schema_version") or 1)),
         )
+        if state.schema_version < cls.SCHEMA_VERSION:
+            state._normalize_legacy_derived_fields()
+        state._frozen_baseline = state.frozen_values()
+        return state.validate()
+
+    def validate(self) -> "AgentState":
+        """Validate serialized identity, routes, plan graph, and numeric bounds."""
+
+        serialized_fields = tuple(item.name for item in fields(self) if item.init)
+        if serialized_fields != self.SERIALIZED_FIELDS:
+            raise ValueError("AgentState serialized field order does not match its interface contract")
+        if not _is_positive_int(self.schema_version):
+            raise ValueError("AgentState schema_version must be a positive integer")
+        if self.schema_version > self.SCHEMA_VERSION:
+            raise ValueError(
+                f"unsupported AgentState schema_version {self.schema_version}; maximum is {self.SCHEMA_VERSION}"
+            )
+        _non_empty_string(self.session_id, "AgentState.session_id")
+        _non_empty_string(self.user_request, "AgentState.user_request")
+        _non_empty_string(self.working_directory, "AgentState.working_directory")
+        if self.status not in AGENT_STATUSES:
+            raise ValueError(f"invalid AgentState.status: {self.status}")
+        if not isinstance(self.project, dict):
+            raise ValueError("AgentState.project must be a dictionary")
+        for key in ("id", "name", "root"):
+            _non_empty_string(self.project.get(key), f"AgentState.project.{key}")
+        if str(self.project["root"]) != self.working_directory:
+            raise ValueError("AgentState.project.root must match working_directory")
+        if not _is_non_negative_int(self.round):
+            raise ValueError("AgentState.round must be a non-negative integer")
+        if not _is_positive_int(self.turn):
+            raise ValueError("AgentState.turn must be a positive integer")
+        if not isinstance(self.plan, list) or not all(isinstance(step, PlanStep) for step in self.plan):
+            raise ValueError("AgentState.plan must contain PlanStep records")
+        self._validate_plan()
+        self._validate_collections()
+        self._validate_routes()
+        self._validate_context_manifest()
+        if self.execution_context is not None:
+            if not isinstance(self.execution_context, ExecutionContext):
+                raise ValueError("AgentState.execution_context must be an ExecutionContext")
+            self.execution_context.validate()
+            if self.execution_context.current_plan_id != self.current_step:
+                raise ValueError("execution_context.current_plan_id must match AgentState.current_step")
+        _validate_iso_timestamp(self.created_at, "AgentState.created_at")
+        _validate_iso_timestamp(self.updated_at, "AgentState.updated_at")
+        self.validate_frozen_fields(self._frozen_baseline)
+        return self
+
+    def frozen_values(self) -> dict[str, Any]:
+        """Return the stable Session identity for comparison before Resume."""
+
+        return {field_name: _nested_value(self, field_name) for field_name in self.FROZEN_FIELDS}
+
+    def validate_frozen_fields(self, previous: "AgentState | dict[str, Any]") -> "AgentState":
+        """Reject identity drift between a loaded Session and its resumed state."""
+
+        if isinstance(previous, AgentState):
+            expected = previous.frozen_values()
+        elif isinstance(previous, dict):
+            expected = (
+                {field_name: previous.get(field_name) for field_name in self.FROZEN_FIELDS}
+                if set(self.FROZEN_FIELDS) <= set(previous)
+                else {field_name: _nested_mapping_value(previous, field_name) for field_name in self.FROZEN_FIELDS}
+            )
+        else:
+            raise TypeError("previous AgentState identity must be an AgentState or dictionary")
+        current = self.frozen_values()
+        changed = [field_name for field_name in self.FROZEN_FIELDS if expected.get(field_name) != current[field_name]]
+        if changed:
+            raise ValueError(f"AgentState frozen fields changed: {', '.join(changed)}")
+        return self
+
+    def _normalize_legacy_derived_fields(self) -> None:
+        """Repair v1 fields that were derived but not validated at write time."""
+
+        known = {step.id for step in self.plan}
+        if self.current_step not in known:
+            self.current_step = None
+        self.completed_steps = [step.id for step in self.plan if step.status == "completed"]
+        if self.execution_context:
+            self.execution_context.current_plan_id = self.current_step
+
+    def _validate_plan(self) -> None:
+        ids = [step.validate().id for step in self.plan]
+        if len(ids) != len(set(ids)):
+            raise ValueError("AgentState plan step IDs must be unique")
+        known = set(ids)
+        completed = {step.id for step in self.plan if step.status in {"completed", "skipped"}}
+        for step in self.plan:
+            missing = [dependency for dependency in step.dependencies if dependency not in known]
+            if missing:
+                raise ValueError(f"unknown plan dependencies for {step.id}: {', '.join(missing)}")
+            if step.status == "in_progress" and not set(step.dependencies) <= completed:
+                raise ValueError(f"in-progress plan step dependencies are not complete: {step.id}")
+        graph = {step.id: step.dependencies for step in self.plan}
+        visiting: set[str] = set()
+        visited: set[str] = set()
+
+        def visit(step_id: str) -> None:
+            if step_id in visiting:
+                raise ValueError("AgentState plan dependencies contain a cycle")
+            if step_id in visited:
+                return
+            visiting.add(step_id)
+            for dependency in graph[step_id]:
+                visit(dependency)
+            visiting.remove(step_id)
+            visited.add(step_id)
+
+        for step_id in graph:
+            visit(step_id)
+        if self.current_step is not None and self.current_step not in known:
+            raise ValueError("AgentState.current_step must reference a plan step")
+        expected_completed = [step.id for step in self.plan if step.status == "completed"]
+        if self.completed_steps != expected_completed:
+            raise ValueError("AgentState.completed_steps must match completed plan steps")
+
+    def _validate_collections(self) -> None:
+        if not isinstance(self.completed_steps, list) or not all(
+            isinstance(item, str) and item for item in self.completed_steps
+        ):
+            raise ValueError("AgentState.completed_steps must contain non-empty strings")
+        if len(self.completed_steps) != len(set(self.completed_steps)):
+            raise ValueError("AgentState.completed_steps must be unique")
+        if not isinstance(self.loaded_memories, list) or not all(
+            _is_positive_int(item) for item in self.loaded_memories
+        ):
+            raise ValueError("AgentState.loaded_memories must contain positive integer IDs")
+        if len(self.loaded_memories) != len(set(self.loaded_memories)):
+            raise ValueError("AgentState.loaded_memories must be unique")
+        if not isinstance(self.loaded_tools, list) or not all(
+            isinstance(item, str) and item for item in self.loaded_tools
+        ):
+            raise ValueError("AgentState.loaded_tools must contain non-empty strings")
+        if len(self.loaded_tools) != len(set(self.loaded_tools)):
+            raise ValueError("AgentState.loaded_tools must be unique")
+        if not isinstance(self.tool_calls, list) or not all(isinstance(item, dict) for item in self.tool_calls):
+            raise ValueError("AgentState.tool_calls must contain dictionaries")
+        for index, item in enumerate(self.tool_calls):
+            if not _is_positive_int(item.get("turn", 1)):
+                raise ValueError(f"AgentState.tool_calls[{index}].turn must be a positive integer")
+            if not _is_non_negative_int(item.get("round", 0)):
+                raise ValueError(f"AgentState.tool_calls[{index}].round must be a non-negative integer")
+            if "request" in item and not isinstance(item.get("request"), dict):
+                raise ValueError(f"AgentState.tool_calls[{index}].request must be a dictionary")
+            if "result" in item and not isinstance(item.get("result"), dict):
+                raise ValueError(f"AgentState.tool_calls[{index}].result must be a dictionary")
+
+    def _validate_routes(self) -> None:
+        if not isinstance(self.task_strategy, dict):
+            raise ValueError("AgentState.task_strategy must be a dictionary")
+        if not isinstance(self.task_route, dict):
+            raise ValueError("AgentState.task_route must be a dictionary")
+        if not isinstance(self.model_route, dict):
+            raise ValueError("AgentState.model_route must be a dictionary")
+        if self.task_route:
+            _mapping_enum(self.task_route, "task_type", TASK_TYPES, "task_route")
+            _mapping_enum(self.task_route, "scale", TASK_SCALES, "task_route")
+            _mapping_enum(self.task_route, "risk", TASK_RISKS, "task_route")
+            _mapping_enum(self.task_route, "mode", TASK_MODES, "task_route")
+            if not _is_non_negative_int(self.task_route.get("score")):
+                raise ValueError("AgentState.task_route.score must be a non-negative integer")
+            if not _is_positive_int(self.task_route.get("max_tool_rounds")):
+                raise ValueError("AgentState.task_route.max_tool_rounds must be a positive integer")
+            if not _is_non_negative_int(self.task_route.get("failure_count", 0)):
+                raise ValueError("AgentState.task_route.failure_count must be a non-negative integer")
+        if self.model_route:
+            if str(self.model_route.get("provider") or "").lower() != "deepseek":
+                raise ValueError("AgentState.model_route.provider must be deepseek")
+            _mapping_enum(self.model_route, "tier", MODEL_TIERS, "model_route")
+            _non_empty_string(self.model_route.get("model"), "AgentState.model_route.model")
+            if not _is_positive_int(self.model_route.get("max_tokens")):
+                raise ValueError("AgentState.model_route.max_tokens must be a positive integer")
+            if "cost_class" in self.model_route:
+                _mapping_enum(self.model_route, "cost_class", COST_CLASSES, "model_route")
+
+    def _validate_context_manifest(self) -> None:
+        if not isinstance(self.context_manifest, dict):
+            raise ValueError("AgentState.context_manifest must be a dictionary")
+        if not self.context_manifest:
+            return
+        _mapping_enum(self.context_manifest, "phase", CONTEXT_PHASES, "context_manifest")
+        for key in ("max_chars", "used_chars", "rendered_chars", "original_user_request_chars"):
+            if not _is_non_negative_int(self.context_manifest.get(key)):
+                raise ValueError(f"AgentState.context_manifest.{key} must be a non-negative integer")
+        if self.context_manifest["used_chars"] > self.context_manifest["max_chars"]:
+            raise ValueError("AgentState.context_manifest.used_chars exceeds max_chars")
+        if self.context_manifest["rendered_chars"] > self.context_manifest["used_chars"]:
+            raise ValueError("AgentState.context_manifest.rendered_chars exceeds used_chars")
+        memory_ids = self.context_manifest.get("included_memory_ids", [])
+        if not isinstance(memory_ids, list) or not all(_is_positive_int(item) for item in memory_ids):
+            raise ValueError("AgentState.context_manifest.included_memory_ids must contain positive integers")
 
     def start(self) -> None:
         self.status = "running"
@@ -170,12 +430,14 @@ class AgentState:
             self.execution_context.prompt_phase = "running"
             self.execution_context.last_checkpoint_at = utc_now_iso()
         self.touch()
+        self.validate_frozen_fields(self._frozen_baseline)
 
     def resume(self, user_request: str) -> None:
-        self.schema_version = max(2, self.schema_version)
+        self.schema_version = max(self.SCHEMA_VERSION, self.schema_version)
         self.turn += 1
         self.user_request = user_request
         self.start()
+        self.validate_frozen_fields(self._frozen_baseline)
 
     def complete(self, final_answer: str) -> None:
         self.status = "completed"
@@ -185,6 +447,7 @@ class AgentState:
             self.execution_context.prompt_phase = "completed"
             self.execution_context.last_checkpoint_at = utc_now_iso()
         self.touch()
+        self.validate_frozen_fields(self._frozen_baseline)
 
     def fail(self, error: str, final_answer: str = "") -> None:
         self.status = "failed"
@@ -195,6 +458,7 @@ class AgentState:
             self.execution_context.recent_error = error
             self.execution_context.last_checkpoint_at = utc_now_iso()
         self.touch()
+        self.validate_frozen_fields(self._frozen_baseline)
 
     def record_tool_call(self, request: dict[str, Any], result: dict[str, Any]) -> None:
         self.tool_calls.append(
@@ -208,6 +472,7 @@ class AgentState:
         )
         self._update_execution_context(request, result)
         self.touch()
+        self.validate_frozen_fields(self._frozen_baseline)
 
     def _update_execution_context(self, request: dict[str, Any], result: dict[str, Any]) -> None:
         if self.execution_context is None:
@@ -243,7 +508,9 @@ class AgentState:
         return f"{self.session_id}:turn:{self.turn}"
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        self.validate()
+        serialized = asdict(self)
+        return {field_name: serialized[field_name] for field_name in self.SERIALIZED_FIELDS}
 
 
 def limit_state_value(value: Any, *, depth: int = 0) -> Any:
@@ -255,4 +522,53 @@ def limit_state_value(value: Any, *, depth: int = 0) -> Any:
         return [limit_state_value(item, depth=depth + 1) for item in value[:100]]
     if isinstance(value, str):
         return value if len(value) <= 5000 else value[:5000] + "...[truncated]"
+    return value
+
+
+def _non_empty_string(value: Any, field_name: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{field_name} must be a non-empty string")
+    return value
+
+
+def _is_non_negative_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _is_positive_int(value: Any) -> bool:
+    return _is_non_negative_int(value) and value >= 1
+
+
+def _mapping_enum(mapping: dict[str, Any], key: str, allowed: set[str], section: str) -> str:
+    value = mapping.get(key)
+    if value not in allowed:
+        choices = ", ".join(sorted(allowed))
+        raise ValueError(f"AgentState.{section}.{key} must be one of: {choices}")
+    return str(value)
+
+
+def _validate_iso_timestamp(value: Any, field_name: str) -> None:
+    _non_empty_string(value, field_name)
+    try:
+        datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise ValueError(f"{field_name} must be an ISO-8601 timestamp") from exc
+
+
+def _nested_value(state: AgentState, field_name: str) -> Any:
+    root, *parts = field_name.split(".")
+    value: Any = getattr(state, root)
+    for part in parts:
+        if not isinstance(value, dict):
+            return None
+        value = value.get(part)
+    return value
+
+
+def _nested_mapping_value(mapping: dict[str, Any], field_name: str) -> Any:
+    value: Any = mapping
+    for part in field_name.split("."):
+        if not isinstance(value, dict):
+            return None
+        value = value.get(part)
     return value

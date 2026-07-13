@@ -31,7 +31,8 @@ def make_state(project) -> AgentState:
 
 
 def test_task_strategy_selects_light_standard_large_and_deep(make_config) -> None:
-    selector = TaskStrategySelector(make_config())
+    with pytest.warns(DeprecationWarning, match="TaskStrategySelector is deprecated"):
+        selector = TaskStrategySelector(make_config())
 
     assert selector.select("什么是 Python？").mode == "simple"
     assert selector.select("请比较两个方案并给出建议").mode == "standard"
@@ -43,7 +44,8 @@ def test_task_strategy_selects_light_standard_large_and_deep(make_config) -> Non
     assert deep.reasoning_effort == "max"
     assert deep.require_plan is True
     assert deep.max_tool_rounds == 24
-    plan = selector.initial_plan("全面修复整个仓库", deep)
+    with pytest.warns(DeprecationWarning, match="re-routes the prompt"):
+        plan = selector.initial_plan("全面修复整个仓库", deep)
     assert [item["id"] for item in plan] == ["scope", "inspect-chunks", "implement", "verify"]
 
 

@@ -993,6 +993,7 @@ class ToolManager:
             payload,
             project_id=self.project.id,
             session_id=self.state.session_id if self.state else None,
+            run_id=self.state.run_id if self.state else None,
         )
 
 

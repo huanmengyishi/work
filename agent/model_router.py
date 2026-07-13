@@ -9,6 +9,7 @@ from .task_router import TaskRoute
 
 MODEL_TIERS = {"fast", "standard", "deep"}
 MODEL_TIER_RANK = {"fast": 0, "standard": 1, "deep": 2}
+COST_CLASSES = {"low", "balanced", "high"}
 
 
 @dataclass(frozen=True)
@@ -22,6 +23,7 @@ class ModelRoute:
     reasoning_effort: str | None
     max_tokens: int
     reasons: tuple[str, ...]
+    cost_class: str = "balanced"
     schema_version: int = 1
 
     def to_dict(self) -> dict[str, Any]:
@@ -33,6 +35,7 @@ class ModelRoute:
             "thinking_enabled": self.thinking_enabled,
             "reasoning_effort": self.reasoning_effort,
             "max_tokens": self.max_tokens,
+            "cost_class": self.cost_class,
             "reasons": list(self.reasons),
         }
 
@@ -47,6 +50,9 @@ class ModelRoute:
         model = str(value.get("model") or "").strip()
         if not model:
             raise ValueError("saved model route does not contain a model name")
+        cost_class = str(value.get("cost_class") or _cost_class_for_tier(tier)).strip().lower()
+        if cost_class not in COST_CLASSES:
+            raise ValueError("saved model route contains an invalid cost class")
         effort = value.get("reasoning_effort")
         return cls(
             provider="deepseek",
@@ -55,6 +61,7 @@ class ModelRoute:
             thinking_enabled=bool(value.get("thinking_enabled", False)),
             reasoning_effort=str(effort) if effort else None,
             max_tokens=_positive_int(value.get("max_tokens"), default=4096),
+            cost_class=cost_class,
             reasons=_reasons_from_value(value.get("reasons")),
             schema_version=_positive_int(value.get("schema_version"), default=1),
         )
@@ -70,6 +77,8 @@ class ModelRouter:
             raise ValueError("Deep Agent supports only the DeepSeek model provider")
 
     def route(self, task: TaskRoute, *, explicit_tier: str | None = None) -> ModelRoute:
+        if not isinstance(task, TaskRoute):
+            raise TypeError("ModelRouter requires a TaskRoute from TaskRouter")
         configured_tier = (
             str(explicit_tier if explicit_tier is not None else self.config.get("model.routing.tier", "auto"))
             .strip()
@@ -83,12 +92,8 @@ class ModelRouter:
             tier = configured_tier
             reasons.append("configured-tier")
         else:
-            tier = self._automatic_tier(task)
-            reasons.append(f"task-{task.mode}")
-            if task.risk == "high":
-                reasons.append("high-risk")
-            if task.failure_count >= 2:
-                reasons.append("repeated-failure")
+            tier, automatic_reasons = self._cost_aware_tier(task)
+            reasons.extend(automatic_reasons)
 
         routing_enabled = bool(self.config.get("model.routing.enabled", True))
         model, used_override = self._model_for_tier(tier, routing_enabled=routing_enabled)
@@ -103,6 +108,7 @@ class ModelRouter:
             thinking_enabled=thinking_enabled,
             reasoning_effort=reasoning_effort,
             max_tokens=_positive_int(self.config.get("model.max_tokens", 4096), default=4096),
+            cost_class=_cost_class_for_tier(tier),
             reasons=tuple(dict.fromkeys(reasons)),
         )
 
@@ -112,21 +118,41 @@ class ModelRouter:
         return self.route(task, explicit_tier=explicit_tier)
 
     @staticmethod
-    def _automatic_tier(task: TaskRoute) -> str:
+    def _cost_aware_tier(task: TaskRoute) -> tuple[str, tuple[str, ...]]:
+        """Select the least costly tier that satisfies local task signals."""
+
         if "configured-mode" in task.reasons:
-            return {"simple": "fast", "standard": "standard", "large": "standard", "deep": "deep"}.get(
-                task.mode, "standard"
+            tier = {"simple": "fast", "standard": "standard", "large": "standard", "deep": "deep"}.get(
+                task.mode,
+                "standard",
             )
+            return tier, ("configured-task-mode", f"cost-{_cost_class_for_tier(tier)}")
         if (
             task.mode == "deep"
             or task.risk == "high"
             or task.failure_count >= 2
             or task.task_type in {"architecture", "refactor"}
         ):
-            return "deep"
+            reasons = ["deep-capability-required"]
+            if task.risk == "high":
+                reasons.append("high-risk")
+            if task.failure_count >= 2:
+                reasons.append("repeated-failure")
+            if task.task_type in {"architecture", "refactor"}:
+                reasons.append(f"task-type-{task.task_type}")
+            reasons.append("cost-high")
+            return "deep", tuple(reasons)
         if task.mode == "simple" and task.risk == "low":
-            return "fast"
-        return "standard"
+            return "fast", ("simple-low-risk", "cost-low")
+        if task.mode == "large" and task.risk == "low":
+            return "standard", ("large-low-risk", "cost-balanced")
+        return "standard", (f"task-{task.mode}", "cost-balanced")
+
+    @staticmethod
+    def _automatic_tier(task: TaskRoute) -> str:
+        """Compatibility helper returning only the selected tier."""
+
+        return ModelRouter._cost_aware_tier(task)[0]
 
     def _model_for_tier(self, tier: str, *, routing_enabled: bool) -> tuple[str, bool]:
         # `*_model` is the canonical v0.9 shape. The nested form is accepted so
@@ -172,6 +198,10 @@ def _thinking_enabled(value: Any) -> bool:
     if isinstance(value, bool):
         return value
     return str(value or "").strip().lower() in {"enabled", "true", "on", "1"}
+
+
+def _cost_class_for_tier(tier: str) -> str:
+    return {"fast": "low", "standard": "balanced", "deep": "high"}.get(tier, "balanced")
 
 
 def _positive_int(value: Any, *, default: int) -> int:

@@ -167,6 +167,8 @@ class TaskRouter:
         if action:
             score += 1
             reasons.append("project-action")
+        if mutation:
+            reasons.append("mutation-request")
         if large_signal:
             score += 2
             reasons.append("large-scope")

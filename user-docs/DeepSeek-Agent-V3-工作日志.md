@@ -1,354 +1,106 @@
-# DeepSeek Agent V3 工作日志（0.9.0）
+# DeepSeek Agent V3 工作日志（0.9.1）
 
-日期：2026-07-13
+日期：2026-07-14
 
-## 0.9.0 Context Intelligence 与 DeepSeek 路由
+## 目标
 
-### 目标
+在不进行大规模 Runtime 重构的前提下，为 v1.0 核心接口冻结准备：让 Context Builder 成为唯一上下文入口，冻结 `CLI -> Runtime -> AgentState -> Prompt -> Capability -> Permission` 契约，最小化稳定 Event Bus，整理 AgentState schema，增加 DeepSeek-only cost-aware 路由，并解决 N3-006 的双分类风险。
 
-落实用户确认的 v0.9.0 路线：让所有进入模型的长期/项目/任务/会话/语义/能力信息经过统一 ContextPackage；用本地 Task Router 判断任务类型、规模和风险；只在 DeepSeek 模型族内按 fast/standard/deep 档位路由；恢复 GitHub Actions。v0.10 之后的 Intent Journal、Event 演进、Memory 强化与 Worker Runtime 只保留后续方向，本次不混入。
+## 根因
 
-### 根因
+1. PromptBuilder 虽已有 Package 正式入口，但仍保留 v0.8 的 State/Snapshot/Memory 分散参数与 `append_resume()`，外部调用仍可绕过 ContextPackage。
+2. Runtime 仍实例化 `TaskStrategySelector` 生成计划，使 deprecated facade 留在正式路径；`task_strategy.py` 的分类、路由和计划职责不够清楚。
+3. AgentState schema 只有版本数字，没有正式字段顺序、冻结身份和统一 `validate()`，损坏或未来状态可能在更深处才失败。
+4. 现有 EventBus 能发布和订阅，但没有稳定 schema、run 关联、反序列化、取消订阅和嵌套发布错误语义，后续迁移缺少可依赖边界。
+5. Model Router 已有 fast/standard/deep 能力档位，但没有单独持久化成本级别和充分可解释的本地选择原因。
 
-1. 0.8.0 的 `context.max_prompt_chars` 只约束项目文本，Memory、Task/Session 和 Capability 摘要随后在 Prompt 层追加，缺少统一总预算。
-2. Prompt Builder 同时选择、压缩和渲染上下文，Resume 摘要与失败恢复 Memory 可以绕过 Context Builder。
-3. 0.8.0 只有 simple/standard/large/deep 执行策略，没有持久化的任务类型、规模、风险和精确模型决策。
-4. DeepSeek Client 在构造时固定单个模型，无法在不修改共享状态的前提下逐请求选择模型。
-5. GitHub OAuth 旧凭据失效且之前缺少 `workflow` scope，Actions 文件无法推送。
+## 实现
 
-### 实现
+### Context 与 Prompt
 
-- 新增结构化 `ContextSection`、`ContextBuildRequest` 和 `ContextPackage`；Prompt Builder 的正式入口只接收 Package。
-- 统一装配 Task、Execution、Resume、项目指令、项目文档、Workspace、Semantic、Memory、Capabilities 和 Recovery；标题/分隔符计入总预算，并按完整记录、段落或行截断。
-- 用户请求也计入 ContextPackage 总预算；超长请求保留首尾，超过 250000 字符的粘贴输入明确拒绝并提示改用项目文件分块处理。
-- `context.generated.md` 仍只保存公开项目上下文；Memory、Session、Recovery 仅存在内存 Package，不落盘到项目缓存。
-- AGENTS/CLAUDE/context.md 优先于普通 README；Semantic 作为独立 section 参与选择，不再依赖最终整段切片。
-- Runtime 对初始请求和 Resume 先建立 Package；失败恢复使用每个 turn 总计 6000 字符的 recovery delta。
-- Memory 检索可延迟 usage 更新，只有实际进入 Package 的 ID 才增加 `use_count`。
-- 新增 `TaskRoute`：task_type、scale、risk、mode、score、reasons、轮次、计划和分块标志。
-- 新增 DeepSeek-only `ModelRoute`：tier、精确模型名、Thinking、reasoning effort、max tokens 和原因。
-- simple 低风险默认 fast；普通任务 standard；deep/高风险/架构重构/重复失败使用 deep。large 只读任务依靠分块和 16 轮处理，不强制最高推理档。
-- 三档默认安全回落到已有 `model.model`；允许用户填写已确认可用的 DeepSeek 档位模型，不内置未经当前 API 验证的 flash 名称。
-- DeepSeek Client 支持逐请求 `model`，不修改共享 `self.model`；非 DeepSeek Provider fail-closed。
-- AgentState schema 升级为 2，保存 task_route、model_route 和 context_manifest；旧 v0.8 Session 缺字段时仍可恢复。
-- Resume 只允许任务模式/模型档位升级；同档保留原 Session 的精确模型，配置变化不会让任务中途无意换模。
-- 控制台显示执行模式和 DeepSeek 档位，继续保留流式 `reasoning_content` 与 elapsed Thinking。
-- 恢复 `.github/workflows/test.yml`：Python 3.11/3.12/3.13、最小权限、并发取消、20 分钟超时、pip cache、Ruff、pytest、compileall。
-- GitHub 设备登录已由用户确认，权限范围已核验包含 `repo` 与 `workflow`；未读取或输出真实 Token。
+- PromptBuilder 公开入口冻结为 `build_initial(package: ContextPackage)` 和 `build_resume(package: ContextPackage)`。
+- 删除 `append_resume()`、`_runtime_context()` 及所有分散参数兼容入口。
+- Prompt 模块不导入 ContextBuilder、ContextSnapshot 或 AgentState，也没有文件读取路径。
+- Runtime 的 initial/Resume 测试记录 ContextBuilder 产出的 Package，并验证传给 PromptBuilder 的是同一对象。
 
-### 测试与审查
+### Interface Contract
+
+- 新增 `agent/contracts.py`，定义核心链、Context 链、Event schema 和 AgentState schema/字段常量。
+- 新增 Interface Contract Test，冻结 Runtime 入口签名、Prompt 单 Package 签名、ContextPackage 字段、ToolRequest/ToolResult 字段、ModelRoute 字段、AgentState 字段和 Permission 前置执行顺序。
+- 契约测试证明模型工具调用必须先经过 PermissionManager，再进入注册 handler。
+
+### Task、计划与 Model Router
+
+- TaskRouter 成为唯一分类器，统一生成 type/scale/risk/mode/score/reasons/failure/mutation 证据。
+- 新增 `TaskPlanFactory`，只接受 TaskRoute，不再分析 Prompt 或维护第二套评分规则。
+- Runtime 删除 TaskStrategySelector 的 import、实例化和调用。
+- `task_strategy.py` 仅保留 deprecated DTO/facade；兼容调用全部委托 TaskRouter/ModelRouter/TaskPlanFactory，并产生 DeprecationWarning。
+- ModelRoute 新增 `cost_class`：low、balanced、high；旧 Session 缺字段时按 tier 推导。
+- 本地策略：simple+low -> fast/low；普通与大型只读 -> standard/balanced；deep、高风险、架构/重构或重复失败 -> deep/high。
+- 显式模型 tier 和显式 task mode 继续优先；DeepSeek 是唯一 Provider，其他 Provider fail-closed。
+
+### AgentState
+
+- 增加 `SCHEMA_VERSION`、`SERIALIZED_FIELDS`、`FROZEN_FIELDS`、`validate()` 和冻结基线。
+- 冻结 session_id、project、working_directory、created_at；请求、路线、计划进度、输出和 updated_at 可变。
+- 校验 Session 身份、ISO 时间、状态、plan ID/依赖/环、current/completed 派生字段、Memory/Tool 集合、Task/Model route、DeepSeek Provider、cost class 和 Context manifest 边界。
+- schema v1 仍兼容加载并只修复历史派生 plan 字段；未来未知 schema 明确拒绝。
+
+### 最小 Event Bus
+
+- Event schema v1 冻结：schema_version、id、name、timestamp、project_id、session_id、run_id、payload。
+- 增加 `to_dict()`、`from_dict()`、`effective_run_id` 和时间戳验证。
+- `subscribe()` 返回取消函数；增加幂等 `unsubscribe()`；`publish()` 可接收事件名或既有 Event。
+- 一个订阅者失败不会阻止后续订阅者；嵌套 publish 不覆盖外层最终错误。
+- Runtime、ToolManager、MemoryPipeline 补充 run_id 关联；JSONL 使用相同事件结构并继续脱敏。
+- 本次没有迁移 Session、Memory 等全部副作用，也没有实现 durable broker、重放、跨进程顺序或事务交付。
+
+### 文档与案例
+
+- 新增 `docs/architecture-v0.9.1.md`，详细说明所有权、Event API、禁止事项和未来扩展清单。
+- 架构文档进一步给出 Event 发布者的命名/关联/脱敏规则、可取消订阅者模板、同步执行风险、幂等键和分步迁移顺序；明确不能把 `publish()` 成功当成持久化保证。
+- 架构文档补充 AgentState 扩展约定：新字段必须有旧 Session 默认值与迁移测试，不允许就地改义旧字段，`validate()` 必须保持确定性且无副作用。
+- 新增 `docs/releases/v0.9.1.md`、更新源码 README、实现说明和中文使用说明。
+- 新增 `实用案例-v0.9.1/interface-routing-demo.py`，可离线演示四种路由、计划和 Event 错误隔离。
+- GitHub Actions 保持 `actions/checkout@v5` 与 `actions/setup-python@v6`，避免 Node.js 20 弃用警告。
+
+## 测试与审查
 
 ```text
-113 tests passed（含真实 PTY）
-49 项 Context/Router/Runtime/DeepSeek/Memory 定向回归 passed
+130 tests passed（完整测试含真实 PTY）
+Interface Contract tests passed
+Event/AgentState contracts passed
+ContextPackage/Prompt/Runtime/Router/Permission regression passed
 Ruff check passed
 Ruff format check passed
 compileall passed
 git diff --check passed
+离线接口实用案例 passed
 ```
 
-覆盖 ContextPackage 总字符预算、中文与完整边界截断、AGENTS 优先级、Semantic、私有 Memory 不落盘、Recovery 总预算、任务分类边界、风险/失败升级、三档模型回落与用户覆盖、非 DeepSeek 拒绝、逐请求模型隔离、旧 State 恢复、短 Resume 不降级和精确模型保持。
+最终审查额外修正：
 
-第一次在临时 Git 克隆运行真实 PTY 测试时，只因克隆未包含 `.venv` 而找不到测试解释器；添加指向现有虚拟环境的临时 Git 忽略链接后，全量通过。该链接未进入版本控制，不属于产品缺陷。
+1. TaskPlanFactory 最初若只按 task_type 判断，会把“架构并实现”误当只读计划；TaskRouter 现持久化 mutation-request，计划工厂仍只消费 TaskRoute。
+2. Event 新增 run_id 后，Runtime/Tool/MemoryPipeline 统一传递，旧 payload run_id 仍由 effective_run_id 兼容。
+3. Event payload 保持防御性浅复制而非 MappingProxy，避免破坏现有 `dict` 序列化/消费者契约；文档明确 handler 不应并发修改。
+4. AgentState 冻结字段由内部基线在每次 validate/状态变更时核验，避免只提供手工比较方法而没有实际约束。
 
-### 最终差异审查修正
+## 版本与发布
 
-1. 用户请求最初未计入 Package 总预算：改为有界 head/tail 并计入 `used_chars`，另设 250000 字符输入硬上限。
-2. 单段超长 AGENTS/README 最初可能只剩截断标记：改为保留首尾规则，并修复极小预算下 `-0` 切片反而返回全文的问题。
-3. Resume 同分失败可能保留旧 `failure_count=0`：改为合并失败证据，模型升至 deep，同时保留原任务类型。
-4. large review 后转向 architecture 时，执行模式需要保持 large，但模型需要升 deep：Task Route 与 Model Route 分轴单调合并。
-5. 小于 1000 的 Context hard limit 曾被代码抬高：现严格尊重用户较低硬上限；null/非法字符串安全回落默认值。
-6. v0.8 Session Resume 后仍自报 schema 1：首次 Resume 自动升级为 schema 2。
-7. 自动生成的 `model.yaml` 默认 null 可能遮蔽 `config.yaml` 显式路由模型：加载时只移除“默认遮蔽”，保留 `model.yaml` 非默认值的更高优先级。
+版本升级为 `v0.9.1`。提交哈希、tag、GitHub Actions 运行号和远端核验结果在发布闭环末端填写，并以最终回复为准，避免文档自引用导致无限追加提交。
 
-最终独立差异复核未发现剩余高/中严重度问题。
+本次没有读取或输出真实 API Key，也没有运行在线 DeepSeek 请求。
 
-### 版本与发布
+## 审查问题处理
 
-版本升级为 `v0.9.0`。核心实现提交为 `41e6fd94230cfae26cbb92dd5579326b1a89d7dc`；CI 环境/PTY 可移植性修复为 `fcef10c`；Actions v5/v6 与确定性性能回归修复为 `592922b`。这些提交均已推送到 GitHub `main`。
+- N3-001：当前工作区 `.project-agent/context.md` 版本更新为 0.9.1。
+- N3-002：GitHub Actions TODO 标记已完成。
+- N3-003：后续改进建议更新为 0.9.1，并将 Actions 移到已完成。
+- N3-004/N3-005：当前 Markdown 工作日志只保留 0.9.1；0.9.0、0.8.0、0.7.1 历史日志归档到老版工作日志。
+- N3-006：TaskRouter 唯一分类，TaskPlanFactory 单一计划职责，TaskStrategy deprecated。
 
-GitHub Actions 首轮 `29257025908` 暴露工作流未安装 browser/semantic/ripgrep 且 PTY 测试硬编码 `.venv`；第二轮 `29257619119` 将问题收敛为共享 runner 上 2.5 秒墙钟阈值偶发超限；两轮失败均如实保留并修根因。第三轮 `29257906807` 使用 `actions/checkout@v5`、`actions/setup-python@v6`，Python 3.11/3.12/3.13 三个 job 全部完成 Ruff、113 tests、compileall 并成功。Node.js 20 弃用警告只属于旧 Actions 版本的历史运行，当前工作流已消除。
+## 下一步：Event Bus 整体迁移
 
-最终文档/案例提交、注释标签与远端对象哈希将在闭环末端核验，并以最终回复为准，避免工作日志对自身提交哈希产生无限追加提交。
+用户在 v0.9.1 实施过程中明确要求：必须完成本版本全部工作、tag、推送和 Actions 核验之后，再开始 Event Bus 整体迁移。
 
-### 后续方向
-
-1. v0.10.0：Durable Intent/Result Journal，缩小崩溃恢复时重复副作用窗口。
-2. 逐步把 Runtime 的 Session、Memory、Audit、Metrics 副作用转为稳定 Event 订阅，但不绕过 Capability/Permission。
-3. v0.11.0：根据实际任务结果强化或衰减 Memory。
-4. v0.12.0：共享 Context/Memory/Permission 的 Worker Runtime，而不是多个自治 Agent。
-5. v1.0.0：冻结 Runtime、Router、ContextPackage、Capability、Permission 与 Event 核心接口。
-
-### 用户实用案例
-
-按用户要求在当前目录新建 `实用案例-v0.9.0/order-summary-demo/`。案例包含 CSV 订单数据、故意保留的 cancelled 订单汇总缺陷、浮点金额/输入错误缺陷、2 个描述正确行为的 unittest、项目 AGENTS 约束，以及 simple/standard/large/deep/Resume 的可复制提示词。基线已真实验证为 2 个预期失败，错误输出会把 99 个 cancelled mouse 计入；修复目标和正确结果已写入案例 README。案例不包含 Key，并忽略 `.project-agent` 与 Python 缓存。
-
-## 0.8.0 自适应深度执行工作
-
-### 目标
-
-逐条复核 `analysis-20260713`，修复全部能够复现的问题；同时解决困难问题思考超时、长时间无可见输出，以及大规模文本/代码不能分块处理的问题。参考 `https://gitee.com/free/claude-code` 的 Task、Thinking、Compact、Resume 思路，但保持 DeepSeek 唯一模型和现有权限架构。
-
-### 根因
-
-1. 所有请求共用同一个 8 轮策略，简单问题浪费、复杂问题预算不足。
-2. 复杂任务只依赖 Prompt 要求模型自行规划，首次长推理仍可能超时。
-3. 非流式请求在首字节前没有持续进度，用户误以为程序卡死。
-4. 网络瞬断与临时 5xx 零重试；流式部分输出若盲目重放可能重复工具副作用。
-5. 旧审查报告包含过时或误报项，同时遗漏私有 Memory、符号链接、Queue 路径穿越、Docker 参数绕过和进程组孤儿等真实问题。
-
-### 实现
-
-- 新建 `agent/task_strategy.py`，本地选择 simple/standard/large/deep。
-- large/deep 自动建立有依赖、有完成标准、有重试次数的 starter Task Graph。
-- DeepSeek thinking 按任务选择 disabled/high/max，SSE 流式重组 reasoning/content/tool calls。
-- Console 显示 elapsed Thinking、模式、轮次、当前步骤、工具状态和 reasoning delta。
-- 网络超时、408、500/502/503/504 做有限指数退避；认证/限流切 Key。
-- 部分流中断禁止自动重放，Session 标记 interrupted/resumable 并报告准确 ID。
-- Resume 继承更强的原策略和计划，不被短续写降级。
-- Planner 修复 ID 清理冲突，超过 50 步时显式警告。
-- Daemon Queue 加绝对超时；Shell 超时终止整个进程组。
-- 修复 worktree Git branch、TSX 默认语义索引、损坏 symbol 的 None 渲染。
-- Memory 候选倒排索引降低去重比较量，同时保留前缀不同的相似记录召回。
-- JSONL 内容正则脱敏，日志目录/文件使用 700/600。
-- `.project-agent/memory/` 加入 ignore 和私有路径；拒绝 Agent 目录/源码符号链接逃逸。
-- Queue ID 先校验、锁内重载 canonical 状态、唯一临时文件、按 mtime 选最新。
-- 普通/YOLO 模式拒绝 Docker root、socket、device 和 host namespace 访问。
-- 已生成并本地核验 GitHub Actions Python 3.11/3.12/3.13 矩阵；远端发布受当前凭据 `workflow` scope 限制，未虚报为已启用。
-- 首次 Project 初始化增加项目锁和原子 YAML；Context/Workspace 缓存改用唯一临时文件。
-- 同一 Session 的并发 Resume 增加 per-session flock，拒绝重复 turn。
-- Daemon 使用精确 argv + `/proc` starttime 身份校验；Queue 超时终止整个进程组。
-- Shell 输出、HTTP 请求体/Header、文档输入、浏览器下载和 MCP 分页增加硬上限。
-
-### 审查结论
-
-已确认并修复：C-002、C-003、C-004、C-005、C-007、C-008、S-002、T-006，以及审查未列出的 TSX、Memory 私有边界、symlink、Queue traversal/stale load、Docker 变体、子进程超时问题。
-
-不处理的旧结论：`docs/releases/` 实际已存在；React 检测和 secrets.env 引号内 `=` 已修；当前目录本来就是文档入口，不应单独初始化为第二套源码仓库；parallel 的 8 任务阈值是明确架构策略；代码/用户文档中英分工不是运行缺陷；LICENSE 需要用户选择法律许可，不能替用户假定。
-
-### 测试
-
-```text
-86 tests passed
-Ruff check passed
-Ruff format check passed
-compileall passed
-真实 PTY：空 Enter、/help、/exit passed
-DeepSeek SSE reasoning/tool call assembly passed
-超时 retry、partial stream no replay passed
-symlink/traversal/Queue stale state/Docker escape/process group passed
-Memory 1200 条候选性能回归 passed
-```
-
-### 版本与发布
-
-版本升级为 `v0.8.0`（新能力使用 minor 版本）。源码 README、实现说明、`docs/releases/v0.8.0.md`、用户 README、工作日志和 Word 文档同步更新。
-
-核心发布提交：`1770b39`；后续仅追加发布核验文档。GitHub 远端 `main` 与注释标签 `v0.8.0` 已在发布闭环末端通过 `git ls-remote` 核验为同一提交；最终对象哈希以 GitHub 标签和本次最终回复为准，避免文档提交自引用造成无限追加提交。
-
-推送时发现当前 GitHub OAuth 凭据只有 `repo`、没有 `workflow` scope，GitHub 明确拒绝新增 `.github/workflows/test.yml`。为不阻塞源码、安全修复、测试、文档和标签发布，本轮将 CI 工作流草案留作后续改进，未在远端声称 CI 已启用；本地 Ruff、pytest、format、compileall 全部通过。
-
-### 下一步
-
-- 为 Parallel worker 增加按任务/全局超时与保留失败 worktree 策略。
-- 为工具执行增加 durable intent/result journal，缩小 SIGKILL 后恢复重复副作用窗口。
-- 为 Session 增加 revision/CAS，支持未来可控的并发 turn 合并策略。
-- 若用户选择许可证，再增加 LICENSE；许可证属于法律授权，不自动假设。
-
-## 一、工作目标
-
-在 `v0.7.0` 后修复 WSL/GNU Readline 交互输入提交问题，并补充跨 AI 协作规范。V1.0 仅写入后续规划，不在本次实施。
-
-## 0.7.1 补丁工作
-
-### 问题表现
-
-交互模式中，用户输入任务后按 `Enter` 在部分 WSL 终端中会看起来没有提交，光标或换行位置错位，容易误认为 Agent 仍在等待继续输入。
-
-### 根因
-
-`ConsoleUI` 使用 GNU Readline 的 `input()` 读取命令，但彩色 Prompt 包含裸 ANSI 转义序列。Readline 会把这些不可见字节误算为可见字符，造成光标位置和自动换行计算错误。问题不是 DeepSeek 请求未发出，而是输入界面的可见状态不可靠。
-
-### 修复
-
-- Readline 活跃时用 `\001` 与 `\002` 包裹 ANSI 开始/结束序列。
-- 调用 `input()` 前刷新 stdout。
-- 空 Enter 输出具体提示。
-- 自然语言任务提交后输出处理状态。
-- `Ctrl+C` 不再让交互程序直接退出，保留可恢复 Session 并回到 Prompt。
-
-### 验证
-
-- 新增两项 ConsoleUI 回归测试。
-- 在真实 PTY 中验证：空 Enter 显示提示，`/help + Enter` 立即执行，`/exit` 正常退出。
-- 完整测试、Ruff、格式和编译检查通过。
-
-### 附加根目录健壮性修复
-
-在隔离终端验证中发现，Project Manager 以前只要看见祖先目录中存在 `.git` 就将其认定为 Git 根。空 `.git` 占位目录会让项目错误落到父目录。现已要求 `.git/HEAD` 存在，或 `.git` 文件以 `gitdir:` 指向 worktree 元数据，并新增对应回归测试。
-
-### 发布
-
-版本升级为 `v0.7.1`，发布到现有 GitHub 仓库并创建标签。当前目录的使用说明、工作日志、Word 文档和 `AGENTS.md` 同步更新。
-
-正式发布提交：`94b6bab`（`fix: Deep Agent v0.7.1 interactive input`）。GitHub `main` 已推送，`v0.7.1` 注释标签指向该提交。
-
-用户关闭 Word 后，已将旧版 `0.7.0` 使用说明归档到 `老版使用说明/`，工作日志归档到 `老版工作日志/`。新版 `0.7.1` Word 文档保留在当前目录，作为唯一的当前版本说明。
-
-## 二、版本推送理由与优化方向
-
-### v0.5.0
-
-推送理由：形成可稳定使用的安全基线，先解决文件预览、快照回滚、外部 MCP、浏览器登录态、下载、Queue 和 worktree 并行等实际闭环。
-
-对应提交：`4958b59`。
-
-优化方向：不继续堆叠工具，转向统一的 Planner、状态和项目事实。
-
-### v0.6.0
-
-推送理由：把复杂任务、Resume、Queue 和 Parallel 统一到 AgentState 与依赖感知 Task Graph，并增加 Workspace Memory、Reflection、Execution Context 和 Capability Health。
-
-对应提交：`9fd2595`。
-
-优化方向：增加修改后即时诊断、语义关系、Memory 生命周期和后台增量维护。
-
-### v0.7.0
-
-推送理由：使 Agent 能在写入代码后立即发现 Python/JS/TS 问题，长期控制 Prompt 与 Memory 增长，并允许后台低频维护索引。
-
-优化方向：V1.0 冻结核心 Runtime 接口，统一 Context Builder 和 Event Bus 副作用边界，持续通过 Capability Registry 扩展能力。
-
-## 三、0.7.0 实现过程
-
-### 1. LSP Diagnostics
-
-- 新建 `agent/tools/lsp.py`。
-- Pyright 解析 JSON Diagnostics。
-- TypeScript 使用 `tsc --noEmit`，解析文件、行、列、错误码和消息。
-- Pyright 与 TypeScript 独立判断可用性，不要求同时安装。
-- 扫描跳过依赖、构建、Git、Agent 私有目录。
-- `file_apply` 后自动诊断，但诊断错误不把已成功的原子写入标成失败。
-
-### 2. Semantic Context
-
-- `index.semantic.json` 增加 module summary、exports、relationships。
-- Python 相对 import 和 JS/TS 相对 import 映射到项目内部文件。
-- 外部依赖不生成虚假的内部边。
-- Prompt 只加载受限摘要，最终强制执行 `max_prompt_chars`。
-
-### 3. Memory 生命周期
-
-- SQLite 增加 `confidence`、`use_count`、`last_used_at`、`expires_at`、`merged_into`。
-- 普通检索命中后更新使用次数和最后使用时间。
-- 非保护 Memory 自动设置默认过期时间。
-- `agent memory maintain` 预览去重和过期清理。
-- `agent memory maintain --apply` 执行维护。
-- 合并使用“首选记录相似度”分组，避免相似链导致端点低于阈值仍被归并。
-- merged 记录从 list、stats、recent、FTS、LIKE、Vector fallback 全部过滤。
-- 删除主记录时一并清理归并子记录和向量数据。
-
-### 4. Compact Resume
-
-- 参考 Claude Code 的有界上下文思想。
-- Resume 不再无限保留历史 raw Tool transcript。
-- 保留 System Prompt、上一轮最终结果摘要、AgentState、Execution Context、当前项目 Context、Memory 和能力摘要。
-
-### 5. Daemon
-
-- 新建 `agent/daemon.py`。
-- `agent daemon start/run/status/stop`。
-- 标准库轮询，无额外 watchdog 依赖。
-- 每项目独立 PID、文件锁、stop 文件、状态 JSON 和日志。
-- PID 操作前检查 `/proc/<pid>/cmdline`，避免 PID 复用误杀无关进程。
-- 默认只维护 Context 和 Memory，Queue 后台执行默认关闭。
-
-### 6. 并发和存储
-
-- SQLite 使用 WAL、30 秒 busy timeout。
-- 旧数据库 FTS 数量不一致时执行 rebuild，避免迁移前 Memory 无法全文检索。
-- Queue 增加跨进程文件锁，防止多个终端或 Daemon 重复执行。
-- 默认配置迁移增加跨进程锁和唯一临时文件，修复多个 Agent 同时启动时 `config.yaml.tmp` 被抢占的问题。
-
-## 四、完整代码审查发现与修复
-
-1. Memory 合并后可能被 FTS/limit/recent/stats 重新返回：已统一 SQL 条件与 Vector fallback。
-2. Memory 相似链可能过度合并：改为 keeper-relative 分组。
-3. `recent()` SQL 的 AND/OR 优先级错误：增加括号。
-4. 过期时间字符串直接比较不够稳健：改为 timezone-aware datetime。
-5. LSP 误要求 Pyright 和 tsc 同时存在：改为独立降级。
-6. `file_apply` 写入成功但诊断报错时整体失败：改为成功结果附带诊断。
-7. Context 添加语义摘要后可能超过总上限：最终渲染再次截断。
-8. Resume 历史消息无限增长：改为 compact checkpoint。
-9. Runtime 资源释放只依赖进程退出：增加显式 `runtime.close()`，并在 REPL/Queue/一次性命令退出时调用。
-10. Daemon 每轮恢复 active Queue 会干扰前台任务：删除该行为。
-11. Daemon PID 可能复用：增加命令行和项目根路径身份检查。
-12. Daemon 和 Memory 输出未完全使用 AppConfig.data_dir：统一配置注入。
-13. Queue 缺少跨进程互斥：增加 `fcntl.flock`。
-14. Parallel worker 异常会丢失任务编号：保留 future 对应的 index 和 prompt。
-15. Broken 能力仍出现在 Prompt 摘要和 loaded_tools：统一按 Health 过滤。
-16. Task Graph current_step 可能指向依赖未满足步骤：只选择 ready pending step。
-17. Workspace Memory 假设 package.json dependencies 一定是对象：增加类型检查。
-18. Workspace Memory 读取异常可中断 Context：增加 OSError 容错。
-19. Event 日志脱敏覆盖不足：增加 cookie、password、secret、apikey 等字段。
-20. 多 Agent 同时配置迁移发生唯一临时文件竞争：加入 `.config.lock` 和 UUID 临时文件。
-
-## 五、参考工程分析
-
-参考工程：`https://gitee.com/free/claude-code`。
-
-采纳：
-
-- Context 必须有边界，不能依赖模型窗口无限增长。
-- 资源加载必须限制路径、数量、大小和格式。
-- 工具不可用、需配置、已禁用、故障必须可观察。
-- Session/worktree 状态必须支持恢复。
-- Tool Loop 必须显式，不能让框架隐藏权限边界。
-
-不采纳：
-
-- Java/Spring 第二 Runtime。
-- 多模型 Provider 抽象，当前坚持 DeepSeek 唯一模型。
-- 全屏 TUI、JAR 插件、任意 Hook、遥测。
-- 无限制 Skills/Agents 自动加载。
-- 任何绕过 Capability/Permission 的调用路径。
-
-## 六、测试与运行验收
-
-最终结果：
-
-```text
-55 tests passed
-Ruff check passed
-Ruff format check passed
-compileall passed
-12 个 agent health 并发启动通过
-DeepSeek API Key 5/5 在线通过
-Docker daemon 与代理正常
-docker run --rm hello-world 通过
-Capability Health：所有已启用能力 Available
-Daemon run --once：完成索引维护并清理 PID
-```
-
-## 七、关键文件
-
-```text
-~/AI-Agent/agent/daemon.py
-~/AI-Agent/agent/tools/lsp.py
-~/AI-Agent/agent/memory.py
-~/AI-Agent/agent/context.py
-~/AI-Agent/agent/prompt.py
-~/AI-Agent/agent/task_queue.py
-~/AI-Agent/tests/test_v07_intelligence.py
-~/AI-Agent/docs/releases/v0.7.0.md
-```
-
-## 八、后续 V1.0 方向
-
-V1.0 暂不实施，只保留以下方向：
-
-1. 冻结 `CLI -> Runtime -> AgentState -> Prompt -> Capability -> Permission` 核心接口。
-2. Prompt Builder 不直接读取文件，所有上下文统一由 Context Builder 提供。
-3. Runtime 不直接产生模块副作用，统一发布 Event，由订阅者维护 Memory、Session、Reflection、Workspace 和统计。
-4. GitHub、Jira、Notion、数据库、更多 MCP 和开发工具继续通过 Capability Registry 接入。
-5. 保持 DeepSeek 唯一模型，不引入多 Agent 调度中心。
+下一版本将另建检查点，不混入 v0.9.1。优先建立副作用清单、事件命名与幂等策略，再逐步迁移 Session、Memory、Audit、Metrics 等。任何工具执行仍必须遵循 `ToolRequest -> PermissionManager -> ToolResult`；Event 只能承接记录和副作用编排，不能成为绕过权限的执行通道。

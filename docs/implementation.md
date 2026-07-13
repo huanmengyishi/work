@@ -6,10 +6,11 @@ Deep Agent V3 is a local, project-centric coding Agent powered only by DeepSeek.
 It runs under WSL Ubuntu and can be started from any directory. Program files,
 user configuration, long-term data, and project-local context remain separate.
 
-Version `0.9.0` adds deterministic Task and DeepSeek-only Model routers plus a
-single bounded `ContextPackage` entry for Prompt rendering. It preserves the
-capability and permission boundaries and the streamed Thinking behavior from
-v0.8.0.
+Version `0.9.1` stabilizes the interfaces introduced in v0.9.0. ContextBuilder
+is the only context-selection entry, PromptBuilder only consumes a
+`ContextPackage`, AgentState has a validated/frozen schema, and a minimal
+versioned Event Bus contract is ready for incremental future migration. The
+runtime remains DeepSeek-only and preserves streamed Thinking from v0.8.0.
 
 ## 2. Runtime Architecture
 
@@ -17,8 +18,8 @@ v0.8.0.
 CLI
   -> ProjectManager / ProjectRegistry
   -> AgentRuntime
-     -> TaskRouter
-     -> ModelRouter (DeepSeek only)
+     -> TaskRouter -> TaskPlanFactory
+     -> ModelRouter (DeepSeek only, cost-aware)
      -> AgentState
      -> SessionManager
      -> ContextBuilder -> ContextPackage
@@ -43,6 +44,10 @@ CLI
 belongs in `agent/runtime.py`. Model-independent state belongs in
 `agent/state.py`; context selection and budgeting belong in `agent/context.py`;
 Prompt rendering belongs in `agent/prompt.py`.
+
+The executable contract version and frozen field sets live in
+`agent/contracts.py`. Full boundary ownership, compatibility rules, and the
+minimal Event API are documented in `docs/architecture-v0.9.1.md`.
 
 ## 3. Program, Config, Data, and Project Files
 
@@ -104,16 +109,19 @@ SHA-256: 5ec7002ab0922bc1702470c0d669bff65d3a76607a75e98e34c630882899b056
    when the file fingerprint changes.
 5. SQLite FTS and optional Chroma retrieve project and global memory.
 6. `TaskRouter` locally classifies type, scale, risk, and execution mode.
-7. `ModelRouter` maps that route to a fast, standard, or deep DeepSeek tier.
-8. `AgentState` stores both routes and the resumable execution state.
-9. `ContextBuilder` selects and bounds task, project, Session, semantic,
+7. `TaskPlanFactory` consumes the route when a local starter plan is required;
+   it never scans or classifies the original Prompt.
+8. `ModelRouter` maps that route to a fast, standard, or deep DeepSeek tier and
+   records a low, balanced, or high cost class.
+9. `AgentState` validates and stores both routes and resumable execution state.
+10. `ContextBuilder` selects and bounds task, project, Session, semantic,
    Memory, recovery, and capability-summary sections into one Context Package.
-10. `PromptBuilder` renders system policy, the Package, and the user request.
-11. DeepSeek either answers or emits tool calls.
-12. Every call becomes `ToolRequest`, passes centralized permission checks, and
+11. `PromptBuilder` renders system policy, the Package, and the user request.
+12. DeepSeek either answers or emits tool calls.
+13. Every call becomes `ToolRequest`, passes centralized permission checks, and
    returns structured `ToolResult` with stdout, stderr, data, and duration.
-13. State and messages are checkpointed after each tool call.
-14. A terminal event finalizes session files and triggers the idempotent memory
+14. State and messages are checkpointed after each tool call.
+15. A terminal event finalizes session files and triggers the idempotent memory
     pipeline.
 
 Both routers are deterministic and consume no extra API request. Task routing
@@ -128,6 +136,11 @@ branch, loaded memory IDs, loaded tools, plan, current step, completed steps,
 tool evidence, status, round, turn, structured Task/Model routes, and a compact
 Context Package manifest.
 
+`AgentState.validate()` checks the published serialized field order, frozen
+Session identity, supported schema version, timestamps, plan graph, derived
+step fields, DeepSeek route, cost class, and Context manifest bounds. Schema v1
+Session files remain loadable; an unknown future schema fails closed.
+
 The model can call:
 
 ```text
@@ -136,7 +149,9 @@ agent_update_step
 ```
 
 V3 does not force an extra planning API call for every task. Large/deep work
-receives a local starter plan; the same DeepSeek tool loop refines it. On
+receives a local starter plan from `TaskPlanFactory`; the same DeepSeek tool
+loop refines it. TaskRouter is the only classifier. `task_strategy.py` is a
+deprecated compatibility facade and Runtime does not instantiate it. On
 Resume, `more_capable_task_route()` retains the previous route unless the new
 request is more capable or higher risk. `more_capable_model_route()` retains
 the exact previous DeepSeek model at equal/lower tiers and changes it only for
@@ -149,6 +164,16 @@ fast      thinking off
 standard  thinking on, reasoning_effort=high
 deep      thinking on, reasoning_effort=max
 ```
+
+The persisted cost classes are:
+
+```text
+low       simple, low-risk request
+balanced  standard work or large read-only work
+high      deep/high-risk/architecture/refactor/repeated-failure work
+```
+
+They explain local resource selection and are not token-price calculations.
 
 `model.routing.fast_model`, `standard_model`, and `deep_model` default to
 `null`. Consequently all three tiers use `model.model` by default; distinct
@@ -209,7 +234,7 @@ points, file metadata, and Python/general source symbols. It is intentionally
 not a full language-server database. Optional Tree-sitter semantic data remains
 a bounded sidecar and never replaces the base index.
 
-`ContextBuilder.build_package()` is the only v0.9 path for model-visible base
+`ContextBuilder.build_package()` is the only v0.9.1 path for model-visible base
 context. It produces typed sections, records omitted/truncated sources, and
 computes `used_chars` from the final rendering including headings and section
 separators. Task state and project instructions are selected first; other
@@ -245,6 +270,32 @@ context. Long-term Memory, Session outcomes, and failure-recovery text stay in
 the in-memory Package and Session checkpoint. Resume rebuilds the Package from
 current project data and a bounded previous outcome instead of restoring an
 unlimited raw tool transcript.
+
+PromptBuilder has only `build_initial(package)` and `build_resume(package)`.
+It imports no State/Snapshot builder and performs no file I/O. This is an
+intentional compatibility break for external v0.8 callers that passed separate
+context parameters.
+
+### Minimal Event contract
+
+`Event` schema version 1 serializes the following stable fields:
+
+```text
+schema_version, id, name, timestamp,
+project_id, session_id, run_id, payload
+```
+
+`EventBus.subscribe()` returns a cancellation callback. `unsubscribe()` is
+idempotent, `publish()` accepts either a name plus metadata or an existing
+Event, and subscriber exceptions are isolated in `last_errors`. Runtime and
+ToolManager publish `run_id` correlation metadata. JSONL records use the same
+shape and retain log redaction.
+
+The bus is synchronous and process-local. There is no replay, durable queue,
+delivery retry, cross-process ordering, or transactional tool coupling in this
+release. MemoryPipeline keeps its existing subscriptions; Session persistence
+is not migrated. See `docs/architecture-v0.9.1.md` before adding subscribers or
+moving side effects.
 
 ## 7. Tool Protocol and Capability Registry
 
@@ -463,10 +514,11 @@ Run the release checks locally without exposing credentials:
 
 `.github/workflows/test.yml` uses `actions/checkout@v5` and
 `actions/setup-python@v6`, installs browser/semantic integration dependencies,
-and runs the same Ruff, 113-test, and compileall checks for Python 3.11, 3.12,
-and 3.13. Hosted run `29257906807` passed for all matrix entries. This does not
-claim an online DeepSeek API check; run `agent doctor --online` only with
-private credentials present.
+and runs the same Ruff, 130-test, and compileall checks for Python 3.11, 3.12,
+and 3.13. These action versions use the current runner Node.js runtime and avoid
+the Node.js 20 deprecation warning. The v0.9.1 hosted run is recorded during
+release publication. This does not claim an online DeepSeek API check; run
+`agent doctor --online` only with private credentials present.
 
 ## 19. ECC Reference Decisions
 
@@ -481,6 +533,10 @@ would add disproportionate complexity to this single-model local CLI.
 The following were intentionally not implemented in this upgrade:
 
 - General multi-agent role scheduling.
+- Full Event migration or a durable Event broker.
+- Worker Runtime and complete Runtime redesign.
+- GitHub/Jira/Notion integrations.
+- Non-DeepSeek providers.
 - A full semantic call/reference graph or LSP database.
 - Web UI and remote collaboration.
 - MCP prompts, subscriptions, and resource change notifications.

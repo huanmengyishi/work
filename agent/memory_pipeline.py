@@ -31,7 +31,7 @@ class MemoryPipeline:
 
     def handle(self, event: Event) -> None:
         state = event.payload.get("state") or {}
-        run_id = str(state.get("run_id") or event.payload.get("run_id") or "")
+        run_id = str(state.get("run_id") or event.effective_run_id or "")
         if run_id and self.memory.is_pipeline_run_processed(run_id):
             return
 
@@ -59,6 +59,7 @@ class MemoryPipeline:
                 {"memory_id": summary_id, "run_id": run_id},
                 project_id=self.project.id,
                 session_id=session_id,
+                run_id=run_id or None,
             )
 
         experience_id: int | None = None
@@ -85,6 +86,7 @@ class MemoryPipeline:
                 {"memory_id": experience_id, "kind": kind, "run_id": run_id},
                 project_id=self.project.id,
                 session_id=session_id,
+                run_id=run_id or None,
             )
 
         reflection = self.reflection.reflect(
@@ -114,6 +116,7 @@ class MemoryPipeline:
                 {"memory_id": reflection_id, "run_id": run_id},
                 project_id=self.project.id,
                 session_id=session_id,
+                run_id=run_id or None,
             )
 
         if run_id:

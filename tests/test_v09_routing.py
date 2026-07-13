@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 from dataclasses import replace
 from pathlib import Path
 
@@ -9,6 +10,7 @@ from agent import config as config_module
 from agent.config import DEFAULT_CONFIG, load_config, merge_yaml_defaults, read_yaml
 from agent.model_router import ModelRoute, ModelRouter, more_capable_model_route
 from agent.task_router import TaskRoute, TaskRouter, more_capable_task_route
+from agent.task_plan import TaskPlanFactory
 from agent.task_strategy import TaskStrategySelector
 
 
@@ -125,6 +127,27 @@ def test_model_router_uses_safe_base_fallback_for_all_tiers(make_config) -> None
         "max",
     )
     assert all("base-model-fallback" in item.reasons for item in (fast, standard, deep))
+    assert (fast.cost_class, standard.cost_class, deep.cost_class) == ("low", "balanced", "high")
+    assert "simple-low-risk" in fast.reasons
+    assert "cost-balanced" in standard.reasons
+    assert "deep-capability-required" in deep.reasons
+
+
+def test_model_router_cost_aware_policy_is_local_and_explainable(make_config) -> None:
+    config = make_config()
+    task_router = TaskRouter(config)
+    model_router = ModelRouter(config)
+
+    simple = model_router.route(task_router.route("什么是 Python？"))
+    large_read_only = model_router.route(task_router.route("分析整个代码库的所有文件并总结"))
+    repeated_failure = model_router.route(task_router.route("继续", failure_count=2))
+
+    assert (simple.tier, simple.cost_class) == ("fast", "low")
+    assert (large_read_only.tier, large_read_only.cost_class) == ("standard", "balanced")
+    assert "large-low-risk" in large_read_only.reasons
+    assert (repeated_failure.tier, repeated_failure.cost_class) == ("deep", "high")
+    assert "repeated-failure" in repeated_failure.reasons
+    assert model_router.route(task_router.route("什么是 Python？")).to_dict() == simple.to_dict()
 
 
 def test_model_router_accepts_user_deepseek_tier_models(make_config) -> None:
@@ -177,6 +200,8 @@ def test_model_router_rejects_other_providers_and_invalid_tiers(make_config) -> 
     task = TaskRouter(config).route("普通问题")
     with pytest.raises(ValueError, match="model.routing.tier"):
         ModelRouter(config).route(task, explicit_tier="unknown")
+    with pytest.raises(TypeError, match="requires a TaskRoute"):
+        ModelRouter(config).route({"mode": "simple"})
 
 
 def test_explicit_task_mode_remains_a_compatibility_override(make_config) -> None:
@@ -191,6 +216,17 @@ def test_explicit_task_mode_remains_a_compatibility_override(make_config) -> Non
     assert "configured-mode" in task.reasons
     assert model.tier == "fast"
     assert model.thinking_enabled is False
+    assert "configured-task-mode" in model.reasons
+
+
+def test_explicit_model_tier_takes_priority_over_cost_aware_policy(make_config) -> None:
+    config = make_config()
+    task = TaskRouter(config).route("全面审计整个仓库并重构所有安全问题")
+    route = ModelRouter(config).route(task, explicit_tier="fast")
+
+    assert (route.tier, route.cost_class) == ("fast", "low")
+    assert route.reasons[0] == "configured-tier"
+    assert "deep-capability-required" not in route.reasons
 
 
 def test_model_router_respects_non_adaptive_thinking(make_config) -> None:
@@ -249,17 +285,82 @@ def test_model_route_round_trip_and_strategy_selector_compatibility(make_config)
     model = ModelRouter(config).route(task)
     assert ModelRoute.from_dict(model.to_dict()) == model
 
-    selector = TaskStrategySelector(config)
+    with pytest.warns(DeprecationWarning, match="TaskStrategySelector is deprecated"):
+        selector = TaskStrategySelector(config)
     strategy = selector.select("全面审计整个代码库并重构所有安全问题")
     assert strategy.mode == "deep"
     assert strategy.reasoning_effort == "max"
     assert strategy.max_tool_rounds == 24
-    assert [item["id"] for item in selector.initial_plan("修复整个仓库", strategy)] == [
+    with pytest.warns(DeprecationWarning, match="re-routes the prompt"):
+        assert [item["id"] for item in selector.initial_plan("修复整个仓库", strategy)] == [
+            "scope",
+            "inspect-chunks",
+            "implement",
+            "verify",
+        ]
+
+
+def test_model_route_promotes_legacy_cost_class_and_rejects_invalid_values(make_config) -> None:
+    config = make_config()
+    route = ModelRouter(config).route(TaskRouter(config).route("什么是 Python？"))
+    legacy = route.to_dict()
+    legacy.pop("cost_class")
+
+    assert ModelRoute.from_dict(legacy).cost_class == "low"
+    legacy["cost_class"] = "unlimited"
+    with pytest.raises(ValueError, match="invalid cost class"):
+        ModelRoute.from_dict(legacy)
+
+
+def test_task_strategy_module_contains_no_classifier_rules() -> None:
+    source = Path(__file__).parents[1].joinpath("agent", "task_strategy.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    imports = {
+        alias.name for node in ast.walk(tree) if isinstance(node, (ast.Import, ast.ImportFrom)) for alias in node.names
+    }
+    assigned_names = {
+        target.id
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.Assign, ast.AnnAssign))
+        for target in (node.targets if isinstance(node, ast.Assign) else [node.target])
+        if isinstance(target, ast.Name)
+    }
+
+    assert "re" not in imports
+    assert not any(name.endswith("_MARKERS") for name in assigned_names)
+    assert not any(
+        isinstance(node, ast.AugAssign) and isinstance(node.target, ast.Name) and node.target.id == "score"
+        for node in ast.walk(tree)
+    )
+
+
+def test_task_plan_factory_consumes_task_route_without_classifying(make_config) -> None:
+    config = make_config()
+    router = TaskRouter(config)
+    factory = TaskPlanFactory()
+
+    mutation = router.route("全面修复整个仓库的所有安全问题")
+    architecture_implementation = router.route("为整个项目设计架构并实现迁移")
+    read_only = router.route("全面审计整个仓库的所有安全问题")
+
+    assert [item["id"] for item in factory.build(mutation)] == [
         "scope",
         "inspect-chunks",
         "implement",
         "verify",
     ]
+    assert [item["id"] for item in factory.build(read_only)] == [
+        "scope",
+        "inspect-chunks",
+        "synthesize",
+        "verify",
+    ]
+    assert architecture_implementation.task_type == "architecture"
+    assert "mutation-request" in architecture_implementation.reasons
+    assert factory.build(architecture_implementation)[2]["id"] == "implement"
+    assert factory.build(router.route("什么是 Python？")) == []
+    with pytest.raises(TypeError, match="requires a TaskRoute"):
+        factory.build({"mode": "deep"})
 
 
 def test_model_routing_config_migration_is_add_only(tmp_path: Path) -> None:
