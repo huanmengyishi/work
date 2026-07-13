@@ -203,7 +203,7 @@ def test_daemon_rejects_pid_with_forged_command_line(monkeypatch, tmp_path: Path
     assert not daemon.pid_path.exists()
 
 
-def test_memory_dedupe_prefilter_avoids_global_all_pairs() -> None:
+def test_memory_dedupe_prefilter_avoids_global_all_pairs(monkeypatch) -> None:
     items = []
     for index in range(1200):
         digest = hashlib.sha256(str(index).encode()).hexdigest()
@@ -218,9 +218,19 @@ def test_memory_dedupe_prefilter_avoids_global_all_pairs() -> None:
                 updated_at="2026-07-13T00:00:00+00:00",
             )
         )
+    similarity_calls = 0
+    original_similarity = MemoryStore._memory_similarity
+
+    def counted_similarity(first, second):
+        nonlocal similarity_calls
+        similarity_calls += 1
+        return original_similarity(first, second)
+
+    monkeypatch.setattr(MemoryStore, "_memory_similarity", staticmethod(counted_similarity))
     started = time.monotonic()
     assert MemoryStore._duplicate_groups(items, 0.94) == []
-    assert time.monotonic() - started < 2.5
+    assert similarity_calls < len(items) * 10
+    assert time.monotonic() - started < 8.0
 
     first = MemoryItem(
         id=2001,
