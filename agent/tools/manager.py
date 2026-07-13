@@ -20,6 +20,7 @@ from .document import DocumentTool
 from .git import GitTool
 from .http import HttpTool
 from .file_edit import FileEditTool
+from .lsp import LSPManager, SUPPORTED_SUFFIXES
 from .mcp import MCPManager
 from .permission import PermissionManager
 from .python import PythonTool
@@ -71,6 +72,11 @@ class ToolManager:
             timeout=int(config.get("tools.http.timeout_seconds", 30)),
             max_response_bytes=int(config.get("tools.http.max_response_bytes", 1_048_576)),
         )
+        self.lsp = LSPManager(
+            self.cwd,
+            timeout=int(config.get("tools.lsp.timeout_seconds", 60)),
+            max_diagnostics=int(config.get("tools.lsp.max_diagnostics", 200)),
+        )
         self.file_edit = FileEditTool(
             project,
             int(config.get("tools.file.max_file_bytes", 2_000_000)),
@@ -106,6 +112,8 @@ class ToolManager:
     def capability_summary(self) -> str:
         lines = []
         for item in self.capabilities(enabled_only=True):
+            if self.health.evaluate(item).status != "Available":
+                continue
             permissions = ", ".join(item.permissions) or "none"
             formats = ""
             if item.input_formats or item.output_formats:
@@ -570,6 +578,20 @@ class ToolManager:
             ),
             (
                 ToolCapability(
+                    "lsp",
+                    "diagnostics",
+                    "lsp_diagnostics",
+                    "Run bounded Python, JavaScript, or TypeScript diagnostics and return file/line messages.",
+                    {"path": {"type": "string"}},
+                    permissions=("read", "execute"),
+                    timeout_seconds=int(self.config.get("tools.lsp.timeout_seconds", 60)),
+                    available=self.lsp.available()[0],
+                    unavailable_reason=self.lsp.available()[1],
+                ),
+                self.lsp.diagnostics,
+            ),
+            (
+                ToolCapability(
                     "memory",
                     "search",
                     "memory_search",
@@ -706,6 +728,7 @@ class ToolManager:
             (self.docker, "docker.run"),
             (self.browser, "browser.open_url"),
             (self.templates, "template.run_tests"),
+            (self.lsp, "lsp.diagnostics"),
         )
         for tool, capability_name in mappings:
             capability, _ = self.registry.resolve(capability_name)
@@ -746,7 +769,28 @@ class ToolManager:
         )
 
     def _file_apply(self, preview_id: str) -> ToolResult:
-        return self.file_edit.apply(preview_id=preview_id, session_id=self._require_state().session_id)
+        result = self.file_edit.apply(preview_id=preview_id, session_id=self._require_state().session_id)
+        path = str((result.data or {}).get("path") or "")
+        if (
+            result.success
+            and bool(self.config.get("tools.lsp.auto_after_file_apply", True))
+            and Path(path).suffix.lower() in SUPPORTED_SUFFIXES
+        ):
+            diagnostics = self.lsp.diagnostics(path)
+            data = dict(result.data or {})
+            data["lsp"] = diagnostics.data or {
+                "success": diagnostics.success,
+                "stdout": diagnostics.stdout,
+                "stderr": diagnostics.stderr,
+            }
+            diagnostic_output = diagnostics.stdout or diagnostics.stderr
+            return ToolResult(
+                True,
+                "\n".join(part for part in (result.stdout, diagnostic_output) if part),
+                "",
+                data=data,
+            )
+        return result
 
     def _file_undo(self, snapshot_id: str | None = None) -> ToolResult:
         return self.file_edit.undo(session_id=self._require_state().session_id, snapshot_id=snapshot_id)

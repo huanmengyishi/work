@@ -79,16 +79,18 @@ class ParallelWorktreeRunner:
                         worktree,
                         patch_dir,
                         base_commit,
-                    ): (worktree, branch)
+                    ): (index, prompt, worktree, branch)
                     for index, prompt, worktree, branch in specs
                 }
                 for future in as_completed(futures):
                     try:
                         results.append(future.result())
                     except Exception as exc:
-                        worktree, _ = futures[future]
+                        index, prompt, worktree, _ = futures[future]
                         results.append(
-                            ParallelTaskResult(0, "", "failed", str(worktree), "", stderr=str(exc), returncode=1)
+                            ParallelTaskResult(
+                                index, prompt, "failed", str(worktree), "", stderr=str(exc), returncode=1
+                            )
                         )
 
             for result in sorted(results, key=lambda item: item.index):

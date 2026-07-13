@@ -3,15 +3,16 @@
 Project-centric DeepSeek CLI agent for WSL. The Agent is installed as a tool;
 the directory where `agent` is started is the workspace.
 
-Current version: `0.6.0`. The runtime includes correction learning, failure
+Current version: `0.7.0`. The runtime includes correction learning, failure
 recovery, Memory administration, MCP stdio/HTTP/SSE and Resources, bounded HTTP
 access, optional Tree-sitter indexing, resumable task queues, and threshold-gated
 Git worktree parallelism in addition to safe editing and browser persistence.
 
-Version `0.6.0` adds a dependency-aware Task Graph, project Workspace Memory,
-rule-based and optional smart Reflection, resumable Execution Context, and
-persisted Capability Health. Queue and parallel Sessions now carry the same
-Task Graph fields instead of using separate planning semantics.
+Version `0.7.0` adds bounded Python/JavaScript/TypeScript diagnostics, richer
+Tree-sitter module and import relationships, Memory lifecycle maintenance,
+compact Session resume, and an optional per-project background daemon. The
+daemon is disabled by default and uses project-specific PID, lock, state, and
+log files under the XDG data directory.
 
 ## Quick Start
 
@@ -111,9 +112,15 @@ agent memory search "query"
 agent memory add Knowledge "title" "content" --global-memory
 agent memory list --kind Correction
 agent memory stats
+agent memory maintain
+agent memory maintain --apply
 agent queue "task one" "task two"
 agent queue resume --id QUEUE_ID
 agent parallel "task 1" "task 2" "task 3" "task 4" "task 5" "task 6" "task 7" "task 8"
+agent health
+agent daemon start
+agent daemon status
+agent daemon stop
 ```
 
 Interactive-only commands: `/new`, `/resume [session-id]`, `/sessions`,
@@ -149,7 +156,10 @@ Explicit user corrections are stored as `Correction` memory. A
 automatically. Failed ToolResults trigger one bounded local search over related
 Correction/Lesson records and inject recovery context into the next model round
 without another API request. Use `agent memory list/edit/delete/stats` to keep
-the store accurate.
+the store accurate. `agent memory maintain` previews duplicate and expiry
+cleanup; add `--apply` to merge high-similarity Correction/Lesson/Reflection
+records and delete expired low-confidence, non-protected records. Corrections
+and Decisions are protected from automatic expiry by default.
 
 ## MCP
 
@@ -167,11 +177,39 @@ allowlist. It permits only GET/POST JSON with 30-second and 1 MiB limits and
 rejects sensitive headers and redirects.
 
 The optional Tree-sitter sidecar writes `index.semantic.json` and adds a bounded
-class/function/import summary to project context without replacing `index.json`.
+class/function/import/module relationship summary to project context without
+replacing `index.json`. Resume rebuilds a compact Prompt from AgentState,
+Execution Context, the previous outcome, current project context, and current
+Memory rather than retaining an unlimited raw tool transcript.
+
+`lsp_diagnostics` uses Pyright for Python and `tsc --noEmit` for JavaScript and
+TypeScript. Each engine degrades independently. After `file_apply`, supported
+files are diagnosed automatically; diagnostics are attached to the successful
+write result so the model can continue fixing errors without misclassifying the
+atomic write as failed.
 
 `agent queue` persists serial tasks and resumes without repeating completed
 entries. `agent parallel` requires at least eight explicit tasks and a clean Git
 worktree, then validates per-worktree patches before applying them.
+
+## Optional Daemon
+
+The daemon is opt-in and does not change CLI behavior. `agent daemon start`
+starts one background process for the current project. It polls for file changes,
+refreshes `index.json`, `workspace_memory.json`, and optional semantic context,
+and applies periodic Memory lifecycle maintenance. Queue execution remains off
+unless `daemon.queue_enabled: true` is set explicitly.
+
+```yaml
+daemon:
+  enabled: false
+  poll_interval_seconds: 10
+  memory_maintenance_seconds: 3600
+  queue_enabled: false
+```
+
+Use `agent daemon status` and `agent daemon stop`. Runtime files are stored in
+`~/.local/share/deep-agent/daemon/<ProjectID>/`.
 
 ## Browser Sessions
 

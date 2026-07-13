@@ -83,7 +83,19 @@ def sanitize_for_log(value: Any, *, depth: int = 0) -> Any:
         result: dict[str, Any] = {}
         for key, item in value.items():
             lowered = str(key).lower()
-            if any(secret in lowered for secret in ("api_key", "authorization", "token", "messages")):
+            if any(
+                secret in lowered
+                for secret in (
+                    "api_key",
+                    "apikey",
+                    "authorization",
+                    "cookie",
+                    "password",
+                    "secret",
+                    "token",
+                    "messages",
+                )
+            ):
                 result[str(key)] = "[redacted]"
             else:
                 result[str(key)] = sanitize_for_log(item, depth=depth + 1)

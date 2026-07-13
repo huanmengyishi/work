@@ -50,6 +50,7 @@ def test_task_graph_dependencies_retries_and_old_state(tmp_path: Path, make_conf
         planner.update_step(state, "change", "in_progress")
     planner.update_step(state, "inspect", "completed")
     assert [step.id for step in planner.ready_steps(state)] == ["change"]
+    assert state.current_step == "change"
     planner.update_step(state, "change", "failed")
     assert plan[1].status == "pending"
     assert plan[1].retry_count == 1

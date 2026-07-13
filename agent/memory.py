@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import json
+import difflib
+import hashlib
 import sqlite3
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable
 
 from . import paths
 from .config import AppConfig
@@ -22,6 +25,11 @@ class MemoryItem:
     content: str
     tags: list[str]
     updated_at: str
+    confidence: float = 0.7
+    use_count: int = 0
+    last_used_at: str | None = None
+    expires_at: str | None = None
+    merged_into: int | None = None
 
 
 @dataclass(frozen=True)
@@ -35,6 +43,7 @@ class MemoryStats:
 class MemoryStore:
     def __init__(self, config: AppConfig, db_path: Path | None = None) -> None:
         self.config = config
+        self.data_dir = config.data_dir
         configured_db = Path(str(config.get("memory.sqlite_path", paths.memory_db_path()))).expanduser()
         configured_vector = Path(str(config.get("memory.vector_path", paths.vector_dir()))).expanduser()
         self.db_path = db_path or configured_db
@@ -46,12 +55,14 @@ class MemoryStore:
         self._init_db()
 
     def _connect(self) -> sqlite3.Connection:
-        con = sqlite3.connect(self.db_path)
+        con = sqlite3.connect(self.db_path, timeout=30)
         con.row_factory = sqlite3.Row
+        con.execute("pragma busy_timeout = 30000")
         return con
 
     def _init_db(self) -> None:
         with self._connect() as con:
+            con.execute("pragma journal_mode = wal")
             con.executescript(
                 """
                 create table if not exists projects (
@@ -138,6 +149,26 @@ class MemoryStore:
                     end;
                     """
                 )
+            self._ensure_memory_columns(con)
+            if self._table_exists(con, "memory_fts"):
+                memory_count = int(con.execute("select count(*) from memories").fetchone()[0])
+                fts_count = int(con.execute("select count(*) from memory_fts").fetchone()[0])
+                if memory_count != fts_count:
+                    con.execute("insert into memory_fts(memory_fts) values ('rebuild')")
+
+    @staticmethod
+    def _ensure_memory_columns(con: sqlite3.Connection) -> None:
+        existing = {str(row[1]) for row in con.execute("pragma table_info(memories)").fetchall()}
+        columns = {
+            "confidence": "real not null default 0.7",
+            "use_count": "integer not null default 0",
+            "last_used_at": "text",
+            "expires_at": "text",
+            "merged_into": "integer",
+        }
+        for name, definition in columns.items():
+            if name not in existing:
+                con.execute(f"alter table memories add column {name} {definition}")
 
     @staticmethod
     def _fts_available(con: sqlite3.Connection) -> bool:
@@ -171,17 +202,31 @@ class MemoryStore:
         content: str,
         tags: Iterable[str] = (),
         project_id: str | None = None,
+        confidence: float | None = None,
+        expires_at: str | None = None,
     ) -> int:
         now = utc_now_iso()
         tag_list = list(tags)
         tags_json = json.dumps(tag_list, ensure_ascii=False)
+        confidence_value = min(
+            1.0,
+            max(
+                0.0, float(confidence if confidence is not None else self.config.get("memory.default_confidence", 0.7))
+            ),
+        )
+        protected = {str(item) for item in self.config.get("memory.protect_kinds", ["Correction", "Decision"])}
+        if expires_at is None and kind not in protected:
+            expiry_days = max(0, int(self.config.get("memory.expiry_days", 365)))
+            if expiry_days:
+                expires_at = (datetime.now(UTC) + timedelta(days=expiry_days)).replace(microsecond=0).isoformat()
         with self._connect() as con:
             cur = con.execute(
                 """
-                insert into memories(project_id, kind, title, content, tags, created_at, updated_at)
-                values (?, ?, ?, ?, ?, ?, ?)
+                insert into memories(
+                    project_id, kind, title, content, tags, created_at, updated_at, confidence, expires_at
+                ) values (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (project_id, kind, title, content, tags_json, now, now),
+                (project_id, kind, title, content, tags_json, now, now, confidence_value, expires_at),
             )
             memory_id = int(cur.lastrowid)
         if self.vector.is_enabled():
@@ -209,7 +254,7 @@ class MemoryStore:
         tag: str | None = None,
         global_only: bool = False,
     ) -> list[MemoryItem]:
-        clauses: list[str] = []
+        clauses: list[str] = ["merged_into is null"]
         params: list[object] = []
         if global_only:
             clauses.append("project_id is null")
@@ -238,22 +283,34 @@ class MemoryStore:
         title: str | None = None,
         content: str | None = None,
         tags: Iterable[str] | None = None,
+        confidence: float | None = None,
+        expires_at: str | None = None,
     ) -> MemoryItem:
         current = self.get_memory(memory_id)
         if current is None:
             raise KeyError(f"memory not found: {memory_id}")
+        if current.merged_into is not None:
+            raise ValueError(f"memory {memory_id} was merged into memory {current.merged_into}")
         next_title = current.title if title is None else title.strip()
         next_content = current.content if content is None else content.strip()
         next_tags = current.tags if tags is None else self._normalize_tags(tags)
+        next_confidence = current.confidence if confidence is None else min(1.0, max(0.0, float(confidence)))
+        next_expires = current.expires_at if expires_at is None else expires_at
         if not next_title or not next_content:
             raise ValueError("memory title and content must not be empty")
         with self._connect() as con:
             con.execute(
-                "update memories set title = ?, content = ?, tags = ?, updated_at = ? where id = ?",
+                """
+                update memories
+                set title = ?, content = ?, tags = ?, confidence = ?, expires_at = ?, updated_at = ?
+                where id = ?
+                """,
                 (
                     next_title,
                     next_content,
                     json.dumps(next_tags, ensure_ascii=False),
+                    next_confidence,
+                    next_expires,
                     utc_now_iso(),
                     memory_id,
                 ),
@@ -272,15 +329,156 @@ class MemoryStore:
             )
         return updated
 
+    def maintain(self, *, project_id: str | None, apply: bool = False) -> dict[str, Any]:
+        items = self.list_memories(project_id=project_id, limit=1000)
+        candidates = [item for item in items if item.kind in {"Correction", "Lesson", "Reflection"}]
+        threshold = float(self.config.get("memory.dedupe_similarity", 0.94))
+        merges: list[dict[str, Any]] = []
+        groups = self._duplicate_groups(candidates, threshold)
+        for group in groups:
+            preferred = max(group, key=self._memory_preference)
+            for duplicate in group:
+                if duplicate.id == preferred.id:
+                    continue
+                merges.append(
+                    {
+                        "keep": preferred.id,
+                        "merge": duplicate.id,
+                        "similarity": round(self._memory_similarity(preferred, duplicate), 4),
+                        "kind": preferred.kind,
+                    }
+                )
+                if apply:
+                    self._merge_memory(preferred, duplicate)
+                    preferred = self.get_memory(preferred.id) or preferred
+
+        expired: list[int] = []
+        protected = {str(item) for item in self.config.get("memory.protect_kinds", ["Correction", "Decision"])}
+        now = datetime.now(UTC)
+        for item in items:
+            expires_at = self._parse_timestamp(item.expires_at)
+            if expires_at and expires_at <= now and item.kind not in protected and item.confidence < 0.5:
+                expired.append(item.id)
+                if apply:
+                    self.delete_memory(item.id)
+        return {
+            "apply": apply,
+            "scanned": len(items),
+            "merges": merges,
+            "expired": expired,
+            "merge_count": len(merges),
+            "expired_count": len(expired),
+        }
+
+    def _merge_memory(self, keeper: MemoryItem, duplicate: MemoryItem) -> None:
+        tags = self._normalize_tags([*keeper.tags, *duplicate.tags])
+        content = keeper.content if len(keeper.content) >= len(duplicate.content) else duplicate.content
+        confidence = max(keeper.confidence, duplicate.confidence)
+        with self._connect() as con:
+            con.execute(
+                """
+                update memories
+                set content = ?, tags = ?, confidence = ?, use_count = ?, last_used_at = ?, updated_at = ?
+                where id = ?
+                """,
+                (
+                    content,
+                    json.dumps(tags, ensure_ascii=False),
+                    confidence,
+                    keeper.use_count + duplicate.use_count,
+                    max(keeper.last_used_at or "", duplicate.last_used_at or "") or None,
+                    utc_now_iso(),
+                    keeper.id,
+                ),
+            )
+            con.execute(
+                "update memories set merged_into = ?, updated_at = ? where id = ?",
+                (keeper.id, utc_now_iso(), duplicate.id),
+            )
+        updated = self.get_memory(keeper.id)
+        if updated and self.vector.is_enabled():
+            self.vector.upsert_memory(
+                memory_id=updated.id,
+                project_id=updated.project_id,
+                kind=updated.kind,
+                title=updated.title,
+                content=updated.content,
+                tags=updated.tags,
+            )
+            self.vector.delete_memory(duplicate.id)
+
+    @staticmethod
+    def _preferred_memory(first: MemoryItem, second: MemoryItem) -> tuple[MemoryItem, MemoryItem]:
+        score_first = MemoryStore._memory_preference(first)
+        score_second = MemoryStore._memory_preference(second)
+        return (first, second) if score_first >= score_second else (second, first)
+
+    @staticmethod
+    def _memory_preference(item: MemoryItem) -> tuple[float, int, int, int]:
+        return (item.confidence, item.use_count, len(item.content), -item.id)
+
+    @classmethod
+    def _duplicate_groups(cls, items: list[MemoryItem], threshold: float) -> list[list[MemoryItem]]:
+        remaining = sorted(items, key=cls._memory_preference, reverse=True)
+        groups: list[list[MemoryItem]] = []
+        while remaining:
+            keeper = remaining.pop(0)
+            duplicates = [
+                item
+                for item in remaining
+                if keeper.kind == item.kind
+                and keeper.project_id == item.project_id
+                and cls._memory_similarity(keeper, item) >= threshold
+            ]
+            if duplicates:
+                groups.append([keeper, *duplicates])
+                duplicate_ids = {item.id for item in duplicates}
+                remaining = [item for item in remaining if item.id not in duplicate_ids]
+        return groups
+
+    @staticmethod
+    def _parse_timestamp(value: str | None) -> datetime | None:
+        if not value:
+            return None
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+
+    @staticmethod
+    def _memory_similarity(first: MemoryItem, second: MemoryItem) -> float:
+        def normalized(item: MemoryItem) -> str:
+            value = f"{item.title}\n{item.content}".lower()
+            return " ".join("".join(ch if ch.isalnum() else " " for ch in value).split())
+
+        left, right = normalized(first), normalized(second)
+        if hashlib.sha256(left.encode()).digest() == hashlib.sha256(right.encode()).digest():
+            return 1.0
+        return difflib.SequenceMatcher(None, left, right, autojunk=False).ratio()
+
     def delete_memory(self, memory_id: int) -> bool:
         with self._connect() as con:
-            deleted = con.execute("delete from memories where id = ?", (memory_id,)).rowcount > 0
+            ids = [
+                int(row[0])
+                for row in con.execute(
+                    "select id from memories where id = ? or merged_into = ?", (memory_id, memory_id)
+                ).fetchall()
+            ]
+            deleted = (
+                con.execute("delete from memories where id = ? or merged_into = ?", (memory_id, memory_id)).rowcount > 0
+            )
         if deleted and self.vector.is_enabled():
-            self.vector.delete_memory(memory_id)
+            for item_id in ids:
+                self.vector.delete_memory(item_id)
         return deleted
 
     def stats(self, *, project_id: str | None = None) -> MemoryStats:
-        clauses = " where project_id = ? or project_id is null" if project_id is not None else ""
+        clauses = (
+            " where merged_into is null and (project_id = ? or project_id is null)"
+            if project_id is not None
+            else " where merged_into is null"
+        )
         params = (project_id,) if project_id is not None else ()
         with self._connect() as con:
             rows = con.execute(f"select project_id, kind, tags from memories{clauses}", params).fetchall()
@@ -313,6 +511,7 @@ class MemoryStore:
                 select * from memories
                 where (project_id = ? or project_id is null)
                   and kind in ('Correction', 'Lesson')
+                  and merged_into is null
                   and ({clauses})
                 order by case kind when 'Correction' then 0 else 1 end, updated_at desc
                 limit ?
@@ -402,7 +601,7 @@ class MemoryStore:
                         select m.*
                         from memory_fts f
                         join memories m on m.id = f.rowid
-                        where memory_fts match ? and m.project_id is null
+                        where memory_fts match ? and m.project_id is null and m.merged_into is null
                         order by bm25(memory_fts)
                         limit ?
                         """,
@@ -416,6 +615,7 @@ class MemoryStore:
                         join memories m on m.id = f.rowid
                         where memory_fts match ?
                           and (? is null or m.project_id = ? or m.project_id is null)
+                          and m.merged_into is null
                         order by bm25(memory_fts)
                         limit ?
                         """,
@@ -430,6 +630,7 @@ class MemoryStore:
                         from memories
                         where (? = '' or title like ? or content like ? or tags like ?)
                           and project_id is null
+                          and merged_into is null
                         order by updated_at desc
                         limit ?
                         """,
@@ -442,6 +643,7 @@ class MemoryStore:
                         from memories
                         where (? = '' or title like ? or content like ? or tags like ?)
                           and (? is null or project_id = ? or project_id is null)
+                          and merged_into is null
                         order by updated_at desc
                         limit ?
                         """,
@@ -455,7 +657,7 @@ class MemoryStore:
                 if missing_ids:
                     placeholders = ",".join("?" for _ in missing_ids)
                     extra_rows = con.execute(
-                        f"select * from memories where id in ({placeholders})",
+                        f"select * from memories where merged_into is null and id in ({placeholders})",
                         missing_ids,
                     ).fetchall()
                     for row in extra_rows:
@@ -465,7 +667,19 @@ class MemoryStore:
                             seen.add(item.id)
                         if len(items) >= limit:
                             break
-        return items[:limit]
+        selected = items[:limit]
+        self._record_usage([item.id for item in selected])
+        return selected
+
+    def _record_usage(self, memory_ids: list[int]) -> None:
+        if not memory_ids:
+            return
+        placeholders = ",".join("?" for _ in memory_ids)
+        with self._connect() as con:
+            con.execute(
+                f"update memories set use_count = use_count + 1, last_used_at = ? where id in ({placeholders})",
+                [utc_now_iso(), *memory_ids],
+            )
 
     def recent(self, project_id: str | None = None, limit: int = 10) -> list[MemoryItem]:
         with self._connect() as con:
@@ -473,7 +687,8 @@ class MemoryStore:
                 """
                 select *
                 from memories
-                where ? is null or project_id = ? or project_id is null
+                where (? is null or project_id = ? or project_id is null)
+                  and merged_into is null
                 order by updated_at desc
                 limit ?
                 """,
@@ -508,7 +723,7 @@ class MemoryStore:
         project: Project | None,
         global_memory: bool = True,
     ) -> None:
-        base = paths.memory_dir() / kind.lower()
+        base = self.data_dir / "memory" / kind.lower()
         if project and not global_memory:
             base = project.agent_dir / "memory" / kind.lower()
         base.mkdir(parents=True, exist_ok=True)
@@ -530,6 +745,11 @@ class MemoryStore:
             content=row["content"],
             tags=tags if isinstance(tags, list) else [],
             updated_at=row["updated_at"],
+            confidence=float(row["confidence"] or 0.7),
+            use_count=int(row["use_count"] or 0),
+            last_used_at=row["last_used_at"],
+            expires_at=row["expires_at"],
+            merged_into=int(row["merged_into"]) if row["merged_into"] is not None else None,
         )
 
     @staticmethod

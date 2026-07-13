@@ -98,7 +98,12 @@ class WorkspaceMemoryManager:
                     build_commands.append(target)
                 elif lowered in {"start", "dev", "serve"}:
                     run_commands.append(target)
-            dependencies = {**(package_json.get("dependencies") or {}), **(package_json.get("devDependencies") or {})}
+            dependencies_value = package_json.get("dependencies")
+            dev_dependencies_value = package_json.get("devDependencies")
+            dependencies = {
+                **(dependencies_value if isinstance(dependencies_value, dict) else {}),
+                **(dev_dependencies_value if isinstance(dev_dependencies_value, dict) else {}),
+            }
             for dependency, framework in (
                 ("react", "React"),
                 ("next", "Next.js"),
@@ -168,7 +173,12 @@ class WorkspaceMemoryManager:
 
     def _text(self, relative: str) -> str:
         path = self.project.root / relative
-        return path.read_text(encoding="utf-8", errors="replace")[:100_000] if path.is_file() else ""
+        if not path.is_file():
+            return ""
+        try:
+            return path.read_text(encoding="utf-8", errors="replace")[:100_000]
+        except OSError:
+            return ""
 
     def _json(self, relative: str) -> dict[str, Any]:
         try:

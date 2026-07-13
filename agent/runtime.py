@@ -67,7 +67,11 @@ class AgentRuntime:
             project=self.project,
             user_request=prompt,
             loaded_memories=[item.id for item in memory_items],
-            loaded_tools=[item.name for item in self.tools.capabilities(enabled_only=True)],
+            loaded_tools=[
+                item.name
+                for item in self.tools.capabilities(enabled_only=True)
+                if self.tools.health.evaluate(item).status == "Available"
+            ],
             git_branch=context.git_branch,
             context_index_path=str(context.index_path),
         )
@@ -96,7 +100,11 @@ class AgentRuntime:
         memory_items = self.memory.search(prompt, self.project.id)
         state.resume(prompt)
         state.loaded_memories = [item.id for item in memory_items]
-        state.loaded_tools = [item.name for item in self.tools.capabilities(enabled_only=True)]
+        state.loaded_tools = [
+            item.name
+            for item in self.tools.capabilities(enabled_only=True)
+            if self.tools.health.evaluate(item).status == "Available"
+        ]
         state.git_branch = context.git_branch
         state.context_index_path = str(context.index_path)
         if state.execution_context:
@@ -204,6 +212,9 @@ class AgentRuntime:
             self.sessions.finalize(state, messages)
             self._publish_terminal("task.failed", state, error=str(exc))
             raise
+
+    def close(self) -> None:
+        self.tools.close()
 
     def _publish_terminal(
         self,

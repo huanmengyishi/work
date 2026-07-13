@@ -53,16 +53,30 @@ class PromptBuilder:
         memory_context: str,
         capability_summary: str,
     ) -> list[dict[str, Any]]:
-        refreshed = list(messages)
-        refreshed.append(
+        previous = self._previous_outcome(messages)
+        refreshed = [
+            {"role": "system", "content": SYSTEM_PROMPT},
             {
                 "role": "system",
-                "content": "Session resumed. Refresh the runtime context before continuing.\n\n"
+                "content": "Session resumed from a compact checkpoint. The previous raw tool transcript was "
+                "removed to keep Prompt growth bounded. Use AgentState and Execution Context as the source of truth."
+                + ("\n\n## Previous Outcome\n\n" + previous if previous else "")
+                + "\n\n"
                 + self._runtime_context(state, context, memory_context, capability_summary),
-            }
-        )
+            },
+        ]
         refreshed.append({"role": "user", "content": state.user_request})
         return refreshed
+
+    @staticmethod
+    def _previous_outcome(messages: list[dict[str, Any]]) -> str:
+        for message in reversed(messages):
+            if message.get("role") != "assistant" or message.get("tool_calls"):
+                continue
+            content = str(message.get("content") or "").strip()
+            if content:
+                return content[:4000]
+        return ""
 
     @staticmethod
     def _runtime_context(

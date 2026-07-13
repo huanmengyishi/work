@@ -1,96 +1,69 @@
-# DeepSeek Agent V3 0.5.0 使用说明
+# DeepSeek Agent V3 使用说明（0.7.0）
 
-本文是当前 Deep Agent 的主使用入口。程序安装在 `~/AI-Agent`，当前目录用于
-查看说明、保存工作日志和提出后续需求。Agent 是工具，执行 `agent` 时所在的项目
-目录才是 Workspace。
+更新时间：2026-07-13
 
-## 一、当前能力
+## 1. 系统定位
 
-当前版本：`0.5.0`。
+Deep Agent 是安装在 WSL Ubuntu 中的项目型 CLI Agent。Agent 是工具，当前项目目录才是 Workspace。
 
-- 任意项目目录启动、项目注册、移动后 UUID 保持。
-- DeepSeek Key 池、中文逗号/英文逗号解析和失败轮换。
-- Runtime、AgentState、Prompt Builder、Context Builder、Session Resume。
-- SQLite FTS + Chroma Memory、自动 Summary/Lesson/Bug/Decision。
-- 用户纠错写入 Correction、工具失败后的本地经验自愈检索。
-- Memory 列出、编辑、删除和统计。
-- 安全文件预览、SHA-256 冲突保护、快照应用与撤销。
-- Shell、Python、Git、Docker、OCR、文档、Playwright 和安全模板。
-- MCP stdio、Streamable HTTP、legacy SSE、Tools 和 Resources。
-- 受限 `http_request`，域名白名单、30 秒和 1 MiB 上限。
-- 可选 Tree-sitter 语义旁路索引。
-- 持久串行任务队列和满足门槛时的 Git worktree 并行执行。
-- Safe、Auto approve、YOLO、SUPER YOLO 四级批准模式。
-
-未实现：MCP Prompts/Subscriptions、Web UI、通用 Multi-Agent、自动语义重构图。
-
-## 二、目录与数据
-
-```text
-~/AI-Agent/                         程序、测试、维护文档
-~/.config/deep-agent/              配置和 secrets.env
-~/.local/share/deep-agent/         SQLite、Chroma、日志、备份、临时 worktree
-<项目>/.project-agent/             项目上下文、索引、会话和运行状态
+```bash
+cd /任意/项目目录
+agent
 ```
 
-项目私有目录：
+首次运行会在项目根目录创建 `.project-agent/`，保存项目上下文、索引、会话、快照和缓存。程序、配置、全局数据与项目数据相互分离：
 
 ```text
-.project-agent/
-  context.md                       人工维护的长期项目事实
-  architecture.md                  架构说明
-  todo.md                          项目 TODO
-  index.json                       轻量文件和符号索引
-  index.semantic.json              可选 Tree-sitter 语义索引
-  sessions/                        会话 JSON/Markdown
-  snapshots/                       文件修改快照
-  browser-sessions/                Playwright 登录状态
-  downloads/                       浏览器下载
-  queues/                          持久任务队列
-  parallel/                        并行 patch 和报告
+~/AI-Agent/                         程序、测试、发布说明
+~/.config/deep-agent/              配置和 API Key
+~/.local/share/deep-agent/         SQLite、Chroma、日志、备份、Daemon 状态
+<项目>/.project-agent/             项目上下文、索引、Session、快照
 ```
 
-这些运行数据已加入 `.project-agent/.gitignore`。项目位于 `/mnt/d` 时 DrvFS 可能
-显示权限 `777`；高敏感浏览器身份建议放到 `~/Projects` 或启用 DrvFS metadata。
+## 2. DEEPSEEK_API_KEY 设置位置
 
-## 三、DeepSeek API Key
-
-API Key 推荐放在：
+推荐且程序会自动读取的位置：
 
 ```text
 ~/.config/deep-agent/secrets.env
 ```
 
+编辑方法：
+
 ```bash
 nano ~/.config/deep-agent/secrets.env
 ```
 
-单 Key 或 Key 池：
+单个 Key：
+
+```bash
+DEEPSEEK_API_KEY=sk-your-key
+```
+
+多个 Key 可以使用英文逗号或中文逗号分隔：
 
 ```bash
 DEEPSEEK_API_KEY=key_1,key_2,key_3
 ```
 
-支持英文逗号 `,` 和中文逗号 `，`，自动去空格、空项和重复值。HTTP `401`、
-`403`、`429` 时尝试下一个 Key，日志不显示 Key 内容。
+程序会自动去除空格、空值和重复 Key，并在 `401`、`403`、`429` 时切换下一个 Key。不要把 Key 放进项目目录、Git、README 或聊天记录。
+
+设置后执行：
 
 ```bash
 chmod 600 ~/.config/deep-agent/secrets.env
 agent doctor --online
 ```
 
-不要把 Key 放进源码、项目、`model.yaml`、README、Git 或 MCP 配置示例。
+当前验收结果：5/5 Key 可用。程序只显示数量和状态，不输出 Key 内容。
 
-## 四、基础使用
+## 3. 常用启动方式
 
 ```bash
-agent --version
-agent doctor
-agent doctor --online
-cd /path/to/project
+cd /mnt/d/detail/deepseek
 agent init
-agent "分析当前项目"
 agent
+agent "分析当前项目并给出修改建议"
 ```
 
 交互命令：
@@ -100,89 +73,21 @@ agent
 /resume [session-id]
 /sessions
 /status
-/undo [snapshot-id]
+/undo
 /yolo on|off
 /super-yolo on|off
-/help
 /clear
 /exit
 ```
 
-会话：
+安全模式是默认模式。`--yolo` 自动同意普通工具调用，但仍受路径、危险命令和 sudo 策略保护。`--super-yolo` 绕过 Permission Manager 的硬限制，可允许 sudo、外部路径、特权 Docker 和破坏性命令；操作系统自身的密码和权限检查仍然有效。
 
 ```bash
-agent sessions
-agent resume "继续最近任务"
-agent resume --session SESSION_ID "继续测试"
+agent --yolo
+agent --super-yolo
 ```
 
-上下文：
-
-```bash
-agent context show
-agent context refresh
-agent context index
-```
-
-## 五、纠错学习与 Memory
-
-当用户明确否定 Agent 的事实或行为时，System Prompt 要求模型修正后调用
-`memory_add` 写入 `Correction`，并携带 `correction:<topic>` 与项目名标签。
-程序侧会拒绝缺少 `correction:*` 标签的 Correction，且自动补项目名标签。
-
-例子：
-
-```text
-用户：不对，这个服务端口是 8080，不是 8000。
-Agent：修正回答，并记录 Correction：correction:port。
-```
-
-工具返回失败后，Runtime 从当前项目和全局 Memory 中搜索与错误关键字相关的
-Correction/Lesson，以 `Failure Recovery Memory` 加入下一轮 Prompt。只做本地
-SQLite 检索，不增加 DeepSeek API 调用；同一条经验每次执行最多补注一次。
-
-管理命令：
-
-```bash
-agent memory search "端口错误"
-agent memory list --limit 50
-agent memory list --kind Correction
-agent memory list --tag correction:port
-agent memory stats
-agent memory edit 123
-agent memory edit 123 --content "修正后的内容" --tag correction:port --tag 项目名
-agent memory delete 123
-```
-
-不带参数的 `edit` 使用 `$EDITOR`，内容是临时 YAML；也可使用 flags 非交互修改。
-编辑和删除同步 SQLite FTS 与 Chroma。
-
-手工新增 Correction：
-
-```bash
-agent memory add Correction "服务端口" "该服务使用 8080" \
-  --tag correction:port
-```
-
-## 六、安全文件修改与权限
-
-源码修改协议：
-
-```text
-file_diff -> file_apply -> file_undo
-```
-
-`file_diff` 只生成预览；`file_apply` 校验原文件 SHA-256、保存 Session 快照并原子
-写入；`file_undo` 在文件仍匹配 Agent 应用版本时回退，避免覆盖后续人工修改。
-
-| 模式 | 启动方式 | 行为 |
-|---|---|---|
-| Safe | `agent` | 高风险工具逐次确认，权限策略生效。 |
-| Auto approve | `agent --auto-approve` | 默认只自动批准快照支持的 apply/undo。 |
-| YOLO | `agent --yolo` | 跳过确认，仍拦截 sudo、项目外 cwd、特权 Docker。 |
-| SUPER YOLO | `agent --super-yolo` | 跳过确认并绕过 Permission Manager 硬策略。 |
-
-持久开关位于 `~/.config/deep-agent/config.yaml`：
+永久开关位于 `~/.config/deep-agent/config.yaml`：
 
 ```yaml
 permissions:
@@ -190,76 +95,89 @@ permissions:
   super_yolo: false
 ```
 
-SUPER YOLO 允许发起 `sudo`，但不保存、不猜测、不绕过 sudo 密码；操作系统认证
-仍然生效。默认保持关闭，只对明确任务临时开启。
+## 4. 0.5.0、0.6.0、0.7.0 演进
 
-## 七、MCP
+### 0.5.0：安全执行与外部连接基线
+
+发布原因：先建立可信修改闭环，再扩展外部能力。
+
+主要能力：`file_diff -> file_apply -> file_undo`、Git/文件快照、MCP stdio/HTTP/SSE、MCP Resources、浏览器持久会话与下载、受限 HTTP、Queue、8 任务阈值的 Git worktree 并行、Memory 管理和纠错学习。
+
+后续方向：从“工具齐全”转向“统一决策状态”。
+
+### 0.6.0：决策智能
+
+发布原因：让 Resume、Queue、Parallel 共用同一 Task Graph 和 AgentState，而不是各自维护状态。
+
+主要能力：依赖感知 Planner、Workspace Memory、Reflection、Execution Context、Capability Health。
+
+后续方向：提高修改代码后的即时反馈和大型项目长期维护能力。
+
+### 0.7.0：深度代码理解与长期维护
+
+发布原因：代码修改后需要立即诊断，Memory 需要去重与生命周期，Session 和项目索引需要长期运行而不无限膨胀。
+
+主要能力：
+
+- Python 使用 Pyright，JavaScript/TypeScript 使用 `tsc --noEmit`，每个诊断引擎可独立降级。
+- `file_apply` 成功后自动诊断，写入成功与代码诊断错误分开表达。
+- Tree-sitter 旁路索引增加模块摘要、导出符号和内部 import 关系。
+- Memory 增加可信度、使用次数、最后使用时间、过期时间和归并关系。
+- `/resume` 压缩历史工具消息，保留上次结果、AgentState、Execution Context、当前上下文和 Memory。
+- 可选 Daemon 负责增量索引和 Memory 整理，默认关闭。
+- SQLite WAL、FTS 回填、Queue 跨进程锁和更严格的日志脱敏。
+
+后续方向：V1.0 只作为规划，不在当前版本实施。目标是冻结 Runtime 接口、让 Context Builder 成为唯一上下文入口、完成 Event Bus 副作用闭环，并保持所有新能力经过 Capability Registry 与 Permission Manager。
+
+## 5. 安全文件修改与回滚
+
+Agent 的源码修改流程：
+
+```text
+file_diff 生成 unified diff 预览
+    -> file_apply 校验原文件哈希
+    -> 创建 Session 快照
+    -> 原子写入
+    -> 校验写入结果
+    -> 对 Python/JS/TS 自动运行诊断
+```
+
+回滚：
+
+```text
+/undo
+```
+
+或模型调用 `file_undo`。如果文件在快照后又被人工修改，Agent 会拒绝覆盖更新内容。
+
+## 6. LSP Diagnostics
+
+手动诊断能力名为 `lsp_diagnostics`，支持 `.py`、`.js`、`.jsx`、`.ts`、`.tsx`。
+
+依赖安装位置：
+
+```text
+~/.local/share/deep-agent/node-tools
+```
+
+当前工具：Pyright 1.1.411、TypeScript 7.0.2、typescript-language-server 5.3.0。
+
+诊断返回文件、行、列、严重级别、错误代码和消息。扫描会跳过 `.git`、`.project-agent`、虚拟环境、`node_modules`、`dist`、`build` 等目录。
 
 配置：
 
-```text
-~/.config/deep-agent/mcp.yaml
-```
-
-状态：
-
-```bash
-agent mcp status
-agent mcp tools
-agent mcp config
-```
-
-MCP 整体和每个服务器默认关闭，默认最多 10 个服务器、80 个能力。支持：
-
-- `stdio`：本地子进程。
-- `streamable_http`：HTTP POST JSON-RPC、Session ID、JSON/SSE 响应。
-- `sse`：legacy GET event stream + POST endpoint。
-- Tools：`tools/list`、`tools/call`。
-- Resources：显式 `resources_enabled: true` 后注册 `resources/read` 能力。
-
-Streamable HTTP 示例：
-
-```yaml
-mcp:
-  enabled: true
-  servers:
-    - name: knowledge
-      enabled: true
-      transport: streamable_http
-      url: https://mcp.example.com/mcp
-      headers: {}
-      tool_allowlist:
-        - search_*
-      resources_enabled: true
-      resource_uri_allowlist:
-        - docs://public/*
-```
-
-legacy SSE 将 `transport` 改为 `sse`，`url` 指向事件流。HTTP 传输拒绝嵌入 URL
-凭据和自动重定向。stdio MCP 不继承 `DEEPSEEK_API_KEY`，除非服务器配置明确写入
-`env_passthrough`。`mcp.yaml` 权限为 `600`。
-
-## 八、受限 HTTP 工具
-
-默认关闭。在 `~/.config/deep-agent/config.yaml` 中设置唯一开关和域名白名单：
-
 ```yaml
 tools:
-  http:
+  lsp:
     enabled: true
-    timeout_seconds: 30
-    max_response_bytes: 1048576
-    allowed_domains:
-      - api.example.com
+    timeout_seconds: 60
+    max_diagnostics: 200
+    auto_after_file_apply: true
 ```
 
-工具 `http_request` 只支持 GET 和 POST JSON，超时最多 30 秒，响应最多 1 MiB。
-子域名匹配允许项；拒绝 URL 内凭据、Authorization/Cookie/API-Key header 和自动
-重定向。该工具与 MCP 互补，适合没有 MCP Server 的临时 API。
+## 7. Semantic Context
 
-## 九、可选语义索引
-
-已安装 `tree-sitter-language-pack`，默认关闭。启用：
+默认关闭。在 `~/.config/deep-agent/config.yaml` 中启用：
 
 ```yaml
 context:
@@ -273,111 +191,154 @@ context:
     - rust
 ```
 
-然后：
+生成文件：
 
-```bash
-agent context refresh
+```text
+.project-agent/index.semantic.json
 ```
 
-结果写入 `.project-agent/index.semantic.json`，包含类、函数/方法层级、行号和 import
-来源；摘要会加入项目 Prompt。它不替换 `index.json`，缺少 grammar 或解析失败时
-不阻断 Agent。
+它不会替换轻量 `index.json`。Prompt 只加载受限摘要，完整索引留在文件中，最终 Context 长度仍受 `context.max_prompt_chars` 限制。
 
-## 十、任务队列
+## 8. Memory 生命周期
 
-直接执行多个串行任务：
+查看和维护：
 
 ```bash
-agent queue "任务一" "任务二" "任务三"
+agent memory list
+agent memory search "docker proxy"
+agent memory stats
+agent memory edit 123
+agent memory delete 123
+agent memory maintain
+agent memory maintain --apply
 ```
 
-显式形式与管理：
+`maintain` 默认只预览。`--apply` 才执行：
+
+- 合并高相似度的 Correction、Lesson、Reflection。
+- 合并标签、使用次数和可信度，并保留 `merged_into` 追踪关系。
+- 删除已过期、低可信度且非保护类型的 Memory。
+- Correction 和 Decision 默认不会自动过期。
+
+配置：
+
+```yaml
+memory:
+  dedupe_similarity: 0.94
+  default_confidence: 0.7
+  expiry_days: 365
+  protect_kinds:
+    - Correction
+    - Decision
+  smart_reflection: false
+```
+
+## 9. Daemon
+
+Daemon 默认关闭，只在需要后台增量维护时启动：
 
 ```bash
-agent queue run "任务一" "任务二"
+cd 项目目录
+agent daemon start
+agent daemon status
+agent daemon stop
+```
+
+功能：轮询文件变化、刷新 `index.json`、Workspace Memory 和可选语义索引，定期执行 Memory 生命周期维护。PID、锁、状态和日志位于：
+
+```text
+~/.local/share/deep-agent/daemon/<ProjectID>/
+```
+
+配置：
+
+```yaml
+daemon:
+  enabled: false
+  poll_interval_seconds: 10
+  memory_maintenance_seconds: 3600
+  queue_enabled: false
+```
+
+`queue_enabled` 默认关闭。开启后 Daemon 才会寻找 `pending` Queue，并使用安全的 `--auto-approve` 模式执行。Queue 自带跨进程锁，防止前台与后台重复运行。
+
+## 10. MCP、HTTP、Browser 与 OCR
+
+MCP 配置：
+
+```text
+~/.config/deep-agent/mcp.yaml
+```
+
+MCP 默认关闭，支持 stdio、Streamable HTTP、SSE、tools/list、tools/call 和可选 resources/read。远端工具仍通过 Capability Registry 和 Permission Manager。
+
+受限 HTTP 默认关闭，启用时必须配置域名白名单、30 秒超时和 1 MiB 响应限制。
+
+浏览器持久 Session：
+
+```text
+.project-agent/browser-sessions/<session_name>/
+```
+
+下载：
+
+```text
+.project-agent/downloads/<session_name>/
+```
+
+OCR/文档统一调用 `document.parse()`，优先复用已有 `~/.local/bin/ai-parser`，并可降级到 pdftotext、Tesseract、ImageMagick。模型最终只处理 Markdown。
+
+## 11. Queue 与 Parallel
+
+```bash
+agent queue "任务一" "任务二"
 agent queue list
 agent queue show --id QUEUE_ID
 agent queue resume --id QUEUE_ID
-agent queue --continue-on-error "任务一" "任务二"
 ```
 
-每个任务创建独立 Session，队列 JSON 位于 `.project-agent/queues/`。默认失败即暂停；
-Ctrl+C 会将当前项标为 paused，resume 跳过已完成项并从未完成项继续。
+Parallel 仅在至少 8 个明确独立任务时启用，要求干净 Git 工作树。每个任务在临时 worktree 中运行，补丁逐个 `git apply --check` 后应用，失败或冲突不会直接污染主工作区。
 
-## 十一、Git Worktree 并行
-
-只有至少 8 个明确独立任务时允许：
+## 12. 健康检查与故障定位
 
 ```bash
-agent parallel --workers 4 \
-  "任务1" "任务2" "任务3" "任务4" \
-  "任务5" "任务6" "任务7" "任务8"
+agent --version
+agent doctor
+agent doctor --online
+agent health
+agent health --reset lsp.diagnostics
+agent health --reset
 ```
 
-前置条件：当前项目是 Git 仓库，除 `.project-agent` 外工作区干净。每项创建独立
-临时分支和 worktree，默认子 Agent 使用 `--auto-approve`。如果顶层使用 `--yolo`
-或 `--super-yolo`，风险级别会传给子 Agent。
+能力状态：Available、Unavailable、Need Config、Disabled、Broken。Unavailable/Broken 能力不会放入模型 Tool Schema 和 Prompt 能力摘要。
 
-每项从基线提交生成 binary patch，主工作区逐项运行 `git apply --check` 后应用。
-冲突不会强制覆盖；patch 和 `report.json` 保存在 `.project-agent/parallel/<run-id>/`。
-worktree 与临时分支最终清理。此功能不会自动判断任务是否真的独立，用户必须确保
-任务修改范围不重叠。
-
-## 十二、完整工作流
+当前 0.7.0 验收：
 
 ```text
-cd 项目 -> agent
-  -> 加载 XDG 配置和 Key 池
-  -> 识别/初始化项目并更新 Project Registry
-  -> 构建轻量索引和可选语义索引
-  -> SQLite FTS + Chroma 检索 Memory
-  -> 创建 AgentState 和 Session 检查点
-  -> Prompt Builder 组装 Context/Memory/Tools/User
-  -> DeepSeek 推理并产生 ToolRequest
-  -> Capability Registry + Permission Manager
-  -> 本地/MCP/HTTP/浏览器工具执行
-  -> 失败时检索 Correction/Lesson 自愈上下文
-  -> 保存 Session、Summary 和经验
-  -> 更新 SQLite、Chroma 和 Markdown Memory
+55 tests passed
+Ruff check passed
+Ruff format check passed
+compileall passed
+DeepSeek online check: 5/5 keys ready
+Docker hello-world passed
+Daemon run-once cleanup passed
+All enabled capabilities healthy
 ```
 
-## 十三、维护与验证
+## 13. 参考工程取舍
 
-```bash
-cd ~/AI-Agent
-.venv/bin/python -m pytest -q
-.venv/bin/ruff check agent tests scripts
-.venv/bin/ruff format --check agent tests scripts
-.venv/bin/python -m compileall -q agent scripts
-```
+参考了 `https://gitee.com/free/claude-code`。采纳：有界上下文、资源路径/大小/数量审计、能力降级可观测、可恢复状态、显式 Tool Loop。
 
-2026-07-13 最终结果：
+未采纳：第二套 Java/Spring Runtime、多模型供应商抽象、全屏 TUI、JAR 插件体系、任意 Hook、遥测、无限制 Skills/Agents 加载。这些内容会破坏当前“DeepSeek 唯一模型”和 `CLI -> Runtime -> AgentState -> Prompt -> Capability -> Permission` 边界。
 
-```text
-版本: 0.5.0
-pytest: 40 passed
-Ruff lint/format: passed
-compileall: passed
-agent doctor --online: 5/5 keys ready
-MCP stdio / Streamable HTTP / legacy SSE / Resources: passed
-HTTP allowlist / size / timeout / redirect policy: passed
-Memory CRUD / Correction / failure recovery: passed
-Tree-sitter semantic sidecar: passed
-Queue resume / Git worktree threshold and patch merge: passed
-```
+## 14. 新功能扩展规则
 
-详细实施取舍见 `DeepSeek-Agent-V3-工作日志.md`。源码维护说明见
-`~/AI-Agent/docs/implementation.md`。
+以后新增工具时：
 
-## 十四、提出后续需求
-
-```text
-目标：增加什么能力？
-触发：哪个 CLI、工具或事件触发？
-输入：读取哪些文件、服务和参数？
-输出：修改、显示或记住什么？
-权限：哪些动作默认关闭、需确认或允许 YOLO？
-恢复：失败、中断、冲突如何恢复？
-记忆：项目经验还是全局经验？
-示例：给出一个真实使用案例。
-```
+1. 在 `agent/tools/` 创建单一入口。
+2. 接受 `ToolRequest`，返回 `ToolResult`。
+3. 在 Capability Registry 注册参数、权限、超时、输入输出格式和可用性。
+4. 通过 Permission Manager，不允许 Runtime 或模型直接 `subprocess` 绕过工具层。
+5. 为成功、失败、超时、路径越界和缺少依赖添加测试。
+6. 副作用通过 Event Bus 记录，敏感值必须脱敏。
+7. 重型功能默认关闭，配置迁移只增加新默认值，不覆盖用户值。

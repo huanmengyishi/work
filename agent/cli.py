@@ -16,6 +16,7 @@ from .config import AppConfig, load_config
 from .console import ConsoleUI
 from .context import ContextBuilder
 from .deepseek import DeepSeekClient
+from .daemon import ProjectDaemon
 from .memory import MemoryStore
 from .network import proxy_url_from_env, redacted_proxy_url
 from .parallel import ParallelWorktreeRunner
@@ -43,6 +44,7 @@ COMMANDS = {
     "queue",
     "parallel",
     "health",
+    "daemon",
 }
 
 
@@ -127,6 +129,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_parallel(config, args, yolo=yolo, super_yolo=super_yolo)
     if args.command == "health":
         return cmd_health(config, args.reset)
+    if args.command == "daemon":
+        return cmd_daemon(config, args.daemon_command, args.project, once=args.once)
     return 2
 
 
@@ -160,7 +164,7 @@ def build_help_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "commands",
         nargs="?",
-        help="Commands: doctor, projects, init, config, memory, sessions, resume, context, tools, mcp, queue, parallel, health",
+        help="Commands: doctor, projects, init, config, memory, sessions, resume, context, tools, mcp, queue, parallel, health, daemon",
     )
     return parser
 
@@ -203,6 +207,8 @@ def build_command_parser() -> argparse.ArgumentParser:
     memory_edit.add_argument("--content")
     memory_edit.add_argument("--tag", action="append")
     memory_sub.add_parser("stats", help="Show memory totals by scope, kind, and tag.")
+    memory_maintain = memory_sub.add_parser("maintain", help="Preview or apply deduplication and expiry cleanup.")
+    memory_maintain.add_argument("--apply", action="store_true", help="Apply the reported maintenance operations.")
 
     sessions_parser = subparsers.add_parser("sessions", help="List resumable sessions for this project.")
     sessions_parser.add_argument("--limit", type=int, default=20)
@@ -225,6 +231,12 @@ def build_command_parser() -> argparse.ArgumentParser:
     parallel_parser.add_argument("--workers", type=int)
     health_parser = subparsers.add_parser("health", help="Show capability health and broken-tool state.")
     health_parser.add_argument("--reset", nargs="?", const="*", help="Reset one capability or all health failures.")
+    daemon_parser = subparsers.add_parser("daemon", help="Manage the optional per-project background daemon.")
+    daemon_parser.add_argument(
+        "daemon_command", choices=["start", "run", "status", "stop"], nargs="?", default="status"
+    )
+    daemon_parser.add_argument("--project", help=argparse.SUPPRESS)
+    daemon_parser.add_argument("--once", action="store_true", help=argparse.SUPPRESS)
     return parser
 
 
@@ -387,7 +399,10 @@ def cmd_memory(config: AppConfig, args: argparse.Namespace) -> int:
         for item in items:
             scope = "global" if item.project_id is None else "project"
             summary = " ".join(item.content.split())[:180]
-            print(f"[{item.id}] {item.updated_at}  {scope}/{item.kind}  {item.title}")
+            print(
+                f"[{item.id}] {item.updated_at}  {scope}/{item.kind}  {item.title} "
+                f"confidence={item.confidence:.2f} uses={item.use_count}"
+            )
             print(f"  tags: {', '.join(item.tags) or '-'}")
             print(f"  {summary}")
         return 0
@@ -429,7 +444,45 @@ def cmd_memory(config: AppConfig, args: argparse.Namespace) -> int:
             for name, count in sorted(values.items(), key=lambda pair: (-pair[1], pair[0].lower())):
                 print(f"  {name}: {count}")
         return 0
+    if args.memory_command == "maintain":
+        report = memory.maintain(project_id=project.id, apply=args.apply)
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        if not args.apply and (report["merge_count"] or report["expired_count"]):
+            print("Dry run only. Re-run with --apply to modify memory.")
+        return 0
     return 2
+
+
+def cmd_daemon(config: AppConfig, action: str, project_path: str | None, *, once: bool = False) -> int:
+    root = Path(project_path).expanduser() if project_path else Path.cwd()
+    project = ProjectManager(config).resolve_project(root)
+    memory = MemoryStore(config)
+    memory.sync_project(project)
+    daemon = ProjectDaemon(config, project, memory)
+    try:
+        if action == "start":
+            pid = daemon.start()
+            print(f"Daemon started for {project.name}: pid={pid}")
+            print(f"Log: {daemon.log_path}")
+            return 0
+        if action == "run":
+            return daemon.run(once=once)
+        if action == "stop":
+            stopped = daemon.stop()
+            print("Daemon stopped." if stopped else "Daemon is not running.")
+            return 0 if stopped else 1
+        status = daemon.status()
+        print(f"status: {'running' if status.running else 'stopped'}")
+        print(f"project: {status.project_root}")
+        print(f"pid: {status.pid or '-'}")
+        print(f"state: {daemon.state_path}")
+        print(f"log: {daemon.log_path}")
+        if status.state.get("last_poll_at"):
+            print(f"last poll: {status.state['last_poll_at']}")
+        return 0 if status.running else 1
+    except Exception as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
 
 
 def edit_memory_interactively(item) -> tuple[str, str, list[str]]:
@@ -658,6 +711,8 @@ def cmd_queue(
     except KeyboardInterrupt:
         print(f"Queue paused: {record.id}", file=sys.stderr)
         return 130
+    finally:
+        runtime.close()
     print(f"Queue {record.id}: {record.status}")
     return 0 if record.status == "completed" else 1
 
@@ -716,6 +771,7 @@ def repl(
             prompt = ui.read(active_session)
         except (EOFError, KeyboardInterrupt):
             print()
+            runtime.close()
             ui.close()
             return 0
         except ValueError as exc:
@@ -724,6 +780,7 @@ def repl(
         if not prompt:
             continue
         if prompt in {"/exit", "/quit"}:
+            runtime.close()
             ui.close()
             return 0
         if prompt == "/help":
@@ -833,6 +890,8 @@ def run_once(
     except Exception as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
+    finally:
+        runtime.close()
     return 0
 
 

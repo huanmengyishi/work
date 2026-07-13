@@ -231,9 +231,16 @@ class ContextBuilder:
         if semantic_index and semantic_index.get("enabled"):
             semantic_lines: list[str] = []
             import_lines: list[str] = []
+            module_lines: list[str] = []
             for file_item in semantic_index.get("files", []):
                 path = str(file_item.get("path") or "")
                 semantic_lines.extend(self._render_semantic_items(path, file_item.get("structures", [])))
+                summary = file_item.get("module_summary") or {}
+                module_lines.append(
+                    f"- `{path}` structures={summary.get('structure_count', 0)} "
+                    f"symbols={summary.get('symbol_count', 0)} imports={summary.get('import_count', 0)} "
+                    f"exports={','.join(file_item.get('exports', [])) or '-'}"
+                )
                 import_lines.extend(
                     f"- `{path}:{item.get('line')}` imports `{item.get('source')}`"
                     for item in file_item.get("imports", [])
@@ -243,13 +250,21 @@ class ContextBuilder:
                     "",
                     "## Optional Semantic Index Summary",
                     "",
+                    *module_lines[:100],
                     *(semantic_lines[:150] or ["No semantic structures were indexed."]),
                     *(import_lines[:100] or []),
+                    *[
+                        f"- relation `{item.get('source')}` -> `{item.get('target')}` via `{item.get('import')}`"
+                        for item in semantic_index.get("relationships", [])[:100]
+                    ],
                     "",
                     f"Full semantic index: `{project.agent_dir / 'index.semantic.json'}`",
                 ]
             )
-        return "\n".join(sections).strip(), loaded_files
+        rendered = "\n".join(sections).strip()
+        if len(rendered) > max_total:
+            rendered = rendered[: max(0, max_total - 16)].rstrip() + "\n...[truncated]"
+        return rendered, loaded_files
 
     @classmethod
     def _render_semantic_items(
@@ -323,12 +338,23 @@ class ContextBuilder:
                         "language": language,
                         "structures": structures,
                         "imports": imports,
+                        "exports": [
+                            str(item.get("name"))
+                            for item in structures
+                            if item.get("name") and not str(item.get("name")).startswith("_")
+                        ],
+                        "module_summary": {
+                            "structure_count": self._count_semantic_structures(structures),
+                            "symbol_count": len(result.symbols),
+                            "import_count": len(imports),
+                        },
                     }
                 )
             except Exception as exc:
                 failures.append({"path": str(record["path"]), "error": str(exc)[:300]})
             if len(files) >= max_files:
                 break
+        relationships = self._semantic_relationships(files)
         value = {
             "schema_version": 1,
             "enabled": True,
@@ -338,6 +364,7 @@ class ContextBuilder:
             "cache_hit": False,
             "file_count": len(files),
             "files": files,
+            "relationships": relationships,
             "failures": failures[:100],
         }
         self._write_json(path, value)
@@ -358,6 +385,67 @@ class ContextBuilder:
                 }
             )
         return structures
+
+    @classmethod
+    def _count_semantic_structures(cls, items: list[dict[str, Any]]) -> int:
+        return sum(1 + cls._count_semantic_structures(item.get("children", [])) for item in items)
+
+    @staticmethod
+    def _semantic_relationships(files: list[dict[str, Any]]) -> list[dict[str, str]]:
+        paths = {str(item.get("path") or "") for item in files}
+        stems: dict[str, str] = {}
+        for path in paths:
+            pure = Path(path)
+            without_suffix = pure.with_suffix("").as_posix()
+            stems[without_suffix] = path
+            stems[without_suffix.replace("/", ".")] = path
+            if pure.name == "__init__.py":
+                stems[pure.parent.as_posix().replace("/", ".")] = path
+        relationships: list[dict[str, str]] = []
+        seen: set[tuple[str, str, str]] = set()
+        for file_item in files:
+            source_path = str(file_item.get("path") or "")
+            for imported in file_item.get("imports", []):
+                raw = str(imported.get("source") or "")
+                candidates = ContextBuilder._import_candidates(source_path, raw)
+                target = next((stems[candidate] for candidate in candidates if candidate in stems), None)
+                if not target or target == source_path:
+                    continue
+                key = (source_path, target, raw)
+                if key in seen:
+                    continue
+                seen.add(key)
+                relationships.append({"source": source_path, "target": target, "import": raw})
+        return relationships[:5000]
+
+    @staticmethod
+    def _import_candidates(source_path: str, raw: str) -> list[str]:
+        value = raw.strip().rstrip(";")
+        candidates: list[str] = []
+        python_match = re.search(r"(?:from|import)\s+([.A-Za-z0-9_]+)", value)
+        if python_match:
+            module = python_match.group(1)
+            if module.startswith("."):
+                parent_parts = list(Path(source_path).parent.parts)
+                dots = len(module) - len(module.lstrip("."))
+                base = parent_parts[: max(0, len(parent_parts) - dots + 1)]
+                module = ".".join([*base, module.lstrip(".")]).strip(".")
+            candidates.extend([module, module.replace(".", "/")])
+        js_match = re.search(r"(?:from\s+|require\s*\(\s*)['\"]([^'\"]+)['\"]", value)
+        if js_match:
+            module = js_match.group(1)
+            if module.startswith("."):
+                module = (Path(source_path).parent / module).as_posix()
+            candidates.append(module.removesuffix("/index"))
+            candidates.append(module)
+        go_match = re.search(r"['\"]([^'\"]+)['\"]", value)
+        if go_match:
+            candidates.append(go_match.group(1))
+        expanded: list[str] = []
+        for candidate in candidates:
+            normalized = candidate.strip("./")
+            expanded.extend([normalized, f"{normalized}/index"])
+        return list(dict.fromkeys(expanded))
 
     def _extract_symbols(self, path: Path, relative: str) -> list[dict[str, Any]]:
         try:

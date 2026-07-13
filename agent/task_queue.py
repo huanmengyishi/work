@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import fcntl
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Callable
@@ -65,43 +66,54 @@ class TaskQueueManager:
     def run(self, record: QueueRecord, runner: QueueRunner, *, stop_on_failure: bool = True) -> QueueRecord:
         if record.project_id != self.project.id:
             raise ValueError("queue belongs to a different project")
-        record.status = "running"
-        self.save(record)
-        for task in record.tasks:
-            if task.status == "completed":
-                continue
-            if task.status in {"running", "paused"}:
-                task.status = "pending"
-            task.status = "running"
-            task.error = ""
-            task.updated_at = utc_now_iso()
+        lock_path = self.queue_dir / f"{record.id}.lock"
+        lock = lock_path.open("a+")
+        try:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            lock.close()
+            raise RuntimeError(f"queue is already running: {record.id}") from None
+        try:
+            record.status = "running"
             self.save(record)
-            try:
-                result, session_id, session_status = runner(task, record)
-                task.result = result
-                task.session_id = session_id
-                task.status = "completed" if session_status == "completed" else "failed"
-                if task.status == "failed":
-                    task.error = f"session ended with status {session_status}"
-            except KeyboardInterrupt:
-                task.status = "paused"
-                task.error = "interrupted by user"
+            for task in record.tasks:
+                if task.status == "completed":
+                    continue
+                if task.status in {"running", "paused"}:
+                    task.status = "pending"
+                task.status = "running"
+                task.error = ""
                 task.updated_at = utc_now_iso()
-                record.status = "paused"
                 self.save(record)
-                raise
-            except Exception as exc:
-                task.status = "failed"
-                task.error = str(exc)
-            task.updated_at = utc_now_iso()
+                try:
+                    result, session_id, session_status = runner(task, record)
+                    task.result = result
+                    task.session_id = session_id
+                    task.status = "completed" if session_status == "completed" else "failed"
+                    if task.status == "failed":
+                        task.error = f"session ended with status {session_status}"
+                except KeyboardInterrupt:
+                    task.status = "paused"
+                    task.error = "interrupted by user"
+                    task.updated_at = utc_now_iso()
+                    record.status = "paused"
+                    self.save(record)
+                    raise
+                except Exception as exc:
+                    task.status = "failed"
+                    task.error = str(exc)
+                task.updated_at = utc_now_iso()
+                self.save(record)
+                if task.status == "failed" and stop_on_failure:
+                    record.status = "paused"
+                    self.save(record)
+                    return record
+            record.status = "completed" if all(task.status == "completed" for task in record.tasks) else "paused"
             self.save(record)
-            if task.status == "failed" and stop_on_failure:
-                record.status = "paused"
-                self.save(record)
-                return record
-        record.status = "completed" if all(task.status == "completed" for task in record.tasks) else "paused"
-        self.save(record)
-        return record
+            return record
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+            lock.close()
 
     def save(self, record: QueueRecord) -> Path:
         record.updated_at = utc_now_iso()

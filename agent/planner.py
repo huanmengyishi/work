@@ -91,7 +91,15 @@ class PlanManager:
         state.completed_steps = [step.id for step in state.plan if step.status == "completed"]
         active = next((step.id for step in state.plan if step.status == "in_progress"), None)
         if active is None:
-            active = next((step.id for step in state.plan if step.status == "pending"), None)
+            completed = {step.id for step in state.plan if step.status in {"completed", "skipped"}}
+            active = next(
+                (
+                    step.id
+                    for step in state.plan
+                    if step.status == "pending" and all(dependency in completed for dependency in step.dependencies)
+                ),
+                None,
+            )
         state.current_step = active
         if state.execution_context:
             state.execution_context.current_plan_id = active

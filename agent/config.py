@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import os
 import shlex
+import fcntl
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import yaml
 
@@ -54,6 +56,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "max_response_bytes": 1048576,
             "allowed_domains": [],
         },
+        "lsp": {
+            "enabled": True,
+            "timeout_seconds": 60,
+            "max_diagnostics": 200,
+            "auto_after_file_apply": True,
+        },
     },
     "memory": {
         "sqlite_path": str(paths.memory_db_path()),
@@ -61,6 +69,16 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "retrieval_limit": 8,
         "vector_enabled": True,
         "smart_reflection": False,
+        "dedupe_similarity": 0.94,
+        "default_confidence": 0.7,
+        "expiry_days": 365,
+        "protect_kinds": ["Correction", "Decision"],
+    },
+    "daemon": {
+        "enabled": False,
+        "poll_interval_seconds": 10,
+        "memory_maintenance_seconds": 3600,
+        "queue_enabled": False,
     },
     "context": {
         "max_files": 5000,
@@ -183,6 +201,13 @@ DEFAULT_TOOLS = {
                     "permissions": ["network", "read", "write"],
                     "timeout_seconds": 30,
                     "requires_confirmation": True,
+                }
+            },
+            "lsp": {
+                "diagnostics": {
+                    "enabled": True,
+                    "permissions": ["read", "execute"],
+                    "timeout_seconds": 60,
                 }
             },
             "memory": {
@@ -332,7 +357,7 @@ def merge_yaml_defaults(path: Path, defaults: dict[str, Any]) -> None:
     merged = deep_merge(defaults, current)
     if merged == current:
         return
-    temp = path.with_suffix(path.suffix + ".tmp")
+    temp = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
     with temp.open("w", encoding="utf-8") as fh:
         yaml.safe_dump(merged, fh, sort_keys=False, allow_unicode=True)
     temp.replace(path)
@@ -341,18 +366,21 @@ def merge_yaml_defaults(path: Path, defaults: dict[str, Any]) -> None:
 def ensure_default_config() -> None:
     paths.ensure_base_dirs()
     cfg = paths.config_dir()
-    merge_yaml_defaults(cfg / "config.yaml", DEFAULT_CONFIG)
-    merge_yaml_defaults(cfg / "tools.yaml", DEFAULT_TOOLS)
-    merge_yaml_defaults(cfg / "memory.yaml", DEFAULT_MEMORY)
-    merge_yaml_defaults(cfg / "mcp.yaml", DEFAULT_MCP)
-    merge_yaml_defaults(cfg / "model.yaml", {"model": DEFAULT_CONFIG["model"]})
-    ensure_mcp_examples(cfg / "mcp.yaml")
-    migrate_http_activation(cfg / "tools.yaml")
-    try:
-        (cfg / "mcp.yaml").chmod(0o600)
-    except OSError:
-        pass
-    ensure_secrets_file(cfg / "secrets.env")
+    lock_path = cfg / ".config.lock"
+    with lock_path.open("a+") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        merge_yaml_defaults(cfg / "config.yaml", DEFAULT_CONFIG)
+        merge_yaml_defaults(cfg / "tools.yaml", DEFAULT_TOOLS)
+        merge_yaml_defaults(cfg / "memory.yaml", DEFAULT_MEMORY)
+        merge_yaml_defaults(cfg / "mcp.yaml", DEFAULT_MCP)
+        merge_yaml_defaults(cfg / "model.yaml", {"model": DEFAULT_CONFIG["model"]})
+        ensure_mcp_examples(cfg / "mcp.yaml")
+        migrate_http_activation(cfg / "tools.yaml")
+        try:
+            (cfg / "mcp.yaml").chmod(0o600)
+        except OSError:
+            pass
+        ensure_secrets_file(cfg / "secrets.env")
 
 
 def migrate_http_activation(path: Path) -> None:
@@ -371,7 +399,7 @@ def migrate_http_activation(path: Path) -> None:
             changed = True
     if not changed:
         return
-    temp = path.with_suffix(path.suffix + ".tmp")
+    temp = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
     with temp.open("w", encoding="utf-8") as handle:
         yaml.safe_dump(current, handle, sort_keys=False, allow_unicode=True)
     temp.replace(path)
@@ -391,7 +419,7 @@ def ensure_mcp_examples(path: Path) -> None:
         return
     updated = deep_merge({}, current)
     updated["mcp"]["servers"] = [*servers, example]
-    temp = path.with_suffix(path.suffix + ".tmp")
+    temp = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
     with temp.open("w", encoding="utf-8") as fh:
         yaml.safe_dump(updated, fh, sort_keys=False, allow_unicode=True)
     temp.replace(path)

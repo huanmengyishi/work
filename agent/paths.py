@@ -51,6 +51,10 @@ def backup_dir() -> Path:
     return data_dir() / "backup"
 
 
+def daemon_dir() -> Path:
+    return data_dir() / "daemon"
+
+
 def projects_db_path() -> Path:
     return data_dir() / "projects.db"
 
@@ -68,5 +72,6 @@ def ensure_base_dirs() -> None:
         cache_dir(),
         logs_dir(),
         backup_dir(),
+        daemon_dir(),
     ):
         path.mkdir(parents=True, exist_ok=True)
