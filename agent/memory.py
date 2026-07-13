@@ -487,7 +487,7 @@ class MemoryStore:
         # SequenceMatcher ratios near the configured duplicate threshold imply
         # substantial common substrings. A conservative overlap floor keeps those
         # pairs for exact comparison while discarding incidental shared prose.
-        minimum_ratio = max(0.15, threshold - 0.25)
+        minimum_ratio = max(0.15, threshold - 0.4)
         return overlap / min(left_size, right_size) >= minimum_ratio
 
     @staticmethod

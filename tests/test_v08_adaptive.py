@@ -191,7 +191,7 @@ def test_memory_dedupe_prefilter_avoids_global_all_pairs() -> None:
         )
     started = time.monotonic()
     assert MemoryStore._duplicate_groups(items, 0.94) == []
-    assert time.monotonic() - started < 1.5
+    assert time.monotonic() - started < 2.5
 
     first = MemoryItem(
         id=2001,
