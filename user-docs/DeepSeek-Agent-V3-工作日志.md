@@ -63,7 +63,9 @@ Memory 1200 条候选性能回归 passed
 
 版本升级为 `v0.8.0`（新能力使用 minor 版本）。源码 README、实现说明、`docs/releases/v0.8.0.md`、用户 README、工作日志和 Word 文档同步更新。
 
-源码提交：`ec7f55a`（`release: Deep Agent v0.8.0 adaptive reasoning`）。发布文档补记、tag 和远端验证结果在最终发布提交完成后补入本节。
+正式发布提交：`1770b39`。GitHub 远端 `main` 与注释标签 `v0.8.0` 均已核验指向完整提交 `1770b39f83686a8b85aeb76811dbd0d568d507b4`。
+
+推送时发现当前 GitHub OAuth 凭据只有 `repo`、没有 `workflow` scope，GitHub 明确拒绝新增 `.github/workflows/test.yml`。为不阻塞源码、安全修复、测试、文档和标签发布，本轮将 CI 工作流草案留作后续改进，未在远端声称 CI 已启用；本地 Ruff、pytest、format、compileall 全部通过。
 
 ### 下一步
 
