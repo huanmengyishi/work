@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import hashlib
-import subprocess
 import time
 from pathlib import Path
 
@@ -164,14 +163,44 @@ def test_daemon_queue_timeout_is_capped(monkeypatch, tmp_path: Path, make_config
     monkeypatch.setattr("agent.daemon.TaskQueueManager.list", lambda self, limit=100: [Pending()])
     seen: dict[str, int] = {}
 
-    def fake_run(*args, **kwargs):
-        seen["timeout"] = kwargs["timeout"]
-        return subprocess.CompletedProcess(args[0], 0, "", "")
+    class FakeProcess:
+        pid = 999999
+        returncode = 0
 
-    monkeypatch.setattr("agent.daemon.subprocess.run", fake_run)
+        @staticmethod
+        def communicate(timeout=None):
+            seen["timeout"] = timeout
+            return "", ""
+
+    monkeypatch.setattr("agent.daemon.subprocess.Popen", lambda *args, **kwargs: FakeProcess())
 
     assert daemon._run_one_pending_queue() == {"id": "queue-1", "returncode": 0}
     assert seen["timeout"] == 90
+
+
+def test_daemon_rejects_pid_with_forged_command_line(monkeypatch, tmp_path: Path, make_config) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    config = make_config()
+    project = ProjectManager(config).resolve_project(root)
+    daemon = ProjectDaemon(config, project, MemoryStore(config))
+    daemon.pid_path.write_text(json.dumps({"pid": 1234, "starttime": "10"}), encoding="ascii")
+
+    monkeypatch.setattr(daemon, "_pid_alive", lambda _pid: True)
+    monkeypatch.setattr(daemon, "_process_starttime", lambda _pid: "10")
+    original_read_bytes = Path.read_bytes
+
+    def fake_read_bytes(path: Path) -> bytes:
+        if path == Path("/proc/1234/cmdline"):
+            # The old substring test accepted this unrelated process because its
+            # trailing arguments contained the daemon phrase and project root.
+            return b"/usr/bin/python3\0-c\0sleep(60)\0agent daemon run\0" + str(root).encode() + b"\0"
+        return original_read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", fake_read_bytes)
+
+    assert daemon.status().running is False
+    assert not daemon.pid_path.exists()
 
 
 def test_memory_dedupe_prefilter_avoids_global_all_pairs() -> None:

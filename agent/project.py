@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import sqlite3
@@ -126,7 +127,17 @@ class ProjectManager:
     def resolve_project(self, start: Path | None = None) -> Project:
         cwd = (start or Path.cwd()).resolve()
         root = self._find_existing_root(cwd) or self._infer_new_root(cwd)
-        project = self._ensure_project(root)
+        agent_dir = root / self.agent_dir_name
+        if agent_dir.is_symlink():
+            raise ValueError(f"project Agent directory must not be a symbolic link: {agent_dir}")
+        agent_dir.mkdir(parents=True, exist_ok=True)
+        lock_handle = (agent_dir / ".project.lock").open("a+")
+        try:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+            project = self._ensure_project(root)
+        finally:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+            lock_handle.close()
         self.registry.upsert(project)
         return project
 
@@ -247,8 +258,10 @@ class ProjectManager:
 
     @staticmethod
     def _write_project_yaml(path: Path, metadata: dict[str, Any]) -> None:
-        with path.open("w", encoding="utf-8") as fh:
+        temp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+        with temp.open("w", encoding="utf-8") as fh:
             yaml.safe_dump(metadata, fh, sort_keys=False, allow_unicode=True)
+        temp.replace(path)
 
     @staticmethod
     def _write_default_files(

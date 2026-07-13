@@ -171,7 +171,9 @@ runtime:
   max_tool_rounds_hard_limit: 32
   large_project_source_files: 500
   large_project_files: 2000
+  progress_interval_seconds: 10
   show_thinking: true
+  show_reasoning_content: true
 
 model:
   timeout_seconds: 300
@@ -369,7 +371,7 @@ agent health --reset
 当前 0.8.0 验收：
 
 ```text
-79 tests passed（含真实 PTY）
+86 tests passed（含真实 PTY）
 Ruff check passed
 Ruff format check passed
 compileall passed
@@ -401,6 +403,7 @@ DeepSeek streaming/tool-call assembly passed
 - `show_thinking` 展示的是 DeepSeek API 返回的 reasoning 内容，可能较长；可在配置中关闭。
 - 已输出部分 reasoning 后的流断线不会自动重放，需要 `/resume`，这是避免重复工具副作用的安全设计。
 - `--super-yolo` 仍会绕过 Permission Manager；普通模式和 `--yolo` 已增加 Docker host/root/socket/device 防护。
+- Shell/Python 属于宿主机进程：程序会限制请求中的工作目录并拦截已知危险模式，但命令文本内部引用的绝对路径仍由 Linux 权限而非项目级 OS 沙箱隔离。处理不可信任务时使用默认安全模式，不要开启 YOLO/SUPER YOLO。
 
 回滚到上一版不会删除配置、Memory 或项目数据：
 

@@ -43,12 +43,8 @@ class ProjectDaemon:
         self.log_path = self.base_dir / "daemon.log"
         self._stop = Event()
 
-    def start(self) -> int:
-        status = self.status()
-        if status.running and status.pid:
-            return status.pid
-        self.stop_path.unlink(missing_ok=True)
-        command = [
+    def _command(self) -> list[str]:
+        return [
             sys.executable,
             "-m",
             "agent",
@@ -57,6 +53,13 @@ class ProjectDaemon:
             "--project",
             str(self.project.root),
         ]
+
+    def start(self) -> int:
+        status = self.status()
+        if status.running and status.pid:
+            return status.pid
+        self.stop_path.unlink(missing_ok=True)
+        command = self._command()
         with self.log_path.open("a", encoding="utf-8") as log:
             process = subprocess.Popen(
                 command,
@@ -192,21 +195,32 @@ class ProjectDaemon:
             int(self.config.get("tools.shell.timeout_seconds", 120)) * max(1, len(pending.tasks)),
         )
         timeout = min(calculated_timeout, max(60, int(self.config.get("daemon.queue_timeout_seconds", 3600))))
+        process = subprocess.Popen(
+            command,
+            cwd=self.project.root,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
         try:
-            completed = subprocess.run(
-                command,
-                cwd=self.project.root,
-                stdin=subprocess.DEVNULL,
-                text=True,
-                capture_output=True,
-                timeout=timeout,
-                check=False,
-            )
+            stdout, stderr = process.communicate(timeout=timeout)
+            completed = subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
         except subprocess.TimeoutExpired as exc:
-            stdout = exc.stdout if isinstance(exc.stdout, str) else ""
-            stderr = exc.stderr if isinstance(exc.stderr, str) else ""
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+                stdout, stderr = process.communicate(timeout=2)
+            except (ProcessLookupError, subprocess.TimeoutExpired):
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                stdout, stderr = process.communicate()
+            partial_stdout = exc.stdout if isinstance(exc.stdout, str) else stdout or ""
+            partial_stderr = exc.stderr if isinstance(exc.stderr, str) else stderr or ""
             completed = subprocess.CompletedProcess(
-                command, 124, stdout, (stderr + f"\ntimeout after {timeout}s").strip()
+                command, 124, partial_stdout, (partial_stderr + f"\ntimeout after {timeout}s").strip()
             )
         with self.log_path.open("a", encoding="utf-8") as log:
             if completed.stdout:
@@ -227,14 +241,36 @@ class ProjectDaemon:
 
     def _write_pid(self, pid: int) -> None:
         temp = self.pid_path.with_suffix(".tmp")
-        temp.write_text(f"{pid}\n", encoding="ascii")
+        starttime = self._process_starttime(pid)
+        temp.write_text(json.dumps({"pid": pid, "starttime": starttime}) + "\n", encoding="ascii")
         temp.replace(self.pid_path)
 
-    def _read_pid(self) -> int | None:
+    def _read_pid_record(self) -> tuple[int, str | None] | None:
         try:
-            return int(self.pid_path.read_text(encoding="ascii").strip())
-        except (OSError, ValueError):
+            raw = self.pid_path.read_text(encoding="ascii").strip()
+        except OSError:
             return None
+        try:
+            value = json.loads(raw)
+        except json.JSONDecodeError:
+            value = raw
+        if isinstance(value, int):
+            return value, None
+        if isinstance(value, str):
+            try:
+                return int(value), None
+            except ValueError:
+                return None
+        if not isinstance(value, dict):
+            return None
+        try:
+            return int(value["pid"]), str(value.get("starttime") or "") or None
+        except (KeyError, TypeError, ValueError):
+            return None
+
+    def _read_pid(self) -> int | None:
+        record = self._read_pid_record()
+        return record[0] if record else None
 
     def _remove_stale_pid(self) -> None:
         self.pid_path.unlink(missing_ok=True)
@@ -250,16 +286,36 @@ class ProjectDaemon:
     def _is_our_process(self, pid: int) -> bool:
         if not self._pid_alive(pid):
             return False
+        record = self._read_pid_record()
+        if not record or record[0] != pid:
+            return False
+        expected_starttime = record[1]
+        if expected_starttime and self._process_starttime(pid) != expected_starttime:
+            return False
         try:
-            command = (
-                (Path("/proc") / str(pid) / "cmdline")
-                .read_bytes()
-                .replace(b"\0", b" ")
-                .decode("utf-8", errors="replace")
-            )
+            argv = [
+                value.decode("utf-8", errors="replace")
+                for value in (Path("/proc") / str(pid) / "cmdline").read_bytes().split(b"\0")
+                if value
+            ]
         except OSError:
             return False
-        return "agent daemon run" in command and str(self.project.root) in command
+        expected = self._command()
+        return (
+            len(argv) == len(expected)
+            and argv[1:] == expected[1:]
+            and Path(argv[0]).resolve() == Path(expected[0]).resolve()
+        )
+
+    @staticmethod
+    def _process_starttime(pid: int) -> str | None:
+        try:
+            stat = (Path("/proc") / str(pid) / "stat").read_text(encoding="ascii")
+            closing = stat.rfind(")")
+            fields_after_name = stat[closing + 2 :].split()
+            return fields_after_name[19]
+        except (OSError, IndexError):
+            return None
 
     def _read_state(self) -> dict[str, Any]:
         try:

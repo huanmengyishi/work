@@ -34,6 +34,10 @@
 - Queue ID 先校验、锁内重载 canonical 状态、唯一临时文件、按 mtime 选最新。
 - 普通/YOLO 模式拒绝 Docker root、socket、device 和 host namespace 访问。
 - 新增 GitHub Actions Python 3.11/3.12/3.13 矩阵，自动执行 Ruff、pytest 和 compileall。
+- 首次 Project 初始化增加项目锁和原子 YAML；Context/Workspace 缓存改用唯一临时文件。
+- 同一 Session 的并发 Resume 增加 per-session flock，拒绝重复 turn。
+- Daemon 使用精确 argv + `/proc` starttime 身份校验；Queue 超时终止整个进程组。
+- Shell 输出、HTTP 请求体/Header、文档输入、浏览器下载和 MCP 分页增加硬上限。
 
 ### 审查结论
 
@@ -44,7 +48,7 @@
 ### 测试
 
 ```text
-79 tests passed
+86 tests passed
 Ruff check passed
 Ruff format check passed
 compileall passed
@@ -64,8 +68,8 @@ Memory 1200 条候选性能回归 passed
 ### 下一步
 
 - 为 Parallel worker 增加按任务/全局超时与保留失败 worktree 策略。
-- 为 MCP 分页增加重复 cursor 熔断、总页数/总响应字节上限。
-- 将 Session 同记录并发写从唯一 temp 进一步提升为 record lock/CAS。
+- 为工具执行增加 durable intent/result journal，缩小 SIGKILL 后恢复重复副作用窗口。
+- 为 Session 增加 revision/CAS，支持未来可控的并发 turn 合并策略。
 - 若用户选择许可证，再增加 LICENSE；许可证属于法律授权，不自动假设。
 
 ## 一、工作目标

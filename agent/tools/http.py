@@ -13,6 +13,9 @@ from .base import ToolResult
 
 
 SENSITIVE_HEADERS = {"authorization", "cookie", "proxy-authorization", "x-api-key", "api-key"}
+MAX_REQUEST_BYTES = 1_048_576
+MAX_HEADER_COUNT = 64
+MAX_HEADER_BYTES = 16_384
 
 
 class RejectRedirect(urllib.request.HTTPRedirectHandler):
@@ -48,6 +51,13 @@ class HttpTool:
             if verb not in {"GET", "POST"}:
                 raise ValueError("http_request supports only GET and POST")
             request_headers = {str(key): str(value) for key, value in (headers or {}).items()}
+            if len(request_headers) > MAX_HEADER_COUNT:
+                raise ValueError(f"http_request accepts at most {MAX_HEADER_COUNT} headers")
+            header_bytes = sum(
+                len(key.encode("utf-8")) + len(value.encode("utf-8")) for key, value in request_headers.items()
+            )
+            if header_bytes > MAX_HEADER_BYTES:
+                raise ValueError(f"http_request headers exceed {MAX_HEADER_BYTES} bytes")
             if any(key.lower() in SENSITIVE_HEADERS for key in request_headers):
                 raise ValueError("sensitive authentication headers are not accepted by http_request")
             body = None
@@ -55,6 +65,8 @@ class HttpTool:
                 if verb != "POST":
                     raise ValueError("json_body is supported only with POST")
                 body = json.dumps(json_body, ensure_ascii=False).encode("utf-8")
+                if len(body) > MAX_REQUEST_BYTES:
+                    raise ValueError(f"HTTP request body exceeds {MAX_REQUEST_BYTES} bytes")
                 request_headers.setdefault("Content-Type", "application/json; charset=utf-8")
             request_headers.setdefault("Accept", "application/json, text/plain;q=0.9, */*;q=0.1")
             effective_timeout = min(max(int(timeout or self.timeout), 1), 30)

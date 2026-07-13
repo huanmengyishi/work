@@ -3,10 +3,12 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import pytest
+
 from agent.memory import MemoryStore
 from agent.project import ProjectManager
 from agent.tools import ToolManager
-from agent.tools.mcp import MCPManager
+from agent.tools.mcp import MCPManager, list_remote_tools
 
 
 def mcp_overrides(database: Path) -> dict:
@@ -107,3 +109,16 @@ def test_mcp_environment_does_not_inherit_deepseek_key(monkeypatch, make_config,
 
     assert "DEEPSEEK_API_KEY" not in safe
     assert explicit["DEEPSEEK_API_KEY"] == "must-not-leak"
+
+
+def test_mcp_tool_pagination_rejects_repeated_cursor() -> None:
+    class Client:
+        name = "looping"
+        startup_timeout = 1
+
+        @staticmethod
+        def request(method, params, timeout):
+            return {"tools": [], "nextCursor": "same"}
+
+    with pytest.raises(RuntimeError, match="repeated tools/list cursor"):
+        list_remote_tools(Client())

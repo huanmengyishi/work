@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from agent.context import ContextBuilder
@@ -81,3 +82,36 @@ def test_optional_semantic_index_is_sidecar(tmp_path: Path, make_config) -> None
     assert semantic["files"][0]["structures"][0]["name"] == "UserService"
     assert semantic["files"][0]["imports"][0]["source"] == "import json"
     assert "UserService.load" in snapshot.rendered
+
+
+def test_context_refresh_uses_unique_atomic_temporaries(tmp_path: Path, make_config) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    (root / "main.py").write_text("def run():\n    return 1\n", encoding="utf-8")
+    config = make_config()
+    project = ProjectManager(config).resolve_project(root)
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        snapshots = list(executor.map(lambda _index: ContextBuilder(config).build(project, refresh=True), range(24)))
+
+    assert {snapshot.index["project_id"] for snapshot in snapshots} == {project.id}
+    assert json.loads((project.agent_dir / "index.json").read_text(encoding="utf-8"))["project_id"] == project.id
+    assert (
+        json.loads((project.agent_dir / "workspace_memory.json").read_text(encoding="utf-8"))["project_id"]
+        == project.id
+    )
+
+
+def test_project_first_initialization_converges_under_concurrency(tmp_path: Path, make_config) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    config = make_config()
+
+    with ThreadPoolExecutor(max_workers=12) as executor:
+        projects = list(executor.map(lambda _index: ProjectManager(config).resolve_project(root), range(36)))
+
+    project_ids = {project.id for project in projects}
+    assert len(project_ids) == 1
+    metadata = (root / ".project-agent" / "project.yaml").read_text(encoding="utf-8")
+    assert next(iter(project_ids)) in metadata
+    assert ProjectRegistry(config.data_dir / "projects.db").get_by_root(root)["project_id"] in project_ids

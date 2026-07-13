@@ -24,6 +24,8 @@ from .registry import ToolCapability
 
 
 MCP_PROTOCOL_VERSION = "2025-03-26"
+MAX_TOOL_LIST_PAGES = 100
+MAX_REMOTE_TOOLS = 2_000
 SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9_]+")
 SAFE_INHERITED_ENV = {
     "PATH",
@@ -104,16 +106,23 @@ def rpc_result(server_name: str, message: dict[str, Any]) -> dict[str, Any]:
 def list_remote_tools(client: Any) -> list[dict[str, Any]]:
     tools: list[dict[str, Any]] = []
     cursor: str | None = None
-    while True:
+    seen_cursors: set[str] = set()
+    for _page in range(MAX_TOOL_LIST_PAGES):
         params = {"cursor": cursor} if cursor else {}
         result = client.request("tools/list", params, timeout=client.startup_timeout)
         values = result.get("tools") if isinstance(result, dict) else None
         if not isinstance(values, list):
             raise RuntimeError(f"MCP server {client.name} returned an invalid tools/list result")
         tools.extend(item for item in values if isinstance(item, dict))
+        if len(tools) > MAX_REMOTE_TOOLS:
+            raise RuntimeError(f"MCP server {client.name} returned more than {MAX_REMOTE_TOOLS} tools")
         cursor = str(result.get("nextCursor") or "")
         if not cursor:
             return tools
+        if cursor in seen_cursors:
+            raise RuntimeError(f"MCP server {client.name} repeated tools/list cursor")
+        seen_cursors.add(cursor)
+    raise RuntimeError(f"MCP server {client.name} exceeded {MAX_TOOL_LIST_PAGES} tools/list pages")
 
 
 def tool_call_result(server_name: str, tool_name: str, result: dict[str, Any]) -> ToolResult:
@@ -237,18 +246,7 @@ class MCPClient:
             raise
 
     def list_tools(self) -> list[dict[str, Any]]:
-        tools: list[dict[str, Any]] = []
-        cursor: str | None = None
-        while True:
-            params = {"cursor": cursor} if cursor else {}
-            result = self.request("tools/list", params, timeout=self.startup_timeout)
-            values = result.get("tools") if isinstance(result, dict) else None
-            if not isinstance(values, list):
-                raise RuntimeError(f"MCP server {self.name} returned an invalid tools/list result")
-            tools.extend(item for item in values if isinstance(item, dict))
-            cursor = str(result.get("nextCursor") or "")
-            if not cursor:
-                return tools
+        return list_remote_tools(self)
 
     def call_tool(self, tool_name: str, arguments: dict[str, Any]) -> ToolResult:
         try:

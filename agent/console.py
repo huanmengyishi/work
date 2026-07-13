@@ -36,12 +36,14 @@ class ConsoleUI:
         super_yolo: bool = False,
         show_thinking: bool = True,
         show_reasoning_content: bool = True,
+        progress_interval_seconds: int = 10,
     ) -> None:
         self.project = project
         self.yolo = yolo
         self.super_yolo = super_yolo
         self.show_thinking = show_thinking
         self.show_reasoning_content = show_reasoning_content
+        self.progress_interval_seconds = max(1, min(int(progress_interval_seconds), 60))
         self.history_path = data_dir / "cache" / "repl_history"
         self.color = bool(sys.stdout.isatty() and os.environ.get("TERM") != "dumb" and "NO_COLOR" not in os.environ)
         self._readline = self._configure_readline()
@@ -184,7 +186,7 @@ class ConsoleUI:
         rendered = self._style(f"  ◐ Thinking {elapsed}s · {label}", "35")
         if sys.stdout.isatty():
             print(f"\r\033[2K{rendered}", end="", flush=True)
-        elif elapsed == 0 or elapsed % 10 == 0:
+        elif elapsed == 0 or elapsed % self.progress_interval_seconds == 0:
             print(rendered, flush=True)
 
     @staticmethod

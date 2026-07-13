@@ -5,7 +5,7 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from agent.tools.http import HttpTool
+from agent.tools.http import MAX_HEADER_COUNT, MAX_REQUEST_BYTES, HttpTool
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -46,6 +46,19 @@ def test_http_tool_allowlist_and_response_limit(tmp_path: Path) -> None:
         redirected = tool.request(f"http://127.0.0.1:{server.server_port}/redirect")
         assert redirected.success is False
         assert "HTTP 302" in redirected.stderr
+        oversized_body = tool.request(
+            f"http://127.0.0.1:{server.server_port}/",
+            method="POST",
+            json_body={"value": "x" * MAX_REQUEST_BYTES},
+        )
+        assert oversized_body.success is False
+        assert "request body exceeds" in oversized_body.stderr
+        too_many_headers = tool.request(
+            f"http://127.0.0.1:{server.server_port}/",
+            headers={f"X-Test-{index}": "value" for index in range(MAX_HEADER_COUNT + 1)},
+        )
+        assert too_many_headers.success is False
+        assert "at most" in too_many_headers.stderr
     finally:
         server.shutdown()
         server.server_close()

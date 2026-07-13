@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+
+import pytest
 
 from agent.deepseek import ChatResponse
 from agent.memory import MemoryStore
@@ -210,3 +214,55 @@ def test_short_resume_keeps_deep_strategy_and_plan(tmp_path: Path, make_config) 
     assert resumed.task_strategy["mode"] == "deep"
     assert [step.id for step in resumed.plan] == original_plan
     assert client.options[-1] == {"thinking": True, "reasoning_effort": "max"}
+
+
+def test_concurrent_resume_rejects_second_session_turn(tmp_path: Path, make_config) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    config = make_config()
+    project = ProjectManager(config).resolve_project(root)
+    memory = MemoryStore(config)
+    started = threading.Event()
+    release = threading.Event()
+
+    class BlockingClient(FakeClient):
+        def chat(self, **kwargs) -> ChatResponse:
+            started.set()
+            assert release.wait(timeout=5)
+            return super().chat(**kwargs)
+
+    initial_runtime = AgentRuntime(
+        config=config,
+        project=project,
+        memory=memory,
+        tools=ToolManager(config, project, memory, yolo=True),
+        client=FakeClient([{"role": "assistant", "content": "checkpoint"}]),
+    )
+    assert initial_runtime.run("create resumable session") == "checkpoint"
+    session_id = initial_runtime.last_session_id
+    first = AgentRuntime(
+        config=config,
+        project=project,
+        memory=memory,
+        tools=ToolManager(config, project, memory, yolo=True),
+        client=BlockingClient([{"role": "assistant", "content": "first"}]),
+    )
+    second = AgentRuntime(
+        config=config,
+        project=project,
+        memory=memory,
+        tools=ToolManager(config, project, memory, yolo=True),
+        client=FakeClient([{"role": "assistant", "content": "second"}]),
+    )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        future = executor.submit(first.resume, "first continuation", session_id)
+        assert started.wait(timeout=5)
+        with pytest.raises(RuntimeError, match="already being resumed"):
+            second.resume("second continuation", session_id)
+        release.set()
+        assert future.result(timeout=5) == "first"
+
+    state = first.sessions.load(session_id).state
+    assert state.turn == 2
+    assert state.final_answer == "first"

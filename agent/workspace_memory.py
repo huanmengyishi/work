@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from .project import Project
 from .timeutil import utc_now_iso
@@ -196,7 +197,7 @@ class WorkspaceMemoryManager:
 
     def _write(self, value: dict[str, Any]) -> None:
         value["path"] = str(self.path)
-        temp = self.path.with_suffix(".json.tmp")
+        temp = self.path.with_name(f".{self.path.name}.{uuid4().hex}.tmp")
         temp.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         temp.replace(self.path)
 

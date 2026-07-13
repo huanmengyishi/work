@@ -170,6 +170,9 @@ runtime:
   max_tool_rounds_hard_limit: 32
   large_project_source_files: 500
   large_project_files: 2000
+  progress_interval_seconds: 10
+  show_thinking: true
+  show_reasoning_content: true
 
 model:
   timeout_seconds: 300
@@ -192,6 +195,12 @@ Approval modes:
 
 Persistent switches are `permissions.yolo` and `permissions.super_yolo` in
 `~/.config/deep-agent/config.yaml`.
+
+Important: normal/YOLO Docker calls reject host-root, socket, device, and host
+namespace access. Unstructured shell/Python commands are still host processes;
+their working directory is checked, but the operating system is the actual
+security boundary for paths referenced inside command text. Use safe mode for
+untrusted requests and reserve `--super-yolo` for deliberate host access.
 
 ## Safe Editing
 
@@ -288,7 +297,7 @@ cd ~/AI-Agent
 .venv/bin/python -m compileall -q agent tests scripts
 ```
 
-Current v0.8.0 baseline: 79 pytest cases, including a real PTY smoke test.
+Current v0.8.0 baseline: 86 pytest cases, including a real PTY smoke test.
 
 See `docs/implementation.md` for architecture, extension rules, Docker proxy,
 OCR, memory, and maintenance details.

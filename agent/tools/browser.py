@@ -19,9 +19,10 @@ SAFE_FILENAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
 class BrowserTool:
     """Playwright browser automation with optional project-local persistent contexts."""
 
-    def __init__(self, cwd: Path, timeout: int = 180) -> None:
+    def __init__(self, cwd: Path, timeout: int = 180, max_download_bytes: int = 100_000_000) -> None:
         self.cwd = cwd
         self.timeout = timeout
+        self.max_download_bytes = max(1, min(int(max_download_bytes), 500_000_000))
         self.session_root = cwd / ".project-agent" / "browser-sessions"
         self.download_root = cwd / ".project-agent" / "downloads"
         self.session_root.mkdir(parents=True, exist_ok=True)
@@ -81,6 +82,10 @@ class BrowserTool:
                 selected_name = filename or download.suggested_filename or "download.bin"
                 target = self._unique_download_path(destination_dir, selected_name)
                 download.save_as(target)
+                size = target.stat().st_size
+                if size > self.max_download_bytes:
+                    target.unlink(missing_ok=True)
+                    return ToolResult(False, "", f"browser download exceeds {self.max_download_bytes} bytes")
                 mime_type = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
                 relative = target.relative_to(self.cwd).as_posix()
                 return ToolResult(
@@ -91,7 +96,7 @@ class BrowserTool:
                         "absolute_path": str(target),
                         "filename": target.name,
                         "mime_type": mime_type,
-                        "size_bytes": target.stat().st_size,
+                        "size_bytes": size,
                         "url": download.url,
                         "session_name": session_name,
                     },

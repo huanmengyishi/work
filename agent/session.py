@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fcntl
 import json
 import re
 from dataclasses import dataclass
@@ -29,6 +30,19 @@ class SessionInfo:
     user_request: str
     updated_at: str
     path: Path
+
+
+class SessionLease:
+    def __init__(self, handle) -> None:
+        self.handle = handle
+
+    def __enter__(self) -> SessionLease:
+        return self
+
+    def __exit__(self, exc_type, exc, traceback) -> bool:
+        fcntl.flock(self.handle.fileno(), fcntl.LOCK_UN)
+        self.handle.close()
+        return False
 
 
 class SessionManager:
@@ -108,6 +122,17 @@ class SessionManager:
         if not isinstance(state_data, dict) or not isinstance(messages, list):
             raise ValueError(f"invalid session file: {path}")
         return SessionRecord(state=AgentState.from_dict(state_data), messages=messages)
+
+    def acquire(self, session_id: str) -> SessionLease:
+        """Exclusively lease one Session turn so concurrent resumes cannot replay it."""
+        path = self.session_dir / f".{session_id}.lock"
+        handle = path.open("a+")
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            handle.close()
+            raise RuntimeError(f"session is already being resumed: {session_id}") from None
+        return SessionLease(handle)
 
     def list_sessions(self, limit: int = 20) -> list[SessionInfo]:
         items: list[SessionInfo] = []

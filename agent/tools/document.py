@@ -43,14 +43,17 @@ AI_TOOLS_LAUNCHER = Path.home() / ".local" / "bin" / "ai-parser"
 
 
 class DocumentTool:
-    def __init__(self, cwd: Path, timeout: int = 180) -> None:
+    def __init__(self, cwd: Path, timeout: int = 180, max_input_bytes: int = 25_000_000) -> None:
         self.cwd = cwd
         self.timeout = timeout
+        self.max_input_bytes = max(1, min(int(max_input_bytes), 100_000_000))
 
     def parse(self, path: str, ocr: bool = True) -> ToolResult:
         file_path = self._resolve(path)
         if not file_path.exists():
             return ToolResult(False, "", f"file not found: {file_path}")
+        if file_path.stat().st_size > self.max_input_bytes:
+            return ToolResult(False, "", f"document exceeds {self.max_input_bytes} bytes")
         suffix = file_path.suffix.lower()
         if suffix in {".pdf", *IMAGE_SUFFIXES, *WORD_SUFFIXES}:
             ai_tools_result = self._parse_with_ai_tools(file_path)

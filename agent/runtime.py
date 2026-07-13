@@ -106,6 +106,11 @@ class AgentRuntime:
         prompt = normalize_unicode_text(prompt).strip()
         if not prompt:
             raise ValueError("resume prompt must not be empty")
+        resolved_session_id = self.sessions.resolve_session_id(session_id)
+        with self.sessions.acquire(resolved_session_id):
+            return self._resume_locked(prompt, resolved_session_id)
+
+    def _resume_locked(self, prompt: str, session_id: str) -> str:
         record = self.sessions.load(session_id)
         state = record.state
         if str(state.project.get("id") or "") != self.project.id:

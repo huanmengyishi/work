@@ -62,9 +62,17 @@ class ToolManager:
         self.shell = ShellTool(self.cwd, int(config.get("tools.shell.timeout_seconds", 120)))
         self.python = PythonTool(self.cwd, int(config.get("tools.python.timeout_seconds", 120)))
         self.git = GitTool(self.cwd, int(config.get("tools.git.timeout_seconds", 120)))
-        self.document = DocumentTool(self.cwd, int(config.get("tools.document.timeout_seconds", 180)))
+        self.document = DocumentTool(
+            self.cwd,
+            int(config.get("tools.document.timeout_seconds", 180)),
+            max_input_bytes=int(config.get("tools.document.max_input_bytes", 25_000_000)),
+        )
         self.docker = DockerTool(self.cwd, int(config.get("tools.docker.timeout_seconds", 180)))
-        self.browser = BrowserTool(self.cwd, int(config.get("tools.browser.timeout_seconds", 180)))
+        self.browser = BrowserTool(
+            self.cwd,
+            int(config.get("tools.browser.timeout_seconds", 180)),
+            max_download_bytes=int(config.get("tools.browser.max_download_bytes", 100_000_000)),
+        )
         allowed_domains = config.get("tools.http.allowed_domains", [])
         self.http = HttpTool(
             self.cwd,

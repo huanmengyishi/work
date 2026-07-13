@@ -761,6 +761,7 @@ def repl(
         super_yolo=super_yolo,
         show_thinking=bool(config.get("runtime.show_thinking", True)),
         show_reasoning_content=bool(config.get("runtime.show_reasoning_content", True)),
+        progress_interval_seconds=int(config.get("runtime.progress_interval_seconds", 10)),
     )
     runtime = build_runtime(
         config,

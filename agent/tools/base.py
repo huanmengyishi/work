@@ -117,6 +117,8 @@ def run_command(
         )
     output = output or ""
     error = error or ""
+    output = truncate_text(output, 20_000)
+    error = truncate_text(error, 20_000)
     return ToolResult(
         process.returncode == 0,
         output.strip(),

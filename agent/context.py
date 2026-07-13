@@ -9,6 +9,7 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from .config import AppConfig
 from .project import Project
@@ -92,7 +93,7 @@ class ContextBuilder:
         rendered, loaded_files = self._render_context(project, index, semantic_index, workspace_memory)
         generated_path = project.agent_dir / "cache" / "context.generated.md"
         generated_path.parent.mkdir(parents=True, exist_ok=True)
-        generated_path.write_text(rendered.rstrip() + "\n", encoding="utf-8")
+        self._write_text(generated_path, rendered.rstrip() + "\n")
         return ContextSnapshot(
             rendered=rendered,
             index=index,
@@ -551,8 +552,14 @@ class ContextBuilder:
 
     @staticmethod
     def _write_json(path: Path, value: dict[str, Any]) -> None:
-        temp = path.with_suffix(".json.tmp")
+        temp = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
         temp.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        temp.replace(path)
+
+    @staticmethod
+    def _write_text(path: Path, value: str) -> None:
+        temp = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+        temp.write_text(value, encoding="utf-8")
         temp.replace(path)
 
 

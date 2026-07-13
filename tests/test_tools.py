@@ -203,3 +203,33 @@ def test_shell_timeout_kills_child_process_group(tmp_path: Path, make_config) ->
     assert result.success is False
     assert "timeout" in result.stderr
     assert not marker.exists()
+
+
+def test_shell_output_is_bounded(tmp_path: Path, make_config) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    _, _, _, tools = build_manager(root, make_config, yolo=True)
+
+    _, result = tools.execute_model_call("shell_run", {"command": "head -c 50000 /dev/zero | tr '\\0' x"})
+
+    assert result.success is True
+    assert len(result.stdout) < 21_000
+    assert result.stdout.endswith("...[truncated]")
+
+
+def test_document_input_size_is_bounded(tmp_path: Path, make_config) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    large = root / "large.txt"
+    large.write_text("x" * 101, encoding="utf-8")
+    _, _, _, tools = build_manager(
+        root,
+        make_config,
+        {"tools": {"document": {"max_input_bytes": 100}}},
+        yolo=True,
+    )
+
+    _, result = tools.execute_model_call("document_parse", {"path": "large.txt"})
+
+    assert result.success is False
+    assert "document exceeds 100 bytes" in result.stderr
