@@ -6,9 +6,10 @@ Deep Agent V3 is a local, project-centric coding Agent powered only by DeepSeek.
 It runs under WSL Ubuntu and can be started from any directory. Program files,
 user configuration, long-term data, and project-local context remain separate.
 
-Version `0.8.0` adds adaptive execution, streamed DeepSeek thinking, bounded
-large-input decomposition, transient model retry, and stronger process/path
-isolation while preserving the capability and permission boundaries.
+Version `0.9.0` adds deterministic Task and DeepSeek-only Model routers plus a
+single bounded `ContextPackage` entry for Prompt rendering. It preserves the
+capability and permission boundaries and the streamed Thinking behavior from
+v0.8.0.
 
 ## 2. Runtime Architecture
 
@@ -16,9 +17,11 @@ isolation while preserving the capability and permission boundaries.
 CLI
   -> ProjectManager / ProjectRegistry
   -> AgentRuntime
+     -> TaskRouter
+     -> ModelRouter (DeepSeek only)
      -> AgentState
      -> SessionManager
-     -> ContextBuilder
+     -> ContextBuilder -> ContextPackage
      -> PromptBuilder
      -> DeepSeekClient
      -> ToolManager
@@ -38,7 +41,8 @@ CLI
 
 `agent/cli.py` only parses commands and constructs the runtime. Orchestration
 belongs in `agent/runtime.py`. Model-independent state belongs in
-`agent/state.py`; prompt composition belongs in `agent/prompt.py`.
+`agent/state.py`; context selection and budgeting belong in `agent/context.py`;
+Prompt rendering belongs in `agent/prompt.py`.
 
 ## 3. Program, Config, Data, and Project Files
 
@@ -99,26 +103,30 @@ SHA-256: 5ec7002ab0922bc1702470c0d669bff65d3a76607a75e98e34c630882899b056
 4. `ContextBuilder` scans durable context files and refreshes `index.json` only
    when the file fingerprint changes.
 5. SQLite FTS and optional Chroma retrieve project and global memory.
-6. `AgentState` and a resumable JSON session checkpoint are created.
-7. `PromptBuilder` combines system policy, generated project context, relevant
-   memory, the request, and registered capabilities.
-8. DeepSeek either answers or emits tool calls.
-9. Every call becomes `ToolRequest`, passes centralized permission checks, and
+6. `TaskRouter` locally classifies type, scale, risk, and execution mode.
+7. `ModelRouter` maps that route to a fast, standard, or deep DeepSeek tier.
+8. `AgentState` stores both routes and the resumable execution state.
+9. `ContextBuilder` selects and bounds task, project, Session, semantic,
+   Memory, recovery, and capability-summary sections into one Context Package.
+10. `PromptBuilder` renders system policy, the Package, and the user request.
+11. DeepSeek either answers or emits tool calls.
+12. Every call becomes `ToolRequest`, passes centralized permission checks, and
    returns structured `ToolResult` with stdout, stderr, data, and duration.
-10. State and messages are checkpointed after each tool call.
-11. A terminal event finalizes session files and triggers the idempotent memory
+13. State and messages are checkpointed after each tool call.
+14. A terminal event finalizes session files and triggers the idempotent memory
     pipeline.
 
-Before Prompt construction, `TaskStrategySelector` classifies the request
-locally. Simple tasks avoid unnecessary thinking; large/deep tasks receive a
-starter Task Graph, chunked inspection guidance, a larger bounded round budget,
-and high/max DeepSeek reasoning effort. The decision is serialized in AgentState.
+Both routers are deterministic and consume no extra API request. Task routing
+uses request markers, size, project file counts, prior failures, and configured
+overrides. Model routing rejects non-DeepSeek providers and selects only among
+configured DeepSeek model names.
 
 ## 5. Agent State, Plans, and Resume
 
 `AgentState` stores project identity, current request, working directory, Git
 branch, loaded memory IDs, loaded tools, plan, current step, completed steps,
-tool evidence, status, round, and turn.
+tool evidence, status, round, turn, structured Task/Model routes, and a compact
+Context Package manifest.
 
 The model can call:
 
@@ -127,16 +135,32 @@ agent_update_plan
 agent_update_step
 ```
 
-V3 does not force an extra planning API call for every task. v0.8.0 locally
-creates a starter plan only for large/deep work; the same DeepSeek tool loop
-refines it. Resume keeps the more capable previous strategy, so a short
-“continue” prompt cannot downgrade a deep task.
+V3 does not force an extra planning API call for every task. Large/deep work
+receives a local starter plan; the same DeepSeek tool loop refines it. On
+Resume, `more_capable_task_route()` retains the previous route unless the new
+request is more capable or higher risk. `more_capable_model_route()` retains
+the exact previous DeepSeek model at equal/lower tiers and changes it only for
+a tier upgrade. A short “continue” therefore cannot downgrade the Session.
+
+Automatic model tiers are capability policies:
+
+```text
+fast      thinking off
+standard  thinking on, reasoning_effort=high
+deep      thinking on, reasoning_effort=max
+```
+
+`model.routing.fast_model`, `standard_model`, and `deep_model` default to
+`null`. Consequently all three tiers use `model.model` by default; distinct
+DeepSeek model names are used only when explicitly configured. Setting
+`model.provider` to anything other than `deepseek` is rejected.
 
 ### Thinking, streaming, and timeout recovery
 
 Thinking uses DeepSeek's OpenAI-compatible `thinking` and `reasoning_effort`
-fields. Tool-calling rounds preserve `reasoning_content` in the assistant
-message as required by DeepSeek. SSE deltas are reassembled by tool-call index.
+fields selected by the saved Model route. Tool-calling rounds preserve
+`reasoning_content` in the assistant message as required by DeepSeek. SSE
+deltas are reassembled by tool-call index.
 
 The terminal shows elapsed time before the first byte. Network timeouts and
 transient 408/5xx responses receive bounded same-key retry. If a stream breaks
@@ -182,8 +206,45 @@ project.godot
 
 The lightweight `.project-agent/index.json` contains language, likely entry
 points, file metadata, and Python/general source symbols. It is intentionally
-not a full semantic index or language-server database. This keeps startup fast
-and leaves room for Tree-sitter or LSP indexing later.
+not a full language-server database. Optional Tree-sitter semantic data remains
+a bounded sidecar and never replaces the base index.
+
+`ContextBuilder.build_package()` is the only v0.9 path for model-visible base
+context. It produces typed sections, records omitted/truncated sources, and
+computes `used_chars` from the final rendering including headings and section
+separators. Task state and project instructions are selected first; other
+sources are admitted at complete record, line, or paragraph boundaries.
+
+Default Package limits are selected by Task mode and clamped by a hard limit:
+
+```yaml
+context:
+  max_user_request_chars: 32000
+  package_limits:
+    simple: 12000
+    standard: 32000
+    large: 48000
+    deep: 64000
+  max_package_chars_hard_limit: 96000
+  max_recovery_context_chars: 6000
+```
+
+The separate `runtime.max_user_request_chars` input ceiling defaults to 250000.
+Larger pasted input is rejected with guidance to save it as a project file, so
+the Agent can inspect the complete content through bounded file chunks instead
+of silently discarding most of one message.
+
+`used_chars` counts the bounded user request plus rendered Context Package
+sections. Oversized requests preserve bounded head/tail content. The fixed
+system prompt, active tool JSON schemas, and `ToolResult` messages added in
+later rounds are not counted. They retain their own limits, so the Package
+limit must not be described as a bound on the entire API payload.
+
+`.project-agent/cache/context.generated.md` contains only generated project
+context. Long-term Memory, Session outcomes, and failure-recovery text stay in
+the in-memory Package and Session checkpoint. Resume rebuilds the Package from
+current project data and a bounded previous outcome instead of restoring an
+unlimited raw tool transcript.
 
 ## 7. Tool Protocol and Capability Registry
 
@@ -389,36 +450,23 @@ or Git.
 - Parallel worktree execution requires at least eight tasks and clean Git,
   extracts patches from one baseline, checks conflicts, and cleans resources.
 
-## 18. Verification Status
+## 18. Verification
 
-Verified on 2026-07-13 (version `0.5.0`):
+Run the release checks locally without exposing credentials:
 
-- `pytest`: 40 passed.
-- Ruff lint: passed.
-- Ruff format check: passed.
-- Python compileall: passed.
-- ToolManager Shell: passed.
-- ToolManager Python: passed.
-- ToolManager Docker: passed with `hello-world`.
-- ToolManager Document/OCR: passed with generated sample image.
-- ToolManager Playwright: passed against `https://example.com`.
-- Git tool: passed in an isolated temporary repository.
-- Proxy selection and credential redaction: passed.
-- Chroma persistent client: enabled.
-- `agent doctor`: passed.
-- `agent doctor --online`: passed with all configured Key-pool entries ready.
-- Unicode input boundary: normal Chinese, UTF-16 surrogate pairs, recoverable
-  GB18030 terminal bytes, invalid-byte diagnostics, and UTF-8 HTTP payloads passed.
-- Interactive PTY: banner, session prompt, `/help`, `/status`, and `/exit` passed.
-- File preview/apply/undo, SHA conflict protection, private-path rejection, and
-  non-destructive Git metadata snapshot: passed.
-- Real stdio MCP handshake, allowlist, SQLite read/write, confirmation, and
-  process cleanup: passed.
-- Real Chromium persistent LocalStorage, managed download metadata, and session
-  clearing: passed.
-- Safe/auto-approve/YOLO/SUPER YOLO levels: passed. `sudo -n true` reached the
-  OS in SUPER YOLO and was rejected only because interactive authentication was
-  required.
+```bash
+.venv/bin/python -m pytest
+.venv/bin/ruff check agent tests scripts
+.venv/bin/ruff format --check agent tests scripts
+.venv/bin/python -m compileall -q agent tests scripts
+```
+
+`.github/workflows/test.yml` defines the same Ruff, pytest, and compileall
+checks for Python 3.11, 3.12, and 3.13 on pushes to `main`, pull requests, and
+manual dispatch. The workflow definition was reviewed locally; this document
+does not claim that a hosted GitHub Actions run or an online DeepSeek API check
+was executed. Verify those separately from the repository Actions page and
+`agent doctor --online` when credentials and network access are available.
 
 ## 19. ECC Reference Decisions
 

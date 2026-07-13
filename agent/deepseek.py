@@ -25,6 +25,9 @@ class DeepSeekStreamInterrupted(RuntimeError):
 class DeepSeekClient:
     def __init__(self, config: AppConfig) -> None:
         self.config = config
+        provider = str(config.get("model.provider", "deepseek")).strip().lower()
+        if provider != "deepseek":
+            raise ValueError("Deep Agent supports only the DeepSeek provider")
         self.base_url = str(config.get("model.base_url", "https://api.deepseek.com")).rstrip("/")
         self.chat_path = str(config.get("model.chat_path", "/chat/completions"))
         self.model = str(config.get("model.model", "deepseek-v4-pro"))
@@ -40,6 +43,7 @@ class DeepSeekClient:
         max_tokens: int | None = None,
         thinking: dict[str, Any] | bool | None = None,
         reasoning_effort: str | None = None,
+        model: str | None = None,
     ) -> ChatResponse:
         if not self.api_keys:
             env_name = self.config.get("model.api_key_env", "DEEPSEEK_API_KEY")
@@ -54,6 +58,7 @@ class DeepSeekClient:
             max_tokens=max_tokens,
             thinking=thinking,
             reasoning_effort=reasoning_effort,
+            model=model,
         )
 
         data = normalize_unicode_data(self._request_with_key_pool(normalize_unicode_data(payload)))
@@ -108,6 +113,7 @@ class DeepSeekClient:
         max_tokens: int | None = None,
         thinking: dict[str, Any] | bool | None = None,
         reasoning_effort: str | None = None,
+        model: str | None = None,
     ) -> ChatResponse:
         """Stream visible DeepSeek thinking/text while returning one normal assistant message."""
         if not self.api_keys:
@@ -118,6 +124,7 @@ class DeepSeekClient:
                 max_tokens=max_tokens,
                 thinking=thinking,
                 reasoning_effort=reasoning_effort,
+                model=model,
             )
         payload = self._chat_payload(
             messages=messages,
@@ -126,6 +133,7 @@ class DeepSeekClient:
             max_tokens=max_tokens,
             thinking=thinking,
             reasoning_effort=reasoning_effort,
+            model=model,
         )
         payload["stream"] = True
         emitted = False
@@ -163,6 +171,7 @@ class DeepSeekClient:
                 max_tokens=max_tokens,
                 thinking=thinking,
                 reasoning_effort=reasoning_effort,
+                model=model,
             )
         return ChatResponse(message=normalize_unicode_data(message), raw=raw)
 
@@ -175,9 +184,10 @@ class DeepSeekClient:
         max_tokens: int | None,
         thinking: dict[str, Any] | bool | None,
         reasoning_effort: str | None,
+        model: str | None,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {
-            "model": self.model,
+            "model": str(model or self.model),
             "messages": messages,
             "temperature": self.config.get("model.temperature", 0.2),
             "max_tokens": max_tokens if max_tokens is not None else self.config.get("model.max_tokens", 4096),

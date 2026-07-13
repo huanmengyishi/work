@@ -5,14 +5,16 @@ from dataclasses import dataclass
 from typing import Any
 
 from .config import AppConfig
+from .model_router import ModelRoute, ModelRouter
+from .task_router import TASK_MODES, TaskRoute, TaskRouter
 
 
-TASK_MODES = {"simple", "standard", "large", "deep"}
+__all__ = ["TASK_MODES", "TaskStrategy", "TaskStrategySelector"]
 
 
 @dataclass(frozen=True)
 class TaskStrategy:
-    """Bounded execution policy selected before the first model request."""
+    """Legacy combined policy kept for runtime and third-party compatibility."""
 
     mode: str
     score: int
@@ -37,32 +39,12 @@ class TaskStrategy:
 
 
 class TaskStrategySelector:
-    """Classify requests locally so easy work stays fast and hard work is staged."""
-
-    _DEEP_MARKERS = re.compile(
-        r"\b(architecture|migration|refactor|security|audit|root cause|end[- ]to[- ]end|"
-        r"comprehensive|all issues|deep analysis|large[- ]scale)\b|"
-        r"架构|迁移|重构|安全|审计|根因|端到端|全面|所有问题|深度|大规模",
-        re.IGNORECASE,
-    )
-    _LARGE_MARKERS = re.compile(
-        r"\b(repository|codebase|workspace|all files|entire project|long document|dataset)\b|"
-        r"仓库|代码库|工作区|所有文件|整个项目|长文档|数据集|批量",
-        re.IGNORECASE,
-    )
-    _ACTION_MARKERS = re.compile(
-        r"\b(fix|implement|change|edit|test|debug|review|analy[sz]e|inspect|build|write)\b|"
-        r"修复|实现|修改|编辑|测试|调试|审查|分析|检查|构建|编写",
-        re.IGNORECASE,
-    )
-    _SIMPLE_MARKERS = re.compile(
-        r"^(what is|who is|when is|where is|define|translate)\b|"
-        r"^(什么是|谁是|何时是|哪里是|定义|翻译)",
-        re.IGNORECASE,
-    )
+    """Compatibility facade over the v0.9 TaskRouter and ModelRouter."""
 
     def __init__(self, config: AppConfig) -> None:
         self.config = config
+        self.task_router = TaskRouter(config)
+        self.model_router = ModelRouter(config)
 
     def select(
         self,
@@ -71,81 +53,48 @@ class TaskStrategySelector:
         source_file_count: int = 0,
         file_count: int = 0,
         explicit_mode: str | None = None,
+        failure_count: int = 0,
     ) -> TaskStrategy:
-        configured_mode = str(explicit_mode or self.config.get("runtime.task_mode", "auto")).lower()
-        if configured_mode != "auto" and configured_mode not in TASK_MODES:
-            configured_mode = "auto"
-
-        text = prompt.strip()
-        score = 0
-        reasons: list[str] = []
-        if len(text) >= 2_000:
-            score += 2
-            reasons.append("long-request")
-        elif len(text) >= 600:
-            score += 1
-            reasons.append("detailed-request")
-        if self._ACTION_MARKERS.search(text):
-            score += 1
-            reasons.append("project-action")
-        if self._LARGE_MARKERS.search(text):
-            score += 2
-            reasons.append("large-scope")
-        if self._DEEP_MARKERS.search(text):
-            score += 3
-            reasons.append("deep-reasoning")
-        if source_file_count >= int(self.config.get("runtime.large_project_source_files", 500)):
-            score += 2
-            reasons.append("large-codebase")
-        elif file_count >= int(self.config.get("runtime.large_project_files", 2_000)):
-            score += 1
-            reasons.append("many-files")
-
-        if configured_mode in TASK_MODES:
-            mode = configured_mode
-            reasons.append("configured-mode")
-        elif score >= 5:
-            mode = "deep"
-        elif score >= 3:
-            mode = "large"
-        elif score >= 1:
-            mode = "standard"
-        elif self._SIMPLE_MARKERS.search(text):
-            mode = "simple"
-        else:
-            mode = "standard"
-
-        defaults = {
-            "simple": (False, None, 4, False, False),
-            "standard": (True, "high", 8, False, False),
-            "large": (True, "high", 16, True, True),
-            "deep": (True, "max", 24, True, True),
-        }
-        thinking, effort, rounds, require_plan, chunked = defaults[mode]
-        configured_rounds = max(1, int(self.config.get("runtime.max_tool_rounds", 8)))
-        if mode == "simple":
-            rounds = min(rounds, configured_rounds)
-        elif mode == "standard":
-            rounds = configured_rounds
-        else:
-            rounds = max(rounds, configured_rounds)
-        if not bool(self.config.get("runtime.adaptive_thinking", True)):
-            configured_thinking = self.config.get("model.thinking")
-            thinking = self._thinking_enabled(configured_thinking)
-            effort = str(self.config.get("model.reasoning_effort") or "") or None
-        rounds = min(rounds, int(self.config.get("runtime.max_tool_rounds_hard_limit", 32)))
+        task = self.task_router.route(
+            prompt,
+            source_file_count=source_file_count,
+            file_count=file_count,
+            explicit_mode=explicit_mode,
+            failure_count=failure_count,
+        )
+        model = self.model_router.route(task)
         return TaskStrategy(
-            mode=mode,
-            score=score,
-            reasons=tuple(dict.fromkeys(reasons)) or ("default",),
-            thinking_enabled=thinking,
-            reasoning_effort=effort,
-            max_tool_rounds=max(1, rounds),
-            require_plan=require_plan,
-            chunked_context=chunked,
+            mode=task.mode,
+            score=task.score,
+            reasons=task.reasons,
+            thinking_enabled=model.thinking_enabled,
+            reasoning_effort=model.reasoning_effort,
+            max_tool_rounds=task.max_tool_rounds,
+            require_plan=task.require_plan,
+            chunked_context=task.chunked_context,
         )
 
-    def initial_plan(self, prompt: str, strategy: TaskStrategy) -> list[dict[str, Any]]:
+    def route(
+        self,
+        prompt: str,
+        *,
+        source_file_count: int = 0,
+        file_count: int = 0,
+        explicit_mode: str | None = None,
+        failure_count: int = 0,
+    ) -> tuple[TaskRoute, ModelRoute]:
+        """Return the separate v0.9 routes while the old `select` API remains stable."""
+
+        task = self.task_router.route(
+            prompt,
+            source_file_count=source_file_count,
+            file_count=file_count,
+            explicit_mode=explicit_mode,
+            failure_count=failure_count,
+        )
+        return task, self.model_router.route(task)
+
+    def initial_plan(self, prompt: str, strategy: TaskStrategy | TaskRoute) -> list[dict[str, Any]]:
         if not strategy.require_plan:
             return []
         change_task = bool(
@@ -196,6 +145,8 @@ class TaskStrategySelector:
 
     @staticmethod
     def _thinking_enabled(value: Any) -> bool:
+        """Retained for callers that used the v0.8 helper directly."""
+
         if isinstance(value, dict):
             return str(value.get("type") or "").lower() != "disabled"
         if isinstance(value, bool):

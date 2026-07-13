@@ -35,6 +35,11 @@ def test_parse_api_keys_accepts_comma_whitespace_and_duplicates() -> None:
     assert parse_api_keys(" key-one, key-two ,,key-one， key-three ") == ("key-one", "key-two", "key-three")
 
 
+def test_client_rejects_non_deepseek_provider(make_config) -> None:
+    with pytest.raises(ValueError, match="only the DeepSeek provider"):
+        DeepSeekClient(make_config({"model": {"provider": "other"}}))
+
+
 def test_key_pool_rotates_on_auth_and_rate_limit(monkeypatch, make_config) -> None:
     monkeypatch.setenv("DEEPSEEK_API_KEY", "first, second, third")
     config = make_config({"model": {"api_key": "first, second, third"}})
@@ -140,6 +145,24 @@ def test_thinking_request_uses_reasoning_fields_and_omits_temperature(monkeypatc
     assert sent_payload["reasoning_effort"] == "max"
     assert "temperature" not in sent_payload
     assert response.message["reasoning_content"] == "bounded reasoning"
+
+
+def test_model_override_is_request_scoped(monkeypatch, make_config) -> None:
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
+    client = DeepSeekClient(make_config({"model": {"model": "deepseek-base"}}))
+    sent_models: list[str] = []
+
+    def fake_urlopen(request, timeout):
+        sent_models.append(json.loads(request.data.decode("utf-8"))["model"])
+        return FakeResponse({"choices": [{"message": {"role": "assistant", "content": "OK"}}]})
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+
+    client.chat(messages=[{"role": "user", "content": "fast"}], model="deepseek-fast")
+    client.chat(messages=[{"role": "user", "content": "default"}])
+
+    assert sent_models == ["deepseek-fast", "deepseek-base"]
+    assert client.model == "deepseek-base"
 
 
 def test_network_timeout_retries_same_key_with_backoff(monkeypatch, make_config) -> None:

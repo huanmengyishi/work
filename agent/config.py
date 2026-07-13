@@ -27,6 +27,13 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "timeout_seconds": 300,
         "network_retries": 2,
         "retry_base_seconds": 1.0,
+        "routing": {
+            "enabled": True,
+            "tier": "auto",
+            "fast_model": None,
+            "standard_model": None,
+            "deep_model": None,
+        },
     },
     "runtime": {
         "max_tool_rounds": 8,
@@ -39,6 +46,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "show_thinking": True,
         "show_reasoning_content": True,
         "max_reasoning_display_chars": 4000,
+        "max_user_request_chars": 250000,
         "auto_summarize": True,
         "write_lessons": True,
         "checkpoint_each_tool": True,
@@ -99,6 +107,19 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "max_symbol_files": 500,
         "max_prompt_chars": 32000,
         "max_context_file_chars": 8000,
+        "max_user_request_chars": 32000,
+        "package_limits": {
+            "simple": 12000,
+            "standard": 32000,
+            "large": 48000,
+            "deep": 64000,
+        },
+        "max_package_chars_hard_limit": 96000,
+        "max_task_context_chars": 8000,
+        "max_session_context_chars": 6000,
+        "max_memory_context_chars": 8000,
+        "max_capability_context_chars": 8000,
+        "max_recovery_context_chars": 6000,
         "semantic_index_enabled": False,
         "semantic_languages": ["python", "javascript", "typescript", "tsx", "java", "go", "rust"],
     },
@@ -343,6 +364,42 @@ def deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]
     return merged
 
 
+def remove_default_shadows(
+    overlay: dict[str, Any],
+    primary: dict[str, Any],
+    defaults: dict[str, Any],
+) -> dict[str, Any]:
+    """Drop generated overlay defaults that would hide explicit primary values.
+
+    `model.yaml` remains authoritative when it contains a non-default value.
+    A generated default in that file, however, must not erase a user override
+    already present in `config.yaml`.
+    """
+    cleaned: dict[str, Any] = {}
+    missing = object()
+    for key, value in overlay.items():
+        primary_value = primary.get(key, missing)
+        default_value = defaults.get(key, missing)
+        if isinstance(value, dict):
+            nested = remove_default_shadows(
+                value,
+                primary_value if isinstance(primary_value, dict) else {},
+                default_value if isinstance(default_value, dict) else {},
+            )
+            if nested:
+                cleaned[key] = nested
+            continue
+        if (
+            primary_value is not missing
+            and default_value is not missing
+            and primary_value != default_value
+            and value == default_value
+        ):
+            continue
+        cleaned[key] = value
+    return cleaned
+
+
 def read_yaml(path: Path) -> dict[str, Any]:
     if not path.exists():
         return {}
@@ -474,6 +531,10 @@ def load_config() -> AppConfig:
     cfg = paths.config_dir()
     load_secrets_file(cfg / "secrets.env")
     values = dict(DEFAULT_CONFIG)
-    for filename in ("config.yaml", "model.yaml", "tools.yaml", "memory.yaml", "mcp.yaml"):
+    primary = read_yaml(cfg / "config.yaml")
+    values = deep_merge(values, primary)
+    model_overlay = remove_default_shadows(read_yaml(cfg / "model.yaml"), primary, DEFAULT_CONFIG)
+    values = deep_merge(values, model_overlay)
+    for filename in ("tools.yaml", "memory.yaml", "mcp.yaml"):
         values = deep_merge(values, read_yaml(cfg / filename))
     return AppConfig(values=values, config_dir=cfg, data_dir=paths.data_dir())

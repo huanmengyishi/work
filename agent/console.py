@@ -117,7 +117,11 @@ class ConsoleUI:
         mode = str(value.get("mode") or "standard")
         if event == "strategy.selected":
             strategy = value.get("strategy") if isinstance(value.get("strategy"), dict) else {}
-            label = f"{self._mode_label(mode)}；准备 {strategy.get('max_tool_rounds', 8)} 轮以内的受控执行"
+            tier = str(value.get("model_tier") or "standard")
+            label = (
+                f"{self._mode_label(mode)}；DeepSeek {tier} 档；"
+                f"准备 {strategy.get('max_tool_rounds', 8)} 轮以内的受控执行"
+            )
         elif event == "model.requested":
             step = value.get("current_step") or "当前任务"
             label = f"{self._mode_label(mode)}；思考第 {value.get('round')}/{value.get('max_rounds')} 轮；步骤 {step}"

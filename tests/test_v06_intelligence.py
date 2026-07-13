@@ -66,9 +66,19 @@ def test_task_graph_dependencies_retries_and_old_state(tmp_path: Path, make_conf
     old = state.to_dict()
     old["plan"] = [{"id": "legacy", "title": "Legacy", "status": "pending"}]
     old.pop("execution_context", None)
+    old.pop("task_route", None)
+    old.pop("model_route", None)
+    old.pop("context_manifest", None)
+    old["schema_version"] = 1
     restored = AgentState.from_dict(old)
     assert restored.plan[0].dependencies == []
     assert restored.execution_context is not None
+    assert restored.task_route == {}
+    assert restored.model_route == {}
+    assert restored.context_manifest == {}
+    assert restored.schema_version == 1
+    restored.resume("continue legacy session")
+    assert restored.schema_version == 2
 
 
 def test_workspace_memory_detects_project_and_preserves_manual(tmp_path: Path, make_config) -> None:

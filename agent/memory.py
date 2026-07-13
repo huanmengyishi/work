@@ -645,6 +645,7 @@ class MemoryStore:
         limit: int | None = None,
         *,
         global_only: bool = False,
+        record_usage: bool = True,
     ) -> list[MemoryItem]:
         limit = limit or int(self.config.get("memory.retrieval_limit", 8))
         with self._connect() as con:
@@ -722,8 +723,13 @@ class MemoryStore:
                         if len(items) >= limit:
                             break
         selected = items[:limit]
-        self._record_usage([item.id for item in selected])
+        if record_usage:
+            self._record_usage([item.id for item in selected])
         return selected
+
+    def record_usage(self, memory_ids: Iterable[int]) -> None:
+        """Reinforce only Memory entries that were actually included in model context."""
+        self._record_usage([int(memory_id) for memory_id in memory_ids])
 
     def _record_usage(self, memory_ids: list[int]) -> None:
         if not memory_ids:

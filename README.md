@@ -3,10 +3,10 @@
 Project-centric DeepSeek CLI agent for WSL. The Agent is installed as a tool;
 the directory where `agent` is started is the workspace.
 
-Current version: `0.8.0`. The runtime chooses a bounded execution mode for each
-request: lightweight direct answer, standard engineering, large-scale chunked
-inspection, or deep dependency-aware execution. DeepSeek thinking can stream to
-the terminal with elapsed time, current plan step, and tool progress.
+Current version: `0.9.0`. The runtime locally classifies task type, scale, risk,
+and execution mode; selects a DeepSeek-only capability tier; and builds one
+bounded `ContextPackage` before Prompt rendering. DeepSeek thinking can stream
+to the terminal with elapsed time, current plan step, and tool progress.
 
 Version `0.7.0` adds bounded Python/JavaScript/TypeScript diagnostics, richer
 Tree-sitter module and import relationships, Memory lifecycle maintenance,
@@ -27,6 +27,11 @@ eight-round tool loop. Repository-wide or long-document requests use bounded
 chunks, an explicit Task Graph, 16 rounds, and DeepSeek `high` thinking. Deep
 audits/refactors use `max` effort and up to 24 rounds. Mode and limits are stored
 in AgentState, so a short `/resume` cannot downgrade an active deep task.
+
+Version `0.9.0` replaces loose Prompt inputs with structured Task and Model
+routes plus a unified Context Package. Resume routing is monotonic: a short
+continuation cannot downgrade the saved task mode or DeepSeek tier, while a
+higher-risk continuation can upgrade them.
 
 ## Quick Start
 
@@ -80,9 +85,10 @@ tree, a project directory, or Git.
 ```text
 CLI
   -> AgentRuntime
+     -> TaskRouter -> ModelRouter (DeepSeek only)
      -> AgentState + SessionManager
-     -> ContextBuilder + PromptBuilder
-     -> DeepSeekClient
+     -> ContextBuilder -> ContextPackage -> PromptBuilder
+     -> DeepSeekClient (selected DeepSeek model)
      -> ToolManager
         -> ToolRequest -> PermissionManager -> ToolResult
      -> EventBus
@@ -95,13 +101,17 @@ Implemented V3 modules:
 - `AgentState`: serializable project, session, plan, tool, and progress state.
 - `SessionManager`: JSON checkpoints, Markdown summaries, and resume support.
 - `ContextBuilder`: README/AGENTS/config discovery and cached `index.json`.
-- `PromptBuilder`: one place for system, project, memory, user, and tool context.
+- `ContextPackage`: one bounded entry for task, project, session, semantic,
+  Memory, recovery, and capability-summary context.
+- `PromptBuilder`: renders the system policy, one Context Package, and request.
 - `ToolCapabilityRegistry`: dynamic schemas, permissions, timeouts, formats, and availability.
 - `PermissionManager`: centralized capability, cwd, timeout, and dangerous-command policy.
 - `EventBus`: decoupled runtime, logging, and memory events.
 - `MemoryPipeline`: idempotent Summary and Lesson/Bug/Decision persistence.
 - `PlanManager`: model-maintained plans without an extra mandatory model request.
-- `TaskStrategySelector`: local simple/standard/large/deep routing with bounded budgets.
+- `TaskRouter`: local type/scale/risk and simple/standard/large/deep routing.
+- `ModelRouter`: local fast/standard/deep routing across configured DeepSeek
+  model names; non-DeepSeek providers are rejected.
 
 ## Commands
 
@@ -166,6 +176,7 @@ in `~/.config/deep-agent/config.yaml`:
 runtime:
   task_mode: auto       # auto | simple | standard | large | deep
   adaptive_thinking: true
+  max_user_request_chars: 250000
   max_tool_rounds: 8
   max_tool_rounds_hard_limit: 32
   large_project_source_files: 500
@@ -175,10 +186,43 @@ runtime:
   show_reasoning_content: true
 
 model:
+  provider: deepseek
+  model: deepseek-v4-pro
+  routing:
+    enabled: true
+    tier: auto          # auto | fast | standard | deep
+    fast_model: null
+    standard_model: null
+    deep_model: null
   timeout_seconds: 300
   network_retries: 2
   retry_base_seconds: 1.0
+
+context:
+  max_user_request_chars: 32000
+  package_limits:
+    simple: 12000
+    standard: 32000
+    large: 48000
+    deep: 64000
+  max_package_chars_hard_limit: 96000
+  max_recovery_context_chars: 6000
 ```
+
+The three DeepSeek tiers are capability policies, not separate providers.
+Their model overrides default to `null`, so fast, standard, and deep all fall
+back to `model.model` until the user explicitly supplies valid DeepSeek model
+names. With adaptive thinking enabled, fast disables thinking, standard uses
+`high`, and deep uses `max` reasoning effort.
+
+The Context Package budget counts the bounded user request plus fully rendered
+sections, including headings and separators. The fixed system prompt, active
+tool JSON schemas, and ToolResult messages produced during later rounds are
+outside this character budget and keep their own limits. Oversized requests
+retain bounded head/tail content. `context.generated.md` contains only public
+project context; Session, Memory, and recovery text are not written to that
+cache. Requests above `runtime.max_user_request_chars` are rejected with advice
+to save the text/code in the project for complete chunked inspection.
 
 Large text/code follows scope -> bounded chunks -> synthesize/implement ->
 verify. The Agent does not load an entire repository into one unbounded Prompt.
@@ -297,7 +341,10 @@ cd ~/AI-Agent
 .venv/bin/python -m compileall -q agent tests scripts
 ```
 
-Current v0.8.0 baseline: 86 pytest cases, including a real PTY smoke test.
+The repository includes `.github/workflows/test.yml` for Python 3.11, 3.12,
+and 3.13. It runs Ruff, pytest, and compileall for pushes to `main`, pull
+requests, and manual dispatch. Defining the workflow does not prove a hosted
+GitHub Actions run succeeded; inspect the repository Actions page after push.
 
 See `docs/implementation.md` for architecture, extension rules, Docker proxy,
 OCR, memory, and maintenance details.
@@ -306,9 +353,10 @@ OCR, memory, and maintenance details.
 
 ```bash
 cd ~/AI-Agent
-git switch --detach v0.7.1
+git switch --detach v0.8.0
 .venv/bin/pip install -e .
 ```
 
-Return with `git switch main`. v0.8.0 config migration is add-only; v0.7.1
-ignores the new keys.
+Return with `git switch main`. v0.9.0 config migration only adds missing
+defaults and preserves existing values; v0.8.0 ignores the new routing and
+Context Package keys.

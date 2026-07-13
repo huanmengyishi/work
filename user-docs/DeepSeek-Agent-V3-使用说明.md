@@ -1,4 +1,4 @@
-# DeepSeek Agent V3 使用说明（0.8.0）
+# DeepSeek Agent V3 使用说明（0.9.0）
 
 更新时间：2026-07-13
 
@@ -82,7 +82,7 @@ agent "分析当前项目并给出修改建议"
 
 普通任务输入完成后按一次 `Enter` 即提交。终端随后会显示“正在处理请求，请稍候...”，这表示 Agent 已开始调用 DeepSeek 和工具，不再等待继续输入。空回车不会执行任务，会提示正确用法。运行中需要返回交互界面时按 `Ctrl+C`，随后可 `/resume` 继续会话。
 
-0.8.0 提交后还会持续显示 `Thinking` 已用秒数、当前执行模式、模型轮次、Task Graph 当前步骤和工具状态。DeepSeek thinking 模式返回 `reasoning_content` 时会边生成边显示，不再长时间无输出。若流式响应在已经输出部分内容后断开，Agent 不会自动重复请求，以免重复工具调用；它会保存可恢复 Session 并给出 Session ID。
+0.9.0 提交后会持续显示 `Thinking` 已用秒数、任务模式、DeepSeek 推理档位、模型轮次、Task Graph 当前步骤和工具状态。DeepSeek thinking 模式返回 `reasoning_content` 时会边生成边显示，不再长时间无输出。若流式响应在已经输出部分内容后断开，Agent 不会自动重复请求，以免重复工具调用；它会保存可恢复 Session 并给出 Session ID。
 
 安全模式是默认模式。`--yolo` 自动同意普通工具调用，但仍受路径、危险命令和 sudo 策略保护。`--super-yolo` 绕过 Permission Manager 的硬限制，可允许 sudo、外部路径、特权 Docker 和破坏性命令；操作系统自身的密码和权限检查仍然有效。
 
@@ -183,6 +183,55 @@ model:
 
 网络超时、`408` 和临时 `5xx` 会对同一个 Key 做有限指数退避；`401/403/429` 仍切换下一个 Key。
 
+并发和输入边界也已加固：首次 Project 初始化使用项目锁，同一 Session 不能被两个进程同时 Resume，Context/Workspace 缓存原子写入；Daemon 精确校验 argv 与进程 starttime，Queue 超时清理整个进程组；Shell 输出、HTTP 请求体/Header、文档输入、浏览器下载和 MCP 分页都有硬上限。
+
+注意：普通/YOLO 的 Docker 会拒绝 host root/socket/device/namespace。Shell/Python 仍是宿主机进程，程序能限制请求里的工作目录并拦截已知危险模式，但命令文本内部的绝对路径最终由 Linux 权限而非项目级 OS 沙箱隔离。处理不可信任务时使用默认安全模式。
+
+### 0.9.0：统一上下文、任务路由与 DeepSeek 模型路由
+
+0.9.0 将模型前的决策拆成三个本地、确定性的步骤：
+
+```text
+用户请求
+  -> Task Router：任务类型、规模、风险、simple/standard/large/deep
+  -> Model Router：DeepSeek fast/standard/deep 档位
+  -> Context Builder：统一生成受限 ContextPackage
+  -> Prompt Renderer -> Agent Runtime -> Capability -> Permission
+```
+
+Task Route 和 Model Route 会写入 Session。`/resume` 的模式和精确模型只能保持或升级，“继续”等短输入不会把深度任务降为简单任务。模型不能自行选择模型，也没有引入其他 Provider。
+
+ContextPackage 统一装配 Task、Execution、Session、项目说明、README/配置、Workspace、Semantic、Memory 和 Capability 摘要。默认字符预算按模式为 12000/32000/48000/64000，硬上限 96000；标题和分隔符也计入。只有实际进入 Package 的 Memory 才增加使用次数。失败恢复 Memory 使用每轮总计 6000 字符的有界 delta，不再无限追加。
+
+模型路由配置位于 `~/.config/deep-agent/config.yaml` 或 `model.yaml`：
+
+```yaml
+model:
+  provider: deepseek
+  model: deepseek-v4-pro
+  routing:
+    enabled: true
+    tier: auto              # auto / fast / standard / deep
+    fast_model: null
+    standard_model: null
+    deep_model: null
+
+runtime:
+  max_user_request_chars: 250000
+
+context:
+  max_user_request_chars: 32000
+  package_limits:
+    simple: 12000
+    standard: 32000
+    large: 48000
+    deep: 64000
+  max_package_chars_hard_limit: 96000
+  max_recovery_context_chars: 6000
+```
+
+三个档位默认都安全回落到 `model.model`。程序不会猜测或内置未经当前 API 验证的“快速模型”名称；只有确认某个 DeepSeek 模型可用后，才应填写对应 `*_model`。`provider` 不是 `deepseek` 时会直接拒绝启动。ContextPackage 预算包含有界的用户请求，但不包含固定 System Prompt、单独发送的 Tool Schema 和后续 ToolResult；这些输入仍由各自上限控制。超过 `runtime.max_user_request_chars` 的粘贴输入会被拒绝，并提示先保存为项目文件，再由 large/deep 模式完整分块读取，避免静默丢失大段正文。
+
 ## 5. 安全文件修改与回滚
 
 Agent 的源码修改流程：
@@ -251,7 +300,7 @@ context:
 .project-agent/index.semantic.json
 ```
 
-它不会替换轻量 `index.json`。Prompt 只加载受限摘要，完整索引留在文件中，最终 Context 长度仍受 `context.max_prompt_chars` 限制。
+它不会替换轻量 `index.json`。Prompt 只加载受限摘要，完整索引留在文件中；0.9.0 还会把 Semantic 与其他来源一起纳入 ContextPackage 总预算，避免长 README 将其静默挤掉。
 
 ## 8. Memory 生命周期
 
@@ -368,13 +417,15 @@ agent health --reset
 
 能力状态：Available、Unavailable、Need Config、Disabled、Broken。Unavailable/Broken 能力不会放入模型 Tool Schema 和 Prompt 能力摘要。
 
-当前 0.8.0 验收：
+当前 0.9.0 验收：
 
 ```text
-86 tests passed（含真实 PTY）
+113 tests passed（含真实 PTY）
 Ruff check passed
 Ruff format check passed
 compileall passed
+ContextPackage 总预算、完整边界截断、私有 Memory 不落盘 passed
+Task/Model 路由、失败升级、Resume 单调保持 passed
 DeepSeek streaming/tool-call assembly passed
 网络重试与部分流禁止重放 passed
 路径、符号链接、Queue 并发、Docker 参数与进程组超时回归 passed
@@ -403,14 +454,13 @@ DeepSeek streaming/tool-call assembly passed
 - `show_thinking` 展示的是 DeepSeek API 返回的 reasoning 内容，可能较长；可在配置中关闭。
 - 已输出部分 reasoning 后的流断线不会自动重放，需要 `/resume`，这是避免重复工具副作用的安全设计。
 - `--super-yolo` 仍会绕过 Permission Manager；普通模式和 `--yolo` 已增加 Docker host/root/socket/device 防护。
-- Shell/Python 属于宿主机进程：程序会限制请求中的工作目录并拦截已知危险模式，但命令文本内部引用的绝对路径仍由 Linux 权限而非项目级 OS 沙箱隔离。处理不可信任务时使用默认安全模式，不要开启 YOLO/SUPER YOLO。
 
 回滚到上一版不会删除配置、Memory 或项目数据：
 
 ```bash
 cd ~/AI-Agent
-git switch --detach v0.7.1
+git switch --detach v0.8.0
 .venv/bin/pip install -e .
 ```
 
-恢复最新版执行 `git switch main`。0.8.0 的新增配置是 add-only，0.7.1 会忽略不认识的键。
+恢复最新版执行 `git switch main`。0.9.0 的新增配置是 add-only，0.8.0 会忽略不认识的键；回滚不会删除 Session、Memory 或项目数据。

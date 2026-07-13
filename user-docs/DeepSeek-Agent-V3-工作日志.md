@@ -1,6 +1,79 @@
-# DeepSeek Agent V3 工作日志（0.8.0）
+# DeepSeek Agent V3 工作日志（0.9.0）
 
 日期：2026-07-13
+
+## 0.9.0 Context Intelligence 与 DeepSeek 路由
+
+### 目标
+
+落实用户确认的 v0.9.0 路线：让所有进入模型的长期/项目/任务/会话/语义/能力信息经过统一 ContextPackage；用本地 Task Router 判断任务类型、规模和风险；只在 DeepSeek 模型族内按 fast/standard/deep 档位路由；恢复 GitHub Actions。v0.10 之后的 Intent Journal、Event 演进、Memory 强化与 Worker Runtime 只保留后续方向，本次不混入。
+
+### 根因
+
+1. 0.8.0 的 `context.max_prompt_chars` 只约束项目文本，Memory、Task/Session 和 Capability 摘要随后在 Prompt 层追加，缺少统一总预算。
+2. Prompt Builder 同时选择、压缩和渲染上下文，Resume 摘要与失败恢复 Memory 可以绕过 Context Builder。
+3. 0.8.0 只有 simple/standard/large/deep 执行策略，没有持久化的任务类型、规模、风险和精确模型决策。
+4. DeepSeek Client 在构造时固定单个模型，无法在不修改共享状态的前提下逐请求选择模型。
+5. GitHub OAuth 旧凭据失效且之前缺少 `workflow` scope，Actions 文件无法推送。
+
+### 实现
+
+- 新增结构化 `ContextSection`、`ContextBuildRequest` 和 `ContextPackage`；Prompt Builder 的正式入口只接收 Package。
+- 统一装配 Task、Execution、Resume、项目指令、项目文档、Workspace、Semantic、Memory、Capabilities 和 Recovery；标题/分隔符计入总预算，并按完整记录、段落或行截断。
+- 用户请求也计入 ContextPackage 总预算；超长请求保留首尾，超过 250000 字符的粘贴输入明确拒绝并提示改用项目文件分块处理。
+- `context.generated.md` 仍只保存公开项目上下文；Memory、Session、Recovery 仅存在内存 Package，不落盘到项目缓存。
+- AGENTS/CLAUDE/context.md 优先于普通 README；Semantic 作为独立 section 参与选择，不再依赖最终整段切片。
+- Runtime 对初始请求和 Resume 先建立 Package；失败恢复使用每个 turn 总计 6000 字符的 recovery delta。
+- Memory 检索可延迟 usage 更新，只有实际进入 Package 的 ID 才增加 `use_count`。
+- 新增 `TaskRoute`：task_type、scale、risk、mode、score、reasons、轮次、计划和分块标志。
+- 新增 DeepSeek-only `ModelRoute`：tier、精确模型名、Thinking、reasoning effort、max tokens 和原因。
+- simple 低风险默认 fast；普通任务 standard；deep/高风险/架构重构/重复失败使用 deep。large 只读任务依靠分块和 16 轮处理，不强制最高推理档。
+- 三档默认安全回落到已有 `model.model`；允许用户填写已确认可用的 DeepSeek 档位模型，不内置未经当前 API 验证的 flash 名称。
+- DeepSeek Client 支持逐请求 `model`，不修改共享 `self.model`；非 DeepSeek Provider fail-closed。
+- AgentState schema 升级为 2，保存 task_route、model_route 和 context_manifest；旧 v0.8 Session 缺字段时仍可恢复。
+- Resume 只允许任务模式/模型档位升级；同档保留原 Session 的精确模型，配置变化不会让任务中途无意换模。
+- 控制台显示执行模式和 DeepSeek 档位，继续保留流式 `reasoning_content` 与 elapsed Thinking。
+- 恢复 `.github/workflows/test.yml`：Python 3.11/3.12/3.13、最小权限、并发取消、20 分钟超时、pip cache、Ruff、pytest、compileall。
+- GitHub 设备登录已由用户确认，权限范围已核验包含 `repo` 与 `workflow`；未读取或输出真实 Token。
+
+### 测试与审查
+
+```text
+113 tests passed（含真实 PTY）
+49 项 Context/Router/Runtime/DeepSeek/Memory 定向回归 passed
+Ruff check passed
+Ruff format check passed
+compileall passed
+git diff --check passed
+```
+
+覆盖 ContextPackage 总字符预算、中文与完整边界截断、AGENTS 优先级、Semantic、私有 Memory 不落盘、Recovery 总预算、任务分类边界、风险/失败升级、三档模型回落与用户覆盖、非 DeepSeek 拒绝、逐请求模型隔离、旧 State 恢复、短 Resume 不降级和精确模型保持。
+
+第一次在临时 Git 克隆运行真实 PTY 测试时，只因克隆未包含 `.venv` 而找不到测试解释器；添加指向现有虚拟环境的临时 Git 忽略链接后，全量通过。该链接未进入版本控制，不属于产品缺陷。
+
+### 最终差异审查修正
+
+1. 用户请求最初未计入 Package 总预算：改为有界 head/tail 并计入 `used_chars`，另设 250000 字符输入硬上限。
+2. 单段超长 AGENTS/README 最初可能只剩截断标记：改为保留首尾规则，并修复极小预算下 `-0` 切片反而返回全文的问题。
+3. Resume 同分失败可能保留旧 `failure_count=0`：改为合并失败证据，模型升至 deep，同时保留原任务类型。
+4. large review 后转向 architecture 时，执行模式需要保持 large，但模型需要升 deep：Task Route 与 Model Route 分轴单调合并。
+5. 小于 1000 的 Context hard limit 曾被代码抬高：现严格尊重用户较低硬上限；null/非法字符串安全回落默认值。
+6. v0.8 Session Resume 后仍自报 schema 1：首次 Resume 自动升级为 schema 2。
+7. 自动生成的 `model.yaml` 默认 null 可能遮蔽 `config.yaml` 显式路由模型：加载时只移除“默认遮蔽”，保留 `model.yaml` 非默认值的更高优先级。
+
+最终独立差异复核未发现剩余高/中严重度问题。
+
+### 版本与发布
+
+版本升级为 `v0.9.0`。核心提交、注释标签、远端 `main`/tag、GitHub Actions 实际运行结果将在发布闭环完成后补记；当前不得把本地工作流文件误写成远端 CI 已通过。
+
+### 后续方向
+
+1. v0.10.0：Durable Intent/Result Journal，缩小崩溃恢复时重复副作用窗口。
+2. 逐步把 Runtime 的 Session、Memory、Audit、Metrics 副作用转为稳定 Event 订阅，但不绕过 Capability/Permission。
+3. v0.11.0：根据实际任务结果强化或衰减 Memory。
+4. v0.12.0：共享 Context/Memory/Permission 的 Worker Runtime，而不是多个自治 Agent。
+5. v1.0.0：冻结 Runtime、Router、ContextPackage、Capability、Permission 与 Event 核心接口。
 
 ## 0.8.0 自适应深度执行工作
 

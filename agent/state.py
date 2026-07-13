@@ -79,6 +79,9 @@ class AgentState:
     context_index_path: str | None = None
     execution_context: ExecutionContext | None = None
     task_strategy: dict[str, Any] = field(default_factory=dict)
+    task_route: dict[str, Any] = field(default_factory=dict)
+    model_route: dict[str, Any] = field(default_factory=dict)
+    context_manifest: dict[str, Any] = field(default_factory=dict)
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
     round: int = 0
     turn: int = 1
@@ -86,7 +89,7 @@ class AgentState:
     error: str = ""
     created_at: str = field(default_factory=utc_now_iso)
     updated_at: str = field(default_factory=utc_now_iso)
-    schema_version: int = 1
+    schema_version: int = 2
 
     @classmethod
     def create(
@@ -146,6 +149,9 @@ class AgentState:
             context_index_path=value.get("context_index_path"),
             execution_context=execution_context,
             task_strategy=dict(value.get("task_strategy") or {}),
+            task_route=dict(value.get("task_route") or {}),
+            model_route=dict(value.get("model_route") or {}),
+            context_manifest=dict(value.get("context_manifest") or {}),
             tool_calls=list(value.get("tool_calls") or []),
             round=int(value.get("round") or 0),
             turn=int(value.get("turn") or 1),
@@ -153,7 +159,7 @@ class AgentState:
             error=str(value.get("error") or ""),
             created_at=str(value.get("created_at") or utc_now_iso()),
             updated_at=str(value.get("updated_at") or utc_now_iso()),
-            schema_version=int(value.get("schema_version") or 1),
+            schema_version=max(1, int(value.get("schema_version") or 1)),
         )
 
     def start(self) -> None:
@@ -166,6 +172,7 @@ class AgentState:
         self.touch()
 
     def resume(self, user_request: str) -> None:
+        self.schema_version = max(2, self.schema_version)
         self.turn += 1
         self.user_request = user_request
         self.start()

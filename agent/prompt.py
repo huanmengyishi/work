@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from .context import ContextSnapshot
+from .context import ContextBuilder, ContextPackage, ContextSnapshot
 from .state import AgentState
 
 
@@ -34,12 +34,18 @@ Operating rules:
 class PromptBuilder:
     def build_initial(
         self,
+        package: ContextPackage | None = None,
         *,
-        state: AgentState,
-        context: ContextSnapshot,
-        memory_context: str,
-        capability_summary: str,
+        state: AgentState | None = None,
+        context: ContextSnapshot | None = None,
+        memory_context: str = "",
+        capability_summary: str = "",
     ) -> list[dict[str, Any]]:
+        if package is not None:
+            return self._messages_from_package(package)
+        if state is None or context is None:
+            raise TypeError("build_initial requires a ContextPackage")
+        # Compatibility for v0.8 callers. New Runtime code must pass a package.
         runtime_context = self._runtime_context(state, context, memory_context, capability_summary)
         return [
             {"role": "system", "content": SYSTEM_PROMPT},
@@ -47,16 +53,26 @@ class PromptBuilder:
             {"role": "user", "content": state.user_request},
         ]
 
+    def build_resume(self, package: ContextPackage) -> list[dict[str, Any]]:
+        return self._messages_from_package(package)
+
     def append_resume(
         self,
-        messages: list[dict[str, Any]],
+        messages: list[dict[str, Any]] | None = None,
         *,
-        state: AgentState,
-        context: ContextSnapshot,
-        memory_context: str,
-        capability_summary: str,
+        package: ContextPackage | None = None,
+        state: AgentState | None = None,
+        context: ContextSnapshot | None = None,
+        memory_context: str = "",
+        capability_summary: str = "",
     ) -> list[dict[str, Any]]:
-        previous = self._previous_outcome(messages)
+        if package is not None:
+            return self.build_resume(package)
+        if state is None or context is None:
+            raise TypeError("append_resume requires a ContextPackage")
+        # Compatibility for v0.8 checkpoints. Outcome selection now lives in
+        # ContextBuilder and is not part of the package-based Prompt renderer.
+        previous = ContextBuilder.previous_outcome(messages or [])
         refreshed = [
             {"role": "system", "content": SYSTEM_PROMPT},
             {
@@ -72,14 +88,12 @@ class PromptBuilder:
         return refreshed
 
     @staticmethod
-    def _previous_outcome(messages: list[dict[str, Any]]) -> str:
-        for message in reversed(messages):
-            if message.get("role") != "assistant" or message.get("tool_calls"):
-                continue
-            content = str(message.get("content") or "").strip()
-            if content:
-                return content[:4000]
-        return ""
+    def _messages_from_package(package: ContextPackage) -> list[dict[str, Any]]:
+        return [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": package.rendered},
+            {"role": "user", "content": package.user_request},
+        ]
 
     @staticmethod
     def _runtime_context(
