@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+AGENT_HOME="${DEEP_AGENT_HOME:-$HOME/AI-Agent}"
+PY="$AGENT_HOME/.venv/bin/python"
+
+if [[ ! -x "$PY" ]]; then
+  echo "Deep Agent virtualenv not found: $PY" >&2
+  echo "Run: python3 -m venv \"$AGENT_HOME/.venv\" && \"$AGENT_HOME/.venv/bin/python\" -m pip install -r \"$AGENT_HOME/requirements.txt\"" >&2
+  exit 1
+fi
+
+export PYTHONPATH="$AGENT_HOME${PYTHONPATH:+:$PYTHONPATH}"
+exec "$PY" -m agent "$@"
