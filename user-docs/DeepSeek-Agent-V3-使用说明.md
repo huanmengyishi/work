@@ -1,4 +1,4 @@
-# DeepSeek Agent V3 使用说明（0.7.0）
+# DeepSeek Agent V3 使用说明（0.7.1）
 
 更新时间：2026-07-13
 
@@ -80,6 +80,8 @@ agent "分析当前项目并给出修改建议"
 /exit
 ```
 
+普通任务输入完成后按一次 `Enter` 即提交。终端随后会显示“正在处理请求，请稍候...”，这表示 Agent 已开始调用 DeepSeek 和工具，不再等待继续输入。空回车不会执行任务，会提示正确用法。运行中需要返回交互界面时按 `Ctrl+C`，随后可 `/resume` 继续会话。
+
 安全模式是默认模式。`--yolo` 自动同意普通工具调用，但仍受路径、危险命令和 sudo 策略保护。`--super-yolo` 绕过 Permission Manager 的硬限制，可允许 sudo、外部路径、特权 Docker 和破坏性命令；操作系统自身的密码和权限检查仍然有效。
 
 ```bash
@@ -128,6 +130,19 @@ permissions:
 - SQLite WAL、FTS 回填、Queue 跨进程锁和更严格的日志脱敏。
 
 后续方向：V1.0 只作为规划，不在当前版本实施。目标是冻结 Runtime 接口、让 Context Builder 成为唯一上下文入口、完成 Event Bus 副作用闭环，并保持所有新能力经过 Capability Registry 与 Permission Manager。
+
+### 0.7.1：交互输入可靠性补丁
+
+发布原因：WSL/GNU Readline 彩色 Prompt 中的 ANSI 控制字符未声明为不可见字符，在窄终端或自动换行时会导致光标位置计算错误，表现为按 Enter 后看起来仍在输入。
+
+主要修复：
+
+- Readline 模式下正确标记 ANSI 颜色控制字符，不参与光标和换行长度计算。
+- 输入前刷新输出，确保 Prompt 已显示后才开始读取。
+- 空回车显示明确提示，不再静默重新等待。
+- 任务按 Enter 提交后立刻显示“正在处理请求”，避免误以为仍在输入状态。
+- 运行中按 `Ctrl+C` 返回交互界面，可用 `/resume` 继续已检查点保存的会话。
+- 项目根目录识别仅接受有效 Git 元数据，不会再被空 `.git` 占位目录错误劫持。
 
 ## 5. 安全文件修改与回滚
 
@@ -312,10 +327,10 @@ agent health --reset
 
 能力状态：Available、Unavailable、Need Config、Disabled、Broken。Unavailable/Broken 能力不会放入模型 Tool Schema 和 Prompt 能力摘要。
 
-当前 0.7.0 验收：
+当前 0.7.1 验收：
 
 ```text
-55 tests passed
+58 tests passed
 Ruff check passed
 Ruff format check passed
 compileall passed

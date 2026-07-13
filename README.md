@@ -3,7 +3,7 @@
 Project-centric DeepSeek CLI agent for WSL. The Agent is installed as a tool;
 the directory where `agent` is started is the workspace.
 
-Current version: `0.7.0`. The runtime includes correction learning, failure
+Current version: `0.7.1`. The runtime includes correction learning, failure
 recovery, Memory administration, MCP stdio/HTTP/SSE and Resources, bounded HTTP
 access, optional Tree-sitter indexing, resumable task queues, and threshold-gated
 Git worktree parallelism in addition to safe editing and browser persistence.
@@ -13,6 +13,13 @@ Tree-sitter module and import relationships, Memory lifecycle maintenance,
 compact Session resume, and an optional per-project background daemon. The
 daemon is disabled by default and uses project-specific PID, lock, state, and
 log files under the XDG data directory.
+
+Version `0.7.1` fixes interactive input on GNU Readline/WSL terminals. Colored
+prompts now mark ANSI control bytes as non-printing so cursor, line wrapping,
+and Enter submission are calculated correctly. Empty input gives explicit
+feedback, and a visible processing message appears immediately after a request
+is submitted. Project discovery now also requires valid Git metadata instead of
+treating an arbitrary empty `.git` directory as a repository root.
 
 ## Quick Start
 
@@ -127,6 +134,12 @@ Interactive-only commands: `/new`, `/resume [session-id]`, `/sessions`,
 `/status`, `/undo`, `/yolo on|off`, `/super-yolo on|off`, `/help`, `/clear`, and
 `/exit`. History is stored with mode `600` at
 `~/.local/share/deep-agent/cache/repl_history`.
+
+Press `Enter` once to submit a request. After submission the CLI prints a
+processing message while DeepSeek and tools run; it is no longer waiting for
+more input. An empty `Enter` keeps the session open and explains how to submit
+a task. `Ctrl+C` returns to the interactive prompt and the checkpointed Session
+can be continued with `/resume`.
 
 Approval modes:
 

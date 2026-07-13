@@ -73,6 +73,8 @@ class ConsoleUI:
             self.info("SUPER YOLO disabled. Permission Manager hard policies are active.")
 
     def read(self, session_id: str | None) -> str:
+        # Flush before input so WSL terminals always render the prompt before waiting.
+        sys.stdout.flush()
         return normalize_unicode_text(input(self.prompt(session_id))).strip()
 
     def answer(self, value: str) -> None:
@@ -80,6 +82,9 @@ class ConsoleUI:
 
     def info(self, value: str) -> None:
         print(self._style(value, "36"))
+
+    def working(self) -> None:
+        print(self._style("正在处理请求，请稍候...（按 Ctrl+C 可返回交互界面）", "36"), flush=True)
 
     def error(self, value: str) -> None:
         print(self._style(f"error: {value}", "31"), file=sys.stderr)
@@ -150,7 +155,16 @@ class ConsoleUI:
         return readline
 
     def _style(self, value: str, code: str) -> str:
-        return f"\033[{code}m{value}\033[0m" if self.color else value
+        if not self.color:
+            return value
+        start = f"\033[{code}m"
+        end = "\033[0m"
+        # GNU Readline counts raw ANSI bytes as printed characters unless they
+        # are marked as non-printing. Without these markers its cursor and
+        # newline calculations break in some WSL terminals.
+        if self._readline is not None:
+            return f"\001{start}\002{value}\001{end}\002"
+        return f"{start}{value}{end}"
 
 
 def _command_completer(text: str, state: int) -> str | None:

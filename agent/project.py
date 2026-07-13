@@ -138,9 +138,20 @@ class ProjectManager:
 
     def _infer_new_root(self, start: Path) -> Path:
         for current in (start, *start.parents):
-            if (current / ".git").exists():
+            if self._is_git_root(current):
                 return current
         return start
+
+    @staticmethod
+    def _is_git_root(path: Path) -> bool:
+        """Recognize actual Git metadata, not an arbitrary directory named .git."""
+        marker = path / ".git"
+        if marker.is_file():
+            try:
+                return marker.read_text(encoding="utf-8", errors="replace").lstrip().startswith("gitdir:")
+            except OSError:
+                return False
+        return marker.is_dir() and (marker / "HEAD").is_file()
 
     def _ensure_project(self, root: Path) -> Project:
         agent_dir = root / self.agent_dir_name

@@ -50,6 +50,18 @@ def test_project_move_keeps_uuid_and_updates_registry(tmp_path: Path, make_confi
     assert rows[0]["name"] == "new-name"
 
 
+def test_project_root_ignores_empty_git_directory(tmp_path: Path, make_config) -> None:
+    outer = tmp_path / "outer"
+    (outer / ".git").mkdir(parents=True)
+    root = outer / "project"
+    root.mkdir()
+
+    project = ProjectManager(make_config()).resolve_project(root)
+
+    assert project.root == root.resolve()
+    assert project.name == "project"
+
+
 def test_optional_semantic_index_is_sidecar(tmp_path: Path, make_config) -> None:
     root = tmp_path / "project"
     root.mkdir()

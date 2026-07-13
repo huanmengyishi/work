@@ -778,6 +778,7 @@ def repl(
             ui.error(str(exc))
             continue
         if not prompt:
+            ui.info("未输入请求。输入 /help 查看命令，或直接输入任务后按 Enter 执行。")
             continue
         if prompt in {"/exit", "/quit"}:
             runtime.close()
@@ -850,12 +851,16 @@ def repl(
                 ui.error(str(exc))
             continue
         try:
+            ui.working()
             if active_session:
                 answer = runtime.resume(prompt, active_session)
             else:
                 answer = runtime.run(prompt)
                 active_session = runtime.last_session_id
             ui.answer(answer)
+        except KeyboardInterrupt:
+            active_session = runtime.last_session_id or active_session
+            ui.info("请求已中断。可使用 /resume 继续当前会话，或使用 /new 开始新会话。")
         except Exception as exc:
             ui.error(str(exc))
 
