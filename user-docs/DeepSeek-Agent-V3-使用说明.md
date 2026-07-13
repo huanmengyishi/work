@@ -429,6 +429,8 @@ Task/Model 路由、失败升级、Resume 单调保持 passed
 DeepSeek streaming/tool-call assembly passed
 网络重试与部分流禁止重放 passed
 路径、符号链接、Queue 并发、Docker 参数与进程组超时回归 passed
+GitHub Actions 运行 29257906807：Python 3.11 / 3.12 / 3.13 全部 passed
+Actions：checkout@v5、setup-python@v6，无 Node.js 20 弃用警告
 ```
 
 ## 13. 参考工程取舍
@@ -449,7 +451,25 @@ DeepSeek streaming/tool-call assembly passed
 6. 副作用通过 Event Bus 记录，敏感值必须脱敏。
 7. 重型功能默认关闭，配置迁移只增加新默认值，不覆盖用户值。
 
-## 15. 风险与回滚
+## 15. 可直接运行的实用案例
+
+当前目录新增：
+
+```text
+实用案例-v0.9.0/
+```
+
+其中 `order-summary-demo/` 是一个带真实 CSV、业务规则、故意保留缺陷和回归测试的小型订单汇总项目。先阅读 `实用案例-v0.9.0/README.md`，再依次体验 simple 解释、standard Bug 修复、large 全项目分析、deep 财务/安全审计与 `/resume`。案例基线的 2 个测试应当失败，这是用于观察 Agent 定位和修复过程的预期状态，不属于 Deep Agent 主项目测试失败。
+
+快速开始：
+
+```bash
+cd /mnt/d/detail/deepseek/实用案例-v0.9.0/order-summary-demo
+python3 -m unittest discover -s tests -v
+agent
+```
+
+## 16. 风险与回滚
 
 - `show_thinking` 展示的是 DeepSeek API 返回的 reasoning 内容，可能较长；可在配置中关闭。
 - 已输出部分 reasoning 后的流断线不会自动重放，需要 `/resume`，这是避免重复工具副作用的安全设计。

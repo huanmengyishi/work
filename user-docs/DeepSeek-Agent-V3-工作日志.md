@@ -65,7 +65,11 @@ git diff --check passed
 
 ### 版本与发布
 
-版本升级为 `v0.9.0`。核心提交、注释标签、远端 `main`/tag、GitHub Actions 实际运行结果将在发布闭环完成后补记；当前不得把本地工作流文件误写成远端 CI 已通过。
+版本升级为 `v0.9.0`。核心实现提交为 `41e6fd94230cfae26cbb92dd5579326b1a89d7dc`；CI 环境/PTY 可移植性修复为 `fcef10c`；Actions v5/v6 与确定性性能回归修复为 `592922b`。这些提交均已推送到 GitHub `main`。
+
+GitHub Actions 首轮 `29257025908` 暴露工作流未安装 browser/semantic/ripgrep 且 PTY 测试硬编码 `.venv`；第二轮 `29257619119` 将问题收敛为共享 runner 上 2.5 秒墙钟阈值偶发超限；两轮失败均如实保留并修根因。第三轮 `29257906807` 使用 `actions/checkout@v5`、`actions/setup-python@v6`，Python 3.11/3.12/3.13 三个 job 全部完成 Ruff、113 tests、compileall 并成功。Node.js 20 弃用警告只属于旧 Actions 版本的历史运行，当前工作流已消除。
+
+最终文档/案例提交、注释标签与远端对象哈希将在闭环末端核验，并以最终回复为准，避免工作日志对自身提交哈希产生无限追加提交。
 
 ### 后续方向
 
@@ -74,6 +78,10 @@ git diff --check passed
 3. v0.11.0：根据实际任务结果强化或衰减 Memory。
 4. v0.12.0：共享 Context/Memory/Permission 的 Worker Runtime，而不是多个自治 Agent。
 5. v1.0.0：冻结 Runtime、Router、ContextPackage、Capability、Permission 与 Event 核心接口。
+
+### 用户实用案例
+
+按用户要求在当前目录新建 `实用案例-v0.9.0/order-summary-demo/`。案例包含 CSV 订单数据、故意保留的 cancelled 订单汇总缺陷、浮点金额/输入错误缺陷、2 个描述正确行为的 unittest、项目 AGENTS 约束，以及 simple/standard/large/deep/Resume 的可复制提示词。基线已真实验证为 2 个预期失败，错误输出会把 99 个 cancelled mouse 计入；修复目标和正确结果已写入案例 README。案例不包含 Key，并忽略 `.project-agent` 与 Python 缓存。
 
 ## 0.8.0 自适应深度执行工作
 

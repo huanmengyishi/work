@@ -342,9 +342,15 @@ cd ~/AI-Agent
 ```
 
 The repository includes `.github/workflows/test.yml` for Python 3.11, 3.12,
-and 3.13. It runs Ruff, pytest, and compileall for pushes to `main`, pull
-requests, and manual dispatch. Defining the workflow does not prove a hosted
-GitHub Actions run succeeded; inspect the repository Actions page after push.
+and 3.13. It uses `actions/checkout@v5` and `actions/setup-python@v6`, then runs
+Ruff, all 113 pytest cases, and compileall for pushes to `main`, pull requests,
+and manual dispatch. Hosted run `29257906807` passed on all three Python
+versions for the v0.9.0 release.
+
+A runnable Chinese walkthrough is available at
+`user-docs/实用案例-v0.9.0/README.md`. Its order-summary project intentionally
+starts with two failing business-rule tests so users can observe simple,
+standard, large, deep, Thinking, and Resume behavior on a real repair task.
 
 See `docs/implementation.md` for architecture, extension rules, Docker proxy,
 OCR, memory, and maintenance details.

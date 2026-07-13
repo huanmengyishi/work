@@ -1,0 +1,5 @@
+order_id,product,quantity,unit_price,status
+1001,keyboard,2,19.99,paid
+1002,mouse,1,15.50,paid
+1003,mouse,99,15.50,cancelled
+1004,keyboard,1,19.99,paid

@@ -461,12 +461,12 @@ Run the release checks locally without exposing credentials:
 .venv/bin/python -m compileall -q agent tests scripts
 ```
 
-`.github/workflows/test.yml` defines the same Ruff, pytest, and compileall
-checks for Python 3.11, 3.12, and 3.13 on pushes to `main`, pull requests, and
-manual dispatch. The workflow definition was reviewed locally; this document
-does not claim that a hosted GitHub Actions run or an online DeepSeek API check
-was executed. Verify those separately from the repository Actions page and
-`agent doctor --online` when credentials and network access are available.
+`.github/workflows/test.yml` uses `actions/checkout@v5` and
+`actions/setup-python@v6`, installs browser/semantic integration dependencies,
+and runs the same Ruff, 113-test, and compileall checks for Python 3.11, 3.12,
+and 3.13. Hosted run `29257906807` passed for all matrix entries. This does not
+claim an online DeepSeek API check; run `agent doctor --online` only with
+private credentials present.
 
 ## 19. ECC Reference Decisions
 
