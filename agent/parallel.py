@@ -10,6 +10,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from .project import Project
+from .paths import storage_key
 from .timeutil import utc_now_iso
 
 
@@ -29,7 +30,7 @@ class ParallelTaskResult:
 class ParallelWorktreeRunner:
     def __init__(self, project: Project, data_dir: Path) -> None:
         self.project = project
-        self.base_dir = data_dir / "worktrees" / project.id
+        self.base_dir = data_dir / "worktrees" / storage_key(project.id)
         self.report_dir = project.agent_dir / "parallel"
         self.base_dir.mkdir(parents=True, exist_ok=True)
         self.report_dir.mkdir(parents=True, exist_ok=True)

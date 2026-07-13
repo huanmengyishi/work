@@ -133,6 +133,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
     "events": {
         "jsonl_log": True,
+        "metrics_enabled": True,
     },
 }
 

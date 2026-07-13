@@ -14,6 +14,8 @@ from agent.contracts import (
     CORE_INTERFACE_CONTRACT_VERSION,
 )
 from agent.memory import MemoryStore
+from agent.event_pipelines import RuntimeEventPipelines
+from agent.events import EventBus
 from agent.model_router import ModelRoute
 from agent.project import ProjectManager
 from agent.prompt import PromptBuilder
@@ -48,6 +50,26 @@ def test_core_interface_chain_and_runtime_entrypoints_are_versioned() -> None:
     assert _parameter_names(TaskPlanFactory.build) == ("self", "route")
     assert inspect.signature(TaskPlanFactory.build).parameters["route"].annotation in {TaskRoute, "TaskRoute"}
     assert not hasattr(AgentRuntime, "strategy_selector")
+    assert _parameter_names(EventBus.publish) == (
+        "self",
+        "event_name",
+        "payload",
+        "project_id",
+        "session_id",
+        "run_id",
+    )
+    assert _parameter_names(EventBus.dispatch_required) == _parameter_names(EventBus.publish)
+    assert _parameter_names(EventBus.subscribe) == ("self", "event_name", "handler", "required", "name")
+    assert _parameter_names(RuntimeEventPipelines.__init__) == (
+        "self",
+        "config",
+        "project",
+        "sessions",
+        "memory",
+        "health",
+        "events",
+        "progress_handler",
+    )
 
 
 def test_prompt_builder_accepts_only_context_package_and_has_no_file_access() -> None:

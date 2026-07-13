@@ -1,4 +1,4 @@
-# DeepSeek Agent V3 使用说明（0.9.1）
+# DeepSeek Agent V3 使用说明（0.10.0）
 
 更新时间：2026-07-14
 
@@ -16,7 +16,7 @@ agent
 ```text
 ~/AI-Agent/                         程序、测试、发布说明
 ~/.config/deep-agent/              配置和 API Key
-~/.local/share/deep-agent/         SQLite、Chroma、日志、备份、Daemon 状态
+~/.local/share/deep-agent/         SQLite、Chroma、日志、指标、健康与 Daemon 状态
 <项目>/.project-agent/             项目上下文、索引、Session、快照
 ```
 
@@ -254,17 +254,45 @@ DeepSeek 仍是唯一 Provider。没有加入 OpenAI、Anthropic 或其他模型
 
 外部扩展若还调用旧 `PromptBuilder.append_resume()`，或向 `build_initial()` 传入分散参数，需要改为先构建 ContextPackage。程序仓库内部调用已全部迁移。
 
-### Event Bus 后续开发要点
+### 0.10.0：Event Bus 整体迁移
 
-0.9.1 先稳定事件模型，不把 Session、Memory 和工具副作用一次性迁移。新增订阅者时：
+0.10.0 在保持上述接口与 DeepSeek 唯一 Provider 不变的前提下，将 Runtime 自动副作用统一注册到 `RuntimeEventPipelines`：
 
-1. 事件名使用 `task.finished`、`tool.started` 这类稳定命名，不把 ID 编进名称。
-2. 用 `project_id/session_id/run_id` 做关联；旧 payload 中的 `run_id` 可通过 `effective_run_id` 兼容。
-3. payload 必须小、有界、可序列化，不得写入 Key、Cookie、密码、完整模型消息或无界工具输出。
-4. 订阅者在发布线程内同步运行，必须快且有界；通过 `cancel = subscribe(...)` 保存取消回调，组件销毁时执行 `cancel()`。
-5. 当前 `publish()` 返回不代表已持久化或一定会重试。若业务不允许丢失/重复，先设计 Durable Journal，不能直接依赖进程内 Event Bus。
+```text
+EventBus
+  -> required：Session checkpoint/finalize、Context Memory usage
+  -> best-effort：自动 Memory/Reflection、Capability Health
+  -> best-effort：Audit、Metrics、UI Thinking/Progress
+```
 
-推荐迁移顺序是“指标/审计等观察性副作用 -> 增加幂等键 -> 双路对比 -> 切换单个模块”。不应从 Session 提交或文件写入开始。更详细的发布者规则、订阅者模板、崩溃窗口和未实施边界见 `docs/architecture-v0.9.1.md`。
+关键语义：
+
+- required 事件必须有精确 owner；缺失或写入失败会 fail-closed。
+- Session owner 是否已提交通过命名 delivery 结果区分；owner 未写入时不会从不确定状态继续 finalize，只有 owner 已成功而其他 required observer 故障时才可安全落 failed terminal。
+- Session 必须先 finalize，之后才发布 `task.finished/task.failed`，避免从未持久化终态生成 Memory 或指标。
+- 实际进入 ContextPackage 的 Memory 使用 SQLite `usage_id` 原子去重；成功后才更新 AgentState，Resume 的新 turn 可再次强化一次。
+- ToolManager 不再直写 Capability Health；权限检查和 handler 完成后才发布 `tool.finished`。Health 写失败不会改变已得到的 ToolResult。
+- Audit 只记录有界元数据，不记录 Prompt、reasoning、messages、AgentState、工具参数值、stdout/stderr、正文或凭据。
+- Metrics 只记录公开 task/model/tool 事件的计数、总工具耗时和失败数；64 KiB 以上旧指标文件不会解析。
+- Thinking 片段经 `ui.progress.updated` 实时交给 ConsoleUI，但 Audit 丢弃内容、Metrics 不统计，UI 故障不会中断任务。
+
+配置位于 `~/.config/deep-agent/config.yaml`，本次只补默认值，不覆盖已有配置：
+
+```yaml
+events:
+  jsonl_log: true
+  metrics_enabled: true
+```
+
+运行数据位置：
+
+```text
+~/.local/share/deep-agent/logs/       元数据审计 JSONL
+~/.local/share/deep-agent/metrics/    每项目聚合指标 JSON
+~/.local/share/deep-agent/capability-health/
+```
+
+Event Bus 仍是进程内同步总线，不提供跨进程 Broker、重放或进程崩溃后的 exactly-once。需要可靠重放的工具副作用应在后续实现独立 Durable Intent Journal，而不能让 Event 绕过 Permission Manager。完整开发边界见 `docs/architecture-v0.10.0.md`。
 
 ## 5. 安全文件修改与回滚
 
@@ -451,10 +479,10 @@ agent health --reset
 
 能力状态：Available、Unavailable、Need Config、Disabled、Broken。Unavailable/Broken 能力不会放入模型 Tool Schema 和 Prompt 能力摘要。
 
-当前 0.9.1 本地验收：
+当前 0.10.0 本地验收：
 
 ```text
-130 tests passed（含真实 PTY）
+173 tests passed（含真实 PTY Thinking 流式显示）
 Ruff check passed
 Ruff format check passed
 compileall passed
@@ -464,6 +492,8 @@ DeepSeek streaming/tool-call assembly passed
 网络重试与部分流禁止重放 passed
 路径、符号链接、Queue 并发、Docker 参数与进程组超时回归 passed
 Interface Contract、Event、AgentState、ContextPackage、路由与 Permission 顺序 passed
+Session required owner/顺序/失败恢复、Memory usage 幂等与 Resume passed
+Capability Health best-effort、Audit/Metrics 隐私与畸形数据 passed
 GitHub Actions：Python 3.11 / 3.12 / 3.13；发布后核验运行号
 Actions：checkout@v5、setup-python@v6，使用当前 Node.js runtime，无 Node.js 20 弃用警告
 ```
@@ -493,6 +523,7 @@ Actions：checkout@v5、setup-python@v6，使用当前 Node.js runtime，无 Nod
 ```text
 实用案例-v0.9.0/
 实用案例-v0.9.1/
+实用案例-v0.10.0/
 ```
 
 其中 `order-summary-demo/` 是一个带真实 CSV、业务规则、故意保留缺陷和回归测试的小型订单汇总项目。先阅读 `实用案例-v0.9.0/README.md`，再依次体验 simple 解释、standard Bug 修复、large 全项目分析、deep 财务/安全审计与 `/resume`。案例基线的 2 个测试应当失败，这是用于观察 Agent 定位和修复过程的预期状态，不属于 Deep Agent 主项目测试失败。
@@ -513,6 +544,13 @@ cd ~/AI-Agent
 PYTHONPATH=. .venv/bin/python user-docs/实用案例-v0.9.1/interface-routing-demo.py
 ```
 
+0.10.0 的 `event-runtime-demo.py` 同样不需要 API Key，可观察 required owner、best-effort 故障隔离、Memory usage 幂等、安全 Audit 和聚合 Metrics：
+
+```bash
+cd ~/AI-Agent
+PYTHONPATH=. .venv/bin/python user-docs/实用案例-v0.10.0/event-runtime-demo.py
+```
+
 ## 16. 风险与回滚
 
 - `show_thinking` 展示的是 DeepSeek API 返回的 reasoning 内容，可能较长；可在配置中关闭。
@@ -523,8 +561,8 @@ PYTHONPATH=. .venv/bin/python user-docs/实用案例-v0.9.1/interface-routing-de
 
 ```bash
 cd ~/AI-Agent
-git switch --detach v0.9.0
+git switch --detach v0.9.1
 .venv/bin/pip install -e .
 ```
 
-恢复最新版执行 `git switch main`。0.9.1 没有破坏性配置迁移；回滚不会删除 Session、Memory 或项目数据。若有外部代码已切换到新的 PromptBuilder 单 Package 接口，回滚后还需同步恢复该外部调用代码。
+恢复最新版执行 `git switch main`。0.10.0 仅新增默认值、指标文件和 SQLite 幂等表，不覆盖配置，也不删除 Session、Memory 或项目数据；0.9.1 会安全忽略这些新增数据。

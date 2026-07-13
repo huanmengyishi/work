@@ -3,10 +3,10 @@
 Project-centric DeepSeek CLI agent for WSL. The Agent is installed as a tool;
 the directory where `agent` is started is the workspace.
 
-Current version: `0.9.1`. The core interface chain is now covered by executable
+Current version: `0.10.0`. The core interface chain is covered by executable
 contract tests. ContextBuilder is the only model-context entry, PromptBuilder
-only renders a `ContextPackage`, AgentState validates its frozen schema, and a
-minimal versioned Event Bus exposes stable publish/subscribe semantics.
+only renders a `ContextPackage`, AgentState validates its frozen schema, and the
+versioned Event Bus now owns Runtime automatic side-effect pipelines.
 DeepSeek thinking can stream to the terminal with elapsed time, current plan
 step, and tool progress.
 
@@ -38,6 +38,12 @@ higher-risk continuation can upgrade them.
 Version `0.9.1` stabilizes these interfaces for the v1.0 freeze. TaskRouter is
 the only classifier, starter plans consume a `TaskRoute`, and ModelRouter adds
 an explainable low/balanced/high cost class while remaining DeepSeek-only.
+
+Version `0.10.0` completes the in-process Event Bus migration for automatic
+Session persistence, Memory usage/learning, capability health, audit, metrics,
+and UI progress. Required persistence fails closed; best-effort observers never
+change an already completed tool result. This remains one Runtime and one
+DeepSeek provider, not a multi-Agent or cross-process broker design.
 
 ## Quick Start
 
@@ -99,8 +105,8 @@ CLI
      -> ToolManager
         -> ToolRequest -> PermissionManager -> ToolResult
      -> EventBus
-        -> JSONL logger
-        -> MemoryPipeline -> SQLite + Chroma
+        -> required Session + Memory-usage pipelines
+        -> best-effort Memory/Reflection, Health, Audit, Metrics, UI progress
 ```
 
 Implemented V3 modules:
@@ -114,8 +120,10 @@ Implemented V3 modules:
 - `PromptBuilder`: renders the system policy, one Context Package, and request.
 - `ToolCapabilityRegistry`: dynamic schemas, permissions, timeouts, formats, and availability.
 - `PermissionManager`: centralized capability, cwd, timeout, and dangerous-command policy.
-- `EventBus`: versioned synchronous events, correlation IDs, unsubscribe, and
-  isolated subscriber errors. It is not yet a durable broker.
+- `EventBus`: versioned synchronous events, required/best-effort deliveries,
+  correlation IDs, named subscribers, dispatch results, and isolated errors.
+- `RuntimeEventPipelines`: one registration point for Session, Memory usage,
+  automatic Memory/Reflection, Health, Audit, Metrics, and visible Thinking.
 - `MemoryPipeline`: idempotent Summary and Lesson/Bug/Decision persistence.
 - `PlanManager`: model-maintained plans without an extra mandatory model request.
 - `TaskRouter`: the only local type/scale/risk and mode classifier.
@@ -233,9 +241,9 @@ read-only work use `balanced`, and deep/high-risk/architecture/refactor or
 repeated-failure work uses `high`. This is a routing estimate, not a billing
 measurement. Explicit tier configuration still takes priority.
 
-## Frozen Interfaces And Minimal Events
+## Frozen Interfaces And Event Pipelines
 
-The v0.9.1 contract marker is in `agent/contracts.py`, and
+The interface contract marker is in `agent/contracts.py`, and
 `tests/test_interface_contracts.py` verifies the public chain:
 
 ```text
@@ -247,8 +255,30 @@ PromptBuilder accepts only one `ContextPackage`; it does not load files or take
 separate State, Memory, or capability text. `Event` serializes
 `schema_version/id/name/timestamp/project_id/session_id/run_id/payload`.
 EventBus remains synchronous and process-local: it isolates handler failures
-but does not provide replay, durable delivery, or cross-process ordering. See
-`docs/architecture-v0.9.1.md` for extension rules.
+and distinguishes required owners from best-effort observers, but it does not
+provide replay, a network broker, or cross-process ordering. Required Session
+writes and Memory usage fail closed; terminal Memory/Reflection, capability
+health, audit, metrics, and UI progress are best-effort. See
+`docs/architecture-v0.10.0.md` for ownership, ordering, idempotency, and privacy
+rules.
+
+Required dispatch carries named delivery evidence from the Session owner. If
+that owner failed, Runtime does not try to finalize an uncertain checkpoint; if
+the owner succeeded and only a later required observer failed, Runtime can
+safely persist a failed terminal for Resume.
+
+JSONL audit is metadata-only. It drops Prompt, reasoning, model messages,
+AgentState, tool arguments, stdout/stderr, output bodies, and credentials.
+Project metrics store only allowed event counts, bounded aggregate tool time,
+and failed-tool count under `~/.local/share/deep-agent/metrics/`. Both outputs
+use private permissions and reject symbolic-link targets. Configure only by
+adding defaults; existing user values are preserved:
+
+```yaml
+events:
+  jsonl_log: true
+  metrics_enabled: true
+```
 
 The Context Package budget counts the bounded user request plus fully rendered
 sections, including headings and separators. The fixed system prompt, active
@@ -378,9 +408,9 @@ cd ~/AI-Agent
 
 The repository includes `.github/workflows/test.yml` for Python 3.11, 3.12,
 and 3.13. It uses `actions/checkout@v5` and `actions/setup-python@v6` (current
-Node.js runtime, no Node.js 20 deprecation), then runs Ruff, all 130 pytest
+Node.js runtime, no Node.js 20 deprecation), then runs Ruff, all 173 pytest
 cases, and compileall for pushes to `main`, pull requests, and manual dispatch.
-The v0.9.1 hosted run is verified during release publication.
+The v0.10.0 hosted run is verified during release publication.
 
 A runnable Chinese walkthrough is available at
 `user-docs/实用案例-v0.9.0/README.md`. Its order-summary project intentionally
@@ -390,6 +420,9 @@ An offline interface example at
 `user-docs/实用案例-v0.9.1/interface-routing-demo.py` demonstrates cost-aware
 routing, TaskRoute-only plan creation, event correlation, and subscriber error
 isolation without using an API key.
+`user-docs/实用案例-v0.10.0/event-runtime-demo.py` demonstrates required
+delivery, best-effort isolation, Memory usage idempotency, safe audit, and
+bounded metrics entirely offline.
 
 See `docs/implementation.md` for architecture, extension rules, Docker proxy,
 OCR, memory, and maintenance details.
@@ -398,9 +431,11 @@ OCR, memory, and maintenance details.
 
 ```bash
 cd ~/AI-Agent
-git switch --detach v0.9.0
+git switch --detach v0.9.1
 .venv/bin/pip install -e .
 ```
 
-Return with `git switch main`. v0.9.1 has no destructive config migration and
-preserves existing values, Session files, Memory, and project data.
+Return with `git switch main`. v0.10.0 only adds defaults and an internal
+SQLite idempotency table; it does not overwrite configuration or delete
+Session, Memory, or project data. Older code safely ignores the added table and
+metrics file.

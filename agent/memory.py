@@ -118,6 +118,14 @@ class MemoryStore:
                     experience_memory_id integer,
                     processed_at text not null
                 );
+
+                create table if not exists memory_usage_events (
+                    usage_id text primary key,
+                    run_id text not null,
+                    project_id text,
+                    memory_ids text not null,
+                    recorded_at text not null
+                );
                 """
             )
             if self._fts_available(con):
@@ -730,6 +738,63 @@ class MemoryStore:
     def record_usage(self, memory_ids: Iterable[int]) -> None:
         """Reinforce only Memory entries that were actually included in model context."""
         self._record_usage([int(memory_id) for memory_id in memory_ids])
+
+    def record_usage_once(
+        self,
+        usage_id: str,
+        memory_ids: Iterable[int],
+        *,
+        run_id: str,
+        project_id: str | None,
+    ) -> bool:
+        """Atomically record one context-inclusion batch exactly once per usage ID."""
+
+        normalized_usage_id = str(usage_id).strip()
+        normalized_run_id = str(run_id).strip()
+        normalized_ids = sorted(set(int(memory_id) for memory_id in memory_ids))
+        if not normalized_usage_id or len(normalized_usage_id) > 500:
+            raise ValueError("memory usage_id must contain 1 to 500 characters")
+        if not normalized_run_id or len(normalized_run_id) > 500:
+            raise ValueError("memory run_id must contain 1 to 500 characters")
+        if not normalized_ids or len(normalized_ids) > 1000 or any(memory_id <= 0 for memory_id in normalized_ids):
+            raise ValueError("memory usage requires 1 to 1000 positive IDs")
+        serialized_ids = json.dumps(normalized_ids, separators=(",", ":"))
+        now = utc_now_iso()
+        with self._connect() as con:
+            inserted = con.execute(
+                """
+                insert into memory_usage_events(usage_id, run_id, project_id, memory_ids, recorded_at)
+                values (?, ?, ?, ?, ?)
+                on conflict(usage_id) do nothing
+                """,
+                (normalized_usage_id, normalized_run_id, project_id, serialized_ids, now),
+            )
+            if inserted.rowcount == 0:
+                existing = con.execute(
+                    "select run_id, project_id, memory_ids from memory_usage_events where usage_id = ?",
+                    (normalized_usage_id,),
+                ).fetchone()
+                if existing is None:
+                    raise RuntimeError("memory usage journal conflict could not be resolved")
+                if (
+                    str(existing["run_id"]) != normalized_run_id
+                    or existing["project_id"] != project_id
+                    or str(existing["memory_ids"]) != serialized_ids
+                ):
+                    raise ValueError("memory usage_id was replayed with different evidence")
+                return False
+            placeholders = ",".join("?" for _ in normalized_ids)
+            updated = con.execute(
+                f"""
+                update memories
+                set use_count = use_count + 1, last_used_at = ?
+                where id in ({placeholders}) and merged_into is null
+                """,
+                [now, *normalized_ids],
+            )
+            if updated.rowcount != len(normalized_ids):
+                raise ValueError("memory usage evidence contains missing or merged IDs")
+        return True
 
     def _record_usage(self, memory_ids: list[int]) -> None:
         if not memory_ids:

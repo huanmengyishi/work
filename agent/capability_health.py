@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict, dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from .config import AppConfig
+from .paths import storage_key
 from .timeutil import utc_now_iso
-from .tools.registry import ToolCapability
+
+if TYPE_CHECKING:
+    from .tools.registry import ToolCapability
 
 
 HEALTH_STATES = {"Available", "Unavailable", "Need Config", "Disabled", "Broken"}
@@ -26,7 +29,7 @@ class CapabilityHealthManager:
     def __init__(self, config: AppConfig, project_id: str) -> None:
         self.config = config
         self.project_id = project_id
-        self.path = config.data_dir / "capability-health" / f"{project_id}.json"
+        self.path = config.data_dir / "capability-health" / f"{storage_key(project_id)}.json"
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.failure_threshold = max(1, int(config.get("runtime.capability_failure_threshold", 3)))
         self.records = self._read()

@@ -15,6 +15,7 @@ from typing import Any
 from .config import AppConfig
 from .context import ContextBuilder
 from .memory import MemoryStore
+from .paths import storage_key
 from .project import Project
 from .task_queue import TaskQueueManager
 from .timeutil import utc_now_iso
@@ -34,7 +35,7 @@ class ProjectDaemon:
         self.config = config
         self.project = project
         self.memory = memory
-        self.base_dir = config.data_dir / "daemon" / project.id
+        self.base_dir = config.data_dir / "daemon" / storage_key(project.id)
         self.base_dir.mkdir(parents=True, exist_ok=True)
         self.lock_path = self.base_dir / "daemon.lock"
         self.pid_path = self.base_dir / "daemon.pid"

@@ -1,13 +1,20 @@
 from __future__ import annotations
 
+import hashlib
 from typing import Any, Callable
 
 from .config import AppConfig
 from .context import ContextBuildRequest, ContextBuilder, ContextPackage, ContextSnapshot
 from .deepseek import DeepSeekClient, DeepSeekStreamInterrupted
-from .events import EventBus, JsonlEventLogger
+from .event_pipelines import (
+    MEMORY_USAGE_RECORDED,
+    PROGRESS_UPDATED,
+    SESSION_CHECKPOINT_REQUESTED,
+    SESSION_FINALIZE_REQUESTED,
+    RuntimeEventPipelines,
+)
+from .events import EventBus, EventDispatchError
 from .memory import MemoryItem, MemoryStore
-from .memory_pipeline import MemoryPipeline
 from .model_router import ModelRoute, ModelRouter, more_capable_model_route
 from .project import Project
 from .prompt import PromptBuilder
@@ -44,19 +51,19 @@ class AgentRuntime:
         self.context_builder = context_builder or ContextBuilder(config)
         self.prompt_builder = prompt_builder or PromptBuilder()
         self.sessions = sessions or SessionManager(project)
-        self.progress_handler = progress_handler
         self.task_router = TaskRouter(config)
         self.model_router = ModelRouter(config)
         self.task_plan_factory = TaskPlanFactory()
         self.last_session_id: str | None = None
         self.tools.set_event_bus(self.events)
-        if config.get("events.jsonl_log", True):
-            self.events.subscribe("*", JsonlEventLogger(config.data_dir / "logs"))
-        self.memory_pipeline = MemoryPipeline(
+        self.event_pipelines = RuntimeEventPipelines(
             config=config,
             project=project,
+            sessions=self.sessions,
             memory=memory,
+            health=self.tools.health,
             events=self.events,
+            progress_handler=progress_handler,
         )
 
     def run(
@@ -197,7 +204,11 @@ class AgentRuntime:
     ) -> str:
         self.tools.bind_state(state)
         state.start()
-        self.sessions.checkpoint(state, messages)
+        try:
+            self._checkpoint_session(state, messages)
+        except EventDispatchError as exc:
+            state.fail(str(exc))
+            raise
         self.events.publish(
             "task.started",
             {"run_id": state.run_id, "prompt": state.user_request},
@@ -283,7 +294,7 @@ class AgentRuntime:
                 if not tool_calls:
                     final = str(message.get("content") or "").strip()
                     state.complete(final)
-                    self.sessions.finalize(state, messages)
+                    self._finalize_session(state, messages)
                     self._publish_terminal("task.finished", state, final=final)
                     return final
 
@@ -336,24 +347,29 @@ class AgentRuntime:
                                 self._record_included_memories(state, recovery_package.included_memory_ids)
                                 messages.append({"role": "system", "content": recovery_package.rendered})
                     if self.config.get("runtime.checkpoint_each_tool", True):
-                        self.sessions.checkpoint(state, messages)
+                        self._checkpoint_session(state, messages)
 
             final = "Tool round limit reached. The task did not finish cleanly. Resume the session to continue."
             state.fail("max_tool_rounds reached", final)
-            self.sessions.finalize(state, messages)
+            self._finalize_session(state, messages)
             self._publish_terminal("task.failed", state, final=final, error=state.error)
             return final
         except Exception as exc:
+            if isinstance(exc, EventDispatchError) and exc.event_name == SESSION_FINALIZE_REQUESTED:
+                raise
+            if isinstance(exc, EventDispatchError) and exc.event_name == SESSION_CHECKPOINT_REQUESTED:
+                state.fail(str(exc))
+                if exc.subscriber_succeeded("session.checkpoint-writer"):
+                    self._persist_failed_terminal(state, messages)
+                raise
             if isinstance(exc, DeepSeekStreamInterrupted):
                 state.fail(f"resumable interruption: {exc}")
                 if state.execution_context:
                     state.execution_context.prompt_phase = "interrupted"
-                self.sessions.finalize(state, messages)
-                self._publish_terminal("task.failed", state, error=state.error)
+                self._persist_failed_terminal(state, messages)
                 raise RuntimeError(f"{exc} Session: {state.session_id}") from exc
             state.fail(str(exc))
-            self.sessions.finalize(state, messages)
-            self._publish_terminal("task.failed", state, error=str(exc))
+            self._persist_failed_terminal(state, messages)
             raise
 
     def close(self) -> None:
@@ -384,11 +400,12 @@ class AgentRuntime:
         )
 
     def _progress(self, event: str, state: AgentState, **payload: Any) -> None:
-        if self.progress_handler is None:
+        if self.event_pipelines.progress is None:
             return
-        try:
-            self.progress_handler(
-                {
+        self.events.publish(
+            PROGRESS_UPDATED,
+            {
+                "value": {
                     "event": event,
                     "session_id": state.session_id,
                     "mode": (state.task_strategy or {}).get("mode", "standard"),
@@ -396,9 +413,11 @@ class AgentRuntime:
                     "model_tier": (state.model_route or {}).get("tier", "standard"),
                     **payload,
                 }
-            )
-        except Exception:
-            return
+            },
+            project_id=self.project.id,
+            session_id=state.session_id,
+            run_id=state.run_id,
+        )
 
     @staticmethod
     def _strategy_from_state(state: AgentState) -> TaskStrategy:
@@ -484,11 +503,54 @@ class AgentRuntime:
         return package
 
     def _record_included_memories(self, state: AgentState, memory_ids: tuple[int, ...]) -> None:
-        new_ids = [memory_id for memory_id in memory_ids if memory_id not in state.loaded_memories]
+        new_ids = list(dict.fromkeys(memory_id for memory_id in memory_ids if memory_id not in state.loaded_memories))
         if not new_ids:
             return
+        self.events.dispatch_required(
+            MEMORY_USAGE_RECORDED,
+            {
+                "memory_ids": new_ids,
+                "usage_id": self._memory_usage_id(state, new_ids),
+            },
+            project_id=self.project.id,
+            session_id=state.session_id,
+            run_id=state.run_id,
+        )
         state.loaded_memories.extend(new_ids)
-        self.memory.record_usage(new_ids)
+
+    def _checkpoint_session(self, state: AgentState, messages: list[dict[str, Any]]) -> None:
+        self.events.dispatch_required(
+            SESSION_CHECKPOINT_REQUESTED,
+            {"state": state, "messages": messages},
+            project_id=self.project.id,
+            session_id=state.session_id,
+            run_id=state.run_id,
+        )
+
+    def _finalize_session(self, state: AgentState, messages: list[dict[str, Any]]) -> None:
+        self.events.dispatch_required(
+            SESSION_FINALIZE_REQUESTED,
+            {"state": state, "messages": messages},
+            project_id=self.project.id,
+            session_id=state.session_id,
+            run_id=state.run_id,
+        )
+
+    def _persist_failed_terminal(self, state: AgentState, messages: list[dict[str, Any]]) -> None:
+        """Persist the failed State before publishing its terminal derivatives.
+
+        If the required Session writer itself fails, do not recursively retry it
+        and do not publish a terminal event from an unpersisted State.
+        """
+
+        self._finalize_session(state, messages)
+        self._publish_terminal("task.failed", state, error=state.error)
+
+    @staticmethod
+    def _memory_usage_id(state: AgentState, memory_ids: list[int]) -> str:
+        joined_ids = ",".join(str(item) for item in sorted(memory_ids))
+        evidence = f"{state.run_id}\0{joined_ids}".encode("utf-8")
+        return f"memory-usage:{hashlib.sha256(evidence).hexdigest()}"
 
     @staticmethod
     def _failure_count(state: AgentState) -> int:

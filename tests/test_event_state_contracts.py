@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from agent.contracts import EVENT_SCHEMA_VERSION, EVENT_SERIALIZED_FIELDS
-from agent.events import Event, EventBus, JsonlEventLogger
+from agent.events import Event, EventBus, EventDispatchError, JsonlEventLogger
 from agent.project import ProjectManager
 from agent.state import AgentState, PlanStep
 
@@ -59,7 +59,7 @@ def test_event_schema_round_trip_and_jsonl_record_are_stable(tmp_path: Path) -> 
     JsonlEventLogger(tmp_path)(event)
     record = json.loads(next(tmp_path.glob("events-*.jsonl")).read_text(encoding="utf-8"))
     assert tuple(record) == EVENT_SERIALIZED_FIELDS
-    assert Event.from_dict(record) == event
+    assert record == event.to_dict() | {"payload": {}}
 
 
 def test_event_bus_supports_unsubscribe_existing_event_and_handler_isolation() -> None:
@@ -103,6 +103,85 @@ def test_nested_publish_does_not_clobber_outer_handler_errors() -> None:
 
     assert len(bus.last_errors) == 1
     assert "outer failed" in bus.last_errors[0]
+
+
+def test_required_dispatch_fails_closed_without_owner_or_on_required_error() -> None:
+    bus = EventBus()
+    bus.subscribe("*", lambda _event: None, name="audit")
+
+    with pytest.raises(EventDispatchError, match="no required subscribers"):
+        bus.dispatch_required("session.checkpoint.requested", {})
+
+    bus.subscribe(
+        "session.checkpoint.requested",
+        lambda _event: (_ for _ in ()).throw(RuntimeError("disk unavailable")),
+        required=True,
+        name="session-writer",
+    )
+    bus.subscribe("session.checkpoint.requested", lambda _event: None, name="metrics")
+
+    with pytest.raises(EventDispatchError, match="disk unavailable") as raised:
+        bus.dispatch_required("session.checkpoint.requested", {})
+
+    assert raised.value.event_name == "session.checkpoint.requested"
+    assert raised.value.subscriber_succeeded("session-writer") is False
+    assert bus.last_dispatch is not None
+    assert bus.last_dispatch.handler_count == 3
+    assert len(bus.last_dispatch.required_errors) == 1
+
+
+def test_required_error_exposes_named_owner_delivery_evidence() -> None:
+    bus = EventBus()
+
+    def committed(_event: Event) -> None:
+        return None
+
+    bus.subscribe("session.checkpoint.requested", committed, required=True, name="session-writer")
+    bus.subscribe(
+        "session.checkpoint.requested",
+        lambda _event: (_ for _ in ()).throw(RuntimeError("required observer failed")),
+        required=True,
+        name="required-observer",
+    )
+
+    with pytest.raises(EventDispatchError) as raised:
+        bus.dispatch_required("session.checkpoint.requested", {})
+
+    assert raised.value.subscriber_succeeded("session-writer") is True
+
+
+def test_required_dispatch_rejects_observer_only_and_duplicate_names() -> None:
+    bus = EventBus()
+    bus.subscribe("critical", lambda _event: None, name="observer")
+
+    with pytest.raises(EventDispatchError, match="no required subscribers"):
+        bus.dispatch_required("critical", {})
+
+    bus.subscribe("critical", lambda _event: None, required=True, name="owner")
+    with pytest.raises(ValueError, match="already registered"):
+        bus.subscribe("critical", lambda _event: None, required=True, name="owner")
+
+
+def test_required_dispatch_tolerates_best_effort_failure_after_required_success() -> None:
+    bus = EventBus()
+    seen: list[str] = []
+    bus.subscribe(
+        "session.checkpoint.requested",
+        lambda _event: seen.append("persisted"),
+        required=True,
+        name="session-writer",
+    )
+    bus.subscribe(
+        "session.checkpoint.requested",
+        lambda _event: (_ for _ in ()).throw(RuntimeError("metrics unavailable")),
+        name="metrics",
+    )
+
+    dispatch = bus.dispatch_required("session.checkpoint.requested", {})
+
+    assert seen == ["persisted"]
+    assert dispatch.required_errors == ()
+    assert len(dispatch.errors) == 1
 
 
 def test_agent_state_rejects_invalid_graph_route_provider_and_context_bounds(tmp_path: Path, make_config) -> None:

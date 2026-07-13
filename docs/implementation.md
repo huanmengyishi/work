@@ -6,11 +6,11 @@ Deep Agent V3 is a local, project-centric coding Agent powered only by DeepSeek.
 It runs under WSL Ubuntu and can be started from any directory. Program files,
 user configuration, long-term data, and project-local context remain separate.
 
-Version `0.9.1` stabilizes the interfaces introduced in v0.9.0. ContextBuilder
+Version `0.10.0` keeps the interfaces stabilized in v0.9.1. ContextBuilder
 is the only context-selection entry, PromptBuilder only consumes a
-`ContextPackage`, AgentState has a validated/frozen schema, and a minimal
-versioned Event Bus contract is ready for incremental future migration. The
-runtime remains DeepSeek-only and preserves streamed Thinking from v0.8.0.
+`ContextPackage`, AgentState has a validated/frozen schema, and the versioned
+Event Bus owns automatic Runtime side effects. The runtime remains DeepSeek-only
+and preserves streamed Thinking from v0.8.0.
 
 ## 2. Runtime Architecture
 
@@ -33,11 +33,9 @@ CLI
         -> local / browser / MCP adapter
         -> ToolResult
      -> EventBus
-        -> JsonlEventLogger
-        -> MemoryPipeline
-           -> SQLite FTS
-           -> Chroma
-           -> Markdown memory files
+        -> required SessionEventPipeline / MemoryUsageEventPipeline
+        -> best-effort MemoryPipeline / CapabilityHealthEventPipeline
+        -> best-effort Audit / Metrics / Progress subscribers
 ```
 
 `agent/cli.py` only parses commands and constructs the runtime. Orchestration
@@ -47,7 +45,8 @@ Prompt rendering belongs in `agent/prompt.py`.
 
 The executable contract version and frozen field sets live in
 `agent/contracts.py`. Full boundary ownership, compatibility rules, and the
-minimal Event API are documented in `docs/architecture-v0.9.1.md`.
+Event delivery and side-effect ownership are documented in
+`docs/architecture-v0.10.0.md`.
 
 ## 3. Program, Config, Data, and Project Files
 
@@ -74,6 +73,8 @@ minimal Event API are documented in `docs/architecture-v0.9.1.md`.
   vector/
   cache/
   logs/
+  metrics/
+  capability-health/
   backup/
 
 <project>/.project-agent/
@@ -234,7 +235,7 @@ points, file metadata, and Python/general source symbols. It is intentionally
 not a full language-server database. Optional Tree-sitter semantic data remains
 a bounded sidecar and never replaces the base index.
 
-`ContextBuilder.build_package()` is the only v0.9.1 path for model-visible base
+`ContextBuilder.build_package()` is the only supported path for model-visible base
 context. It produces typed sections, records omitted/truncated sources, and
 computes `used_chars` from the final rendering including headings and section
 separators. Task state and project instructions are selected first; other
@@ -276,7 +277,7 @@ It imports no State/Snapshot builder and performs no file I/O. This is an
 intentional compatibility break for external v0.8 callers that passed separate
 context parameters.
 
-### Minimal Event contract
+### Event contract and migrated side effects
 
 `Event` schema version 1 serializes the following stable fields:
 
@@ -285,16 +286,41 @@ schema_version, id, name, timestamp,
 project_id, session_id, run_id, payload
 ```
 
-`EventBus.subscribe()` returns a cancellation callback. `unsubscribe()` is
-idempotent, `publish()` accepts either a name plus metadata or an existing
-Event, and subscriber exceptions are isolated in `last_errors`. Runtime and
-ToolManager publish `run_id` correlation metadata. JSONL records use the same
-shape and retain log redaction.
+`EventBus.subscribe()` returns a cancellation callback and accepts a stable
+subscriber name plus `required=True` ownership. `unsubscribe()` is idempotent,
+`publish()` accepts either a name plus metadata or an existing Event, and
+subscriber exceptions are isolated in delivery results. `dispatch_required()`
+fails closed when an exact required owner is missing or a required handler
+fails; exact best-effort and wildcard Audit/Metrics handlers never count as an
+owner. Subscriber names are unique within one event so delivery evidence cannot
+be confused with another handler.
 
-The bus is synchronous and process-local. There is no replay, durable queue,
-delivery retry, cross-process ordering, or transactional tool coupling in this
-release. MemoryPipeline keeps its existing subscriptions; Session persistence
-is not migrated. See `docs/architecture-v0.9.1.md` before adding subscribers or
+`RuntimeEventPipelines` is the only automatic subscriber-registration point:
+
+- `session.checkpoint.requested` and `session.finalize.requested` are required;
+- `memory.usage.recorded` is required and commits one `usage_id` atomically;
+- `task.finished/task.failed` drive idempotent automatic Memory/Reflection;
+- `tool.finished` updates capability health best-effort;
+- Audit, aggregate Metrics, and `ui.progress.updated` are best-effort.
+
+Runtime persists Session state before it publishes a terminal task event. A
+failed Session finalize therefore does not generate Memory, Audit, or Metrics
+from an unpersisted terminal state. Memory usage updates SQLite before adding
+the ID to `AgentState.loaded_memories`; `memory_usage_events` prevents a replay
+from incrementing `use_count` twice. Tool permission checks and the handler
+still run before `tool.finished`, so Event subscribers cannot execute or bypass
+a capability.
+
+Audit JSONL uses an allow-list metadata projection. It never serializes live
+AgentState, messages, Prompt, reasoning, tool argument values, stdout/stderr,
+result bodies, or arbitrary objects. Metrics persists only allowed event
+counts, bounded aggregate tool duration, and failed-tool count. Both use
+private paths, atomic/bounded writes, and reject symbolic-link destinations.
+
+The bus is synchronous and process-local. There is no replay, network broker,
+delivery retry, cross-process ordering, or exactly-once process-crash guarantee
+in this release. See
+`docs/architecture-v0.10.0.md` before adding subscribers or
 moving side effects.
 
 ## 7. Tool Protocol and Capability Registry
@@ -514,9 +540,9 @@ Run the release checks locally without exposing credentials:
 
 `.github/workflows/test.yml` uses `actions/checkout@v5` and
 `actions/setup-python@v6`, installs browser/semantic integration dependencies,
-and runs the same Ruff, 130-test, and compileall checks for Python 3.11, 3.12,
+and runs the same Ruff, 173-test, and compileall checks for Python 3.11, 3.12,
 and 3.13. These action versions use the current runner Node.js runtime and avoid
-the Node.js 20 deprecation warning. The v0.9.1 hosted run is recorded during
+the Node.js 20 deprecation warning. The v0.10.0 hosted run is recorded during
 release publication. This does not claim an online DeepSeek API check; run
 `agent doctor --online` only with private credentials present.
 
@@ -533,7 +559,7 @@ would add disproportionate complexity to this single-model local CLI.
 The following were intentionally not implemented in this upgrade:
 
 - General multi-agent role scheduling.
-- Full Event migration or a durable Event broker.
+- Durable Intent Journal, replay, or a cross-process Event broker.
 - Worker Runtime and complete Runtime redesign.
 - GitHub/Jira/Notion integrations.
 - Non-DeepSeek providers.

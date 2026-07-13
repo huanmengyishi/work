@@ -92,3 +92,78 @@ def test_real_pty_enter_help_and_exit(tmp_path: Path) -> None:
             process.terminate()
             process.wait(timeout=5)
         os.close(master)
+
+
+def test_real_pty_event_progress_and_thinking_are_visible(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    probe = tmp_path / "progress_probe.py"
+    probe.write_text(
+        """
+from agent.cli import repl
+from agent.config import AppConfig, DEFAULT_CONFIG, deep_merge
+from agent.deepseek import ChatResponse
+import agent.cli as cli
+import time
+
+class FakeClient:
+    def chat_stream(self, **kwargs):
+        kwargs["on_reasoning"]("inspect ")
+        time.sleep(0.05)
+        kwargs["on_reasoning"]("bounded chunks")
+        return ChatResponse(
+            message={"role": "assistant", "content": "PTY complete", "reasoning_content": "inspect bounded chunks"},
+            raw={},
+        )
+
+original = cli.build_runtime
+def build(*args, **kwargs):
+    runtime = original(*args, **kwargs)
+    runtime.client = FakeClient()
+    return runtime
+cli.build_runtime = build
+
+values = deep_merge(DEFAULT_CONFIG, {"memory": {"vector_enabled": False}, "events": {"jsonl_log": False}})
+raise SystemExit(repl(AppConfig(values=values, config_dir=__import__('pathlib').Path.cwd() / '.config', data_dir=__import__('pathlib').Path.cwd() / '.data'), yolo=True))
+""".lstrip(),
+        encoding="utf-8",
+    )
+    master, slave = pty.openpty()
+    env = {
+        **os.environ,
+        "TERM": "xterm-256color",
+        "PYTHONPATH": str(Path(__file__).resolve().parents[1]),
+    }
+    process = subprocess.Popen(
+        [sys.executable, str(probe)],
+        cwd=project,
+        stdin=slave,
+        stdout=slave,
+        stderr=slave,
+        env=env,
+        close_fds=True,
+    )
+    os.close(slave)
+    output = bytearray()
+
+    def read_until(needle: bytes, timeout: float = 10.0) -> None:
+        deadline = time.monotonic() + timeout
+        while needle not in output and time.monotonic() < deadline:
+            ready, _, _ = select.select([master], [], [], 0.2)
+            if ready:
+                output.extend(os.read(master, 4096))
+        assert needle in output, output.decode("utf-8", errors="replace")
+
+    try:
+        read_until(b"> ")
+        os.write(master, "全面审计整个代码库并深度重构所有安全问题\r".encode())
+        read_until(b"DeepSeek Thinking")
+        read_until(b"bounded chunks")
+        read_until(b"PTY complete")
+        os.write(master, b"/exit\r")
+        assert process.wait(timeout=8) == 0
+    finally:
+        if process.poll() is None:
+            process.terminate()
+            process.wait(timeout=5)
+        os.close(master)

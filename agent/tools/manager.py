@@ -1,14 +1,14 @@
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import time
 from pathlib import Path
 from typing import Any, Callable
 
 from ..config import AppConfig
-from ..capability_health import CapabilityHealthManager
-from ..events import EventBus
+from ..events import EventBus, sanitize_for_log
 from ..memory import MemoryStore
 from ..planner import PlanManager
 from ..project import Project
@@ -32,6 +32,18 @@ from .templates import SafeTemplateTool
 ApprovalHandler = Callable[[ToolRequest, ToolCapability, str], bool]
 
 
+_HEALTH_ERROR_MAX_CHARS = 1000
+_EVENT_LABEL_MAX_CHARS = 200
+_EVENT_COUNT_MAX = 1000
+_EVENT_DURATION_MAX_MS = 86_400_000
+_SENSITIVE_ERROR_ASSIGNMENT = re.compile(
+    r"(?i)\b(api[_-]?key|access[_-]?token|refresh[_-]?token|authorization|cookie|password|passwd|secret|token)"
+    r"(\s*[=:]\s*)"
+    r"(?:\"[^\"]*\"|'[^']*'|[^\s,;]+)"
+)
+_URL_CREDENTIALS = re.compile(r"(?i)\b(https?://)[^\s/@:]+:[^\s/@]+@")
+
+
 class ToolManager:
     def __init__(
         self,
@@ -45,6 +57,10 @@ class ToolManager:
         yolo: bool = False,
         super_yolo: bool = False,
     ) -> None:
+        # capability_health depends on tools.registry.  Resolve it only after
+        # this module is initialized so event_pipelines can be imported first.
+        from ..capability_health import CapabilityHealthManager
+
         self.config = config
         self.project = project
         self.memory = memory
@@ -208,10 +224,6 @@ class ToolManager:
         except Exception as exc:
             result = ToolResult(False, "", str(exc))
         result = result.with_execution(request_id=request.request_id, duration_ms=elapsed_ms(started))
-        if result.success:
-            self.health.record(capability.name, success=True)
-        elif self._is_health_failure(result):
-            self.health.record(capability.name, success=False, error=result.stderr)
         self._publish("tool.finished", request, result)
         return result
 
@@ -952,7 +964,7 @@ class ToolManager:
 
     @staticmethod
     def _is_health_failure(result: ToolResult) -> bool:
-        error = result.stderr.lower()
+        error = str(result.stderr or "").lower()
         markers = (
             "timeout",
             "timed out",
@@ -968,25 +980,67 @@ class ToolManager:
         )
         return any(marker in error for marker in markers)
 
+    @staticmethod
+    def _health_error_summary(result: ToolResult) -> str:
+        value = str(sanitize_for_log(str(result.stderr or "")))
+        value = _URL_CREDENTIALS.sub(r"\1[redacted]@", value)
+        value = _SENSITIVE_ERROR_ASSIGNMENT.sub(
+            lambda match: f"{match.group(1)}{match.group(2)}[redacted]",
+            value,
+        )
+        value = " ".join(value.replace("\x00", " ").split())
+        if len(value) <= _HEALTH_ERROR_MAX_CHARS:
+            return value
+        suffix = "...[truncated]"
+        return value[: _HEALTH_ERROR_MAX_CHARS - len(suffix)] + suffix
+
+    @staticmethod
+    def _event_label(value: Any) -> str | None:
+        if value is None:
+            return None
+        label = str(sanitize_for_log(str(value))).strip()
+        if len(label) <= _EVENT_LABEL_MAX_CHARS:
+            return label
+        suffix = "...[truncated]"
+        return label[: _EVENT_LABEL_MAX_CHARS - len(suffix)] + suffix
+
+    @staticmethod
+    def _event_count(value: Any) -> int:
+        try:
+            count = len(value)
+        except (TypeError, ValueError, OverflowError):
+            return 0
+        return max(0, min(count, _EVENT_COUNT_MAX))
+
+    @staticmethod
+    def _event_duration_ms(value: Any) -> int:
+        try:
+            duration = int(value or 0)
+        except (TypeError, ValueError, OverflowError):
+            return 0
+        return max(0, min(duration, _EVENT_DURATION_MAX_MS))
+
     def _publish(self, event_name: str, request: ToolRequest, result: ToolResult | None) -> None:
         if not self.events:
             return
         payload: dict[str, Any] = {
             "request": {
-                "tool": request.tool,
-                "action": request.action,
-                "capability": request.capability,
-                "request_id": request.request_id,
-                "argument_names": sorted(str(key) for key in request.args),
-                "path": request.args.get("path") if isinstance(request.args.get("path"), str) else None,
+                "tool": self._event_label(request.tool),
+                "action": self._event_label(request.action),
+                "capability": self._event_label(request.capability),
+                "request_id": self._event_label(request.request_id),
+                "argument_count": self._event_count(request.args),
             }
         }
         if result is not None:
+            health_failure = event_name == "tool.finished" and not result.success and self._is_health_failure(result)
             payload["result"] = {
                 "success": result.success,
-                "duration_ms": result.duration_ms,
-                "request_id": result.request_id,
-                "data_keys": sorted(str(key) for key in (result.data or {})),
+                "duration_ms": self._event_duration_ms(result.duration_ms),
+                "request_id": self._event_label(result.request_id),
+                "data_field_count": self._event_count(result.data) if isinstance(result.data, dict) else 0,
+                "health_failure": health_failure,
+                "error": self._health_error_summary(result) if health_failure else "",
             }
         self.events.publish(
             event_name,

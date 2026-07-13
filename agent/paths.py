@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import os
+import hashlib
+import re
 from pathlib import Path
 
 
 APP_NAME = "deep-agent"
+_SAFE_COMPONENT_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
 
 def program_dir() -> Path:
@@ -75,3 +78,17 @@ def ensure_base_dirs() -> None:
         daemon_dir(),
     ):
         path.mkdir(parents=True, exist_ok=True)
+
+
+def storage_key(value: str, *, maximum: int = 120) -> str:
+    """Map an external identifier to one stable, traversal-safe path component."""
+
+    raw = str(value).strip()
+    if not raw:
+        raise ValueError("storage identifier must not be empty")
+    if len(raw) <= maximum and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", raw):
+        return raw
+    safe = _SAFE_COMPONENT_RE.sub("_", raw).strip("._-") or "id"
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+    prefix_limit = max(1, maximum - len(digest) - 1)
+    return f"{safe[:prefix_limit]}-{digest}"
