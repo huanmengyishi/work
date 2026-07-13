@@ -5,6 +5,7 @@ import os
 import pty
 import select
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -59,7 +60,7 @@ def test_real_pty_enter_help_and_exit(tmp_path: Path) -> None:
         "PYTHONPATH": str(Path(__file__).resolve().parents[1]),
     }
     process = subprocess.Popen(
-        [str(Path(__file__).resolve().parents[1] / ".venv" / "bin" / "python"), "-m", "agent"],
+        [sys.executable, "-m", "agent"],
         cwd=project,
         stdin=slave,
         stdout=slave,

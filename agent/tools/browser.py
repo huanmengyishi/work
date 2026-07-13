@@ -37,6 +37,11 @@ class BrowserTool:
         error = self._validate_url(url)
         if error:
             return ToolResult(False, "", error)
+        if session_name:
+            try:
+                self._session_name(session_name)
+            except ValueError as exc:
+                return ToolResult(False, "", str(exc))
         try:
             with self._context(session_name) as context:
                 page = context.pages[0] if context.pages else context.new_page()

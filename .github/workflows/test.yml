@@ -37,7 +37,11 @@ jobs:
           cache-dependency-path: pyproject.toml
 
       - name: Install project and development dependencies
-        run: python -m pip install -e '.[dev]'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes ripgrep
+          python -m pip install -e '.[dev,browser,semantic]'
+          python -m playwright install --with-deps chromium
 
       - name: Run Ruff checks
         run: |
