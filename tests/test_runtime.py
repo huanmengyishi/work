@@ -15,7 +15,16 @@ class FakeClient:
     def __init__(self, responses: list[dict]) -> None:
         self.responses = list(responses)
 
-    def chat(self, *, messages, tools=None, tool_choice="auto", max_tokens=None) -> ChatResponse:
+    def chat(
+        self,
+        *,
+        messages,
+        tools=None,
+        tool_choice="auto",
+        max_tokens=None,
+        thinking=None,
+        reasoning_effort=None,
+    ) -> ChatResponse:
         if not self.responses:
             raise AssertionError("fake response queue exhausted")
         return ChatResponse(message=self.responses.pop(0), raw={})
@@ -25,10 +34,28 @@ class RecordingClient(FakeClient):
     def __init__(self, responses: list[dict]) -> None:
         super().__init__(responses)
         self.requests: list[list[dict]] = []
+        self.options: list[dict] = []
 
-    def chat(self, *, messages, tools=None, tool_choice="auto", max_tokens=None) -> ChatResponse:
+    def chat(
+        self,
+        *,
+        messages,
+        tools=None,
+        tool_choice="auto",
+        max_tokens=None,
+        thinking=None,
+        reasoning_effort=None,
+    ) -> ChatResponse:
         self.requests.append(list(messages))
-        return super().chat(messages=messages, tools=tools, tool_choice=tool_choice, max_tokens=max_tokens)
+        self.options.append({"thinking": thinking, "reasoning_effort": reasoning_effort})
+        return super().chat(
+            messages=messages,
+            tools=tools,
+            tool_choice=tool_choice,
+            max_tokens=max_tokens,
+            thinking=thinking,
+            reasoning_effort=reasoning_effort,
+        )
 
 
 def tool_message(call_id: str, name: str, arguments: dict) -> dict:
@@ -120,3 +147,66 @@ def test_runtime_injects_recovery_memory_after_tool_failure(tmp_path: Path, make
     runtime = AgentRuntime(config=config, project=project, memory=memory, tools=tools, client=client)
     assert runtime.run("run the missing command") == "diagnosed"
     assert any("Failure Recovery Memory" in str(message.get("content")) for message in client.requests[1])
+
+
+def test_runtime_adapts_deep_task_and_reports_reasoning_progress(tmp_path: Path, make_config) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    (root / "main.py").write_text("print('ok')\n", encoding="utf-8")
+    config = make_config()
+    project = ProjectManager(config).resolve_project(root)
+    memory = MemoryStore(config)
+    tools = ToolManager(config, project, memory, yolo=True)
+    client = RecordingClient(
+        [
+            {
+                "role": "assistant",
+                "content": "complete",
+                "reasoning_content": "inspect bounded chunks first",
+            }
+        ]
+    )
+    progress: list[dict] = []
+    runtime = AgentRuntime(
+        config=config,
+        project=project,
+        memory=memory,
+        tools=tools,
+        client=client,
+        progress_handler=progress.append,
+    )
+
+    assert runtime.run("全面审计整个代码库的所有安全问题并完成大规模重构") == "complete"
+    session = runtime.sessions.load(runtime.last_session_id)
+
+    assert session.state.task_strategy["mode"] == "deep"
+    assert session.state.task_strategy["max_tool_rounds"] == 24
+    assert [step.id for step in session.state.plan] == ["scope", "inspect-chunks", "implement", "verify"]
+    assert client.options == [{"thinking": True, "reasoning_effort": "max"}]
+    assert any(item["event"] == "thinking.content" for item in progress)
+
+
+def test_short_resume_keeps_deep_strategy_and_plan(tmp_path: Path, make_config) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    config = make_config()
+    project = ProjectManager(config).resolve_project(root)
+    memory = MemoryStore(config)
+    tools = ToolManager(config, project, memory, yolo=True)
+    client = RecordingClient(
+        [
+            {"role": "assistant", "content": "checkpoint"},
+            {"role": "assistant", "content": "continued"},
+        ]
+    )
+    runtime = AgentRuntime(config=config, project=project, memory=memory, tools=tools, client=client)
+
+    assert runtime.run("全面审计整个代码库并深度重构所有安全问题") == "checkpoint"
+    session_id = runtime.last_session_id
+    original_plan = [step.id for step in runtime.sessions.load(session_id).state.plan]
+    assert runtime.resume("继续", session_id) == "continued"
+    resumed = runtime.sessions.load(session_id).state
+
+    assert resumed.task_strategy["mode"] == "deep"
+    assert [step.id for step in resumed.plan] == original_plan
+    assert client.options[-1] == {"thinking": True, "reasoning_effort": "max"}

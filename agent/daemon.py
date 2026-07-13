@@ -187,15 +187,27 @@ class ProjectDaemon:
             "--id",
             pending.id,
         ]
-        completed = subprocess.run(
-            command,
-            cwd=self.project.root,
-            stdin=subprocess.DEVNULL,
-            text=True,
-            capture_output=True,
-            timeout=max(60, int(self.config.get("tools.shell.timeout_seconds", 120)) * max(1, len(pending.tasks))),
-            check=False,
+        calculated_timeout = max(
+            60,
+            int(self.config.get("tools.shell.timeout_seconds", 120)) * max(1, len(pending.tasks)),
         )
+        timeout = min(calculated_timeout, max(60, int(self.config.get("daemon.queue_timeout_seconds", 3600))))
+        try:
+            completed = subprocess.run(
+                command,
+                cwd=self.project.root,
+                stdin=subprocess.DEVNULL,
+                text=True,
+                capture_output=True,
+                timeout=timeout,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            stdout = exc.stdout if isinstance(exc.stdout, str) else ""
+            stderr = exc.stderr if isinstance(exc.stderr, str) else ""
+            completed = subprocess.CompletedProcess(
+                command, 124, stdout, (stderr + f"\ntimeout after {timeout}s").strip()
+            )
         with self.log_path.open("a", encoding="utf-8") as log:
             if completed.stdout:
                 log.write(completed.stdout)

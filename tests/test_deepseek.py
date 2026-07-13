@@ -7,7 +7,7 @@ import urllib.error
 import pytest
 
 from agent.config import parse_api_keys
-from agent.deepseek import DeepSeekClient
+from agent.deepseek import DeepSeekClient, DeepSeekStreamInterrupted
 
 
 class FakeResponse:
@@ -22,6 +22,9 @@ class FakeResponse:
 
     def read(self) -> bytes:
         return json.dumps(self.payload).encode("utf-8")
+
+    def __iter__(self):
+        return iter(self.payload)
 
 
 def http_error(url: str, code: int) -> urllib.error.HTTPError:
@@ -102,3 +105,126 @@ def test_key_pool_check_reports_partial_failure(monkeypatch, make_config) -> Non
 
     with pytest.raises(RuntimeError, match=r"1/2 key\(s\) ready"):
         client.check_key_pool()
+
+
+def test_thinking_request_uses_reasoning_fields_and_omits_temperature(monkeypatch, make_config) -> None:
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
+    client = DeepSeekClient(make_config())
+    sent_payload: dict = {}
+
+    def fake_urlopen(request, timeout):
+        sent_payload.update(json.loads(request.data.decode("utf-8")))
+        return FakeResponse(
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": "done",
+                            "reasoning_content": "bounded reasoning",
+                        }
+                    }
+                ]
+            }
+        )
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+
+    response = client.chat(
+        messages=[{"role": "user", "content": "hard task"}],
+        thinking=True,
+        reasoning_effort="max",
+    )
+
+    assert sent_payload["thinking"] == {"type": "enabled"}
+    assert sent_payload["reasoning_effort"] == "max"
+    assert "temperature" not in sent_payload
+    assert response.message["reasoning_content"] == "bounded reasoning"
+
+
+def test_network_timeout_retries_same_key_with_backoff(monkeypatch, make_config) -> None:
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
+    client = DeepSeekClient(make_config({"model": {"network_retries": 2, "retry_base_seconds": 0}}))
+    calls = 0
+
+    def fake_urlopen(request, timeout):
+        nonlocal calls
+        calls += 1
+        if calls < 3:
+            raise urllib.error.URLError(TimeoutError("temporary timeout"))
+        return FakeResponse({"choices": [{"message": {"role": "assistant", "content": "OK"}}]})
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+
+    assert client.chat(messages=[{"role": "user", "content": "test"}]).message["content"] == "OK"
+    assert calls == 3
+
+
+def test_streaming_chat_emits_reasoning_and_reassembles_tool_call(monkeypatch, make_config) -> None:
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
+    client = DeepSeekClient(make_config())
+    lines = [
+        b'data: {"choices":[{"delta":{"role":"assistant","reasoning_content":"inspect "}}]}\n',
+        b'data: {"choices":[{"delta":{"reasoning_content":"first","tool_calls":[{"index":0,"id":"call-1","type":"function","function":{"name":"search_","arguments":"{\\"query\\":\\""}}]}}]}\n',
+        b'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"code","arguments":"bug\\"}"}}]}}]}\n',
+        b"data: [DONE]\n",
+    ]
+
+    class StreamResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+        def __iter__(self):
+            return iter(lines)
+
+    monkeypatch.setattr("urllib.request.urlopen", lambda request, timeout: StreamResponse())
+    chunks: list[str] = []
+
+    response = client.chat_stream(
+        messages=[{"role": "user", "content": "find bug"}],
+        thinking=True,
+        reasoning_effort="high",
+        on_reasoning=chunks.append,
+    )
+
+    assert chunks == ["inspect ", "first"]
+    assert response.message["reasoning_content"] == "inspect first"
+    assert response.message["tool_calls"][0]["function"] == {
+        "name": "search_code",
+        "arguments": '{"query":"bug"}',
+    }
+
+
+def test_partial_stream_failure_is_not_replayed(monkeypatch, make_config) -> None:
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
+    client = DeepSeekClient(make_config())
+    calls = 0
+
+    class BrokenStream:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+        def __iter__(self):
+            yield b'data: {"choices":[{"delta":{"reasoning_content":"partial"}}]}\n'
+            raise urllib.error.URLError("connection reset")
+
+    def fake_urlopen(request, timeout):
+        nonlocal calls
+        calls += 1
+        return BrokenStream()
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+
+    with pytest.raises(DeepSeekStreamInterrupted, match="partial output"):
+        client.chat_stream(
+            messages=[{"role": "user", "content": "hard task"}],
+            thinking=True,
+            on_reasoning=lambda _chunk: None,
+        )
+    assert calls == 1

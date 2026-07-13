@@ -3,6 +3,8 @@ from __future__ import annotations
 import atexit
 import os
 import sys
+import threading
+import time
 from pathlib import Path
 
 from . import __version__
@@ -32,13 +34,23 @@ class ConsoleUI:
         *,
         yolo: bool = False,
         super_yolo: bool = False,
+        show_thinking: bool = True,
+        show_reasoning_content: bool = True,
     ) -> None:
         self.project = project
         self.yolo = yolo
         self.super_yolo = super_yolo
+        self.show_thinking = show_thinking
+        self.show_reasoning_content = show_reasoning_content
         self.history_path = data_dir / "cache" / "repl_history"
         self.color = bool(sys.stdout.isatty() and os.environ.get("TERM") != "dumb" and "NO_COLOR" not in os.environ)
         self._readline = self._configure_readline()
+        self._progress_stop = threading.Event()
+        self._progress_thread: threading.Thread | None = None
+        self._progress_started = 0.0
+        self._progress_label = ""
+        self._progress_lock = threading.Lock()
+        self._reasoning_stream_open = False
 
     def banner(self) -> None:
         title = self._style(f"Deep Agent {__version__}", "1;36")
@@ -84,7 +96,110 @@ class ConsoleUI:
         print(self._style(value, "36"))
 
     def working(self) -> None:
-        print(self._style("正在处理请求，请稍候...（按 Ctrl+C 可返回交互界面）", "36"), flush=True)
+        print(self._style("正在处理请求...（按 Ctrl+C 可返回交互界面）", "36"), flush=True)
+        self.start_progress("分析任务并选择执行方式")
+
+    def start_progress(self, label: str) -> None:
+        if not self.show_thinking:
+            return
+        self.stop_progress(clear=False)
+        with self._progress_lock:
+            self._progress_label = label
+            self._progress_started = time.monotonic()
+        self._progress_stop.clear()
+        self._progress_thread = threading.Thread(target=self._progress_loop, name="deep-agent-progress", daemon=True)
+        self._progress_thread.start()
+
+    def update_progress(self, value: dict) -> None:
+        event = str(value.get("event") or "")
+        mode = str(value.get("mode") or "standard")
+        if event == "strategy.selected":
+            strategy = value.get("strategy") if isinstance(value.get("strategy"), dict) else {}
+            label = f"{self._mode_label(mode)}；准备 {strategy.get('max_tool_rounds', 8)} 轮以内的受控执行"
+        elif event == "model.requested":
+            step = value.get("current_step") or "当前任务"
+            label = f"{self._mode_label(mode)}；思考第 {value.get('round')}/{value.get('max_rounds')} 轮；步骤 {step}"
+        elif event == "tool.finished":
+            outcome = "完成" if value.get("success") else "失败，正在调整"
+            label = f"工具 {value.get('tool', 'unknown')} {outcome}"
+        elif event == "thinking.content":
+            if self.show_reasoning_content and bool(value.get("content")):
+                self.show_reasoning(str(value["content"]))
+            return
+        elif event == "thinking.delta":
+            content = str(value.get("content") or "")
+            if self.show_reasoning_content and content:
+                self.show_reasoning_delta(content)
+            return
+        else:
+            return
+        with self._progress_lock:
+            self._progress_label = label
+        self._print_progress_line()
+
+    def show_reasoning(self, content: str) -> None:
+        self._finish_tty_line()
+        text = normalize_unicode_text(content).strip()
+        if not text:
+            return
+        print(self._style("\n  ● DeepSeek Thinking", "1;35"))
+        for line in text.splitlines():
+            print(self._style(f"    {line}", "2;35"))
+        print(flush=True)
+
+    def show_reasoning_delta(self, content: str) -> None:
+        text = normalize_unicode_text(content)
+        if not text:
+            return
+        self._finish_tty_line()
+        if not getattr(self, "_reasoning_stream_open", False):
+            print(self._style("\n  ● DeepSeek Thinking", "1;35"))
+            print("    ", end="")
+            self._reasoning_stream_open = True
+        print(self._style(text, "2;35"), end="", flush=True)
+
+    def stop_progress(self, *, clear: bool = True) -> None:
+        thread = getattr(self, "_progress_thread", None)
+        stop = getattr(self, "_progress_stop", None)
+        if stop is not None:
+            stop.set()
+        if thread and thread is not threading.current_thread():
+            thread.join(timeout=0.2)
+        self._progress_thread = None
+        if getattr(self, "_reasoning_stream_open", False):
+            print()
+            self._reasoning_stream_open = False
+        if clear:
+            self._finish_tty_line()
+
+    def _progress_loop(self) -> None:
+        self._print_progress_line()
+        while not self._progress_stop.wait(1.0):
+            self._print_progress_line()
+
+    def _print_progress_line(self) -> None:
+        with self._progress_lock:
+            elapsed = max(0, int(time.monotonic() - self._progress_started))
+            label = self._progress_label
+        rendered = self._style(f"  ◐ Thinking {elapsed}s · {label}", "35")
+        if sys.stdout.isatty():
+            print(f"\r\033[2K{rendered}", end="", flush=True)
+        elif elapsed == 0 or elapsed % 10 == 0:
+            print(rendered, flush=True)
+
+    @staticmethod
+    def _mode_label(mode: str) -> str:
+        return {
+            "simple": "轻量直答",
+            "standard": "标准工程模式",
+            "large": "大规模分块模式",
+            "deep": "深度任务图模式",
+        }.get(mode, "标准工程模式")
+
+    @staticmethod
+    def _finish_tty_line() -> None:
+        if sys.stdout.isatty():
+            print("\r\033[2K", end="", flush=True)
 
     def error(self, value: str) -> None:
         print(self._style(f"error: {value}", "31"), file=sys.stderr)
@@ -124,6 +239,7 @@ class ConsoleUI:
         self.banner()
 
     def close(self) -> None:
+        self.stop_progress()
         if self._readline is None:
             return
         try:

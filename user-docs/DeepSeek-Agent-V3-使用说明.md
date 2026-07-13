@@ -1,4 +1,4 @@
-# DeepSeek Agent V3 使用说明（0.7.1）
+# DeepSeek Agent V3 使用说明（0.8.0）
 
 更新时间：2026-07-13
 
@@ -55,7 +55,7 @@ chmod 600 ~/.config/deep-agent/secrets.env
 agent doctor --online
 ```
 
-当前验收结果：5/5 Key 可用。程序只显示数量和状态，不输出 Key 内容。
+本次未读取或执行真实 Key 在线验证。用户可运行 `agent doctor --online`，程序只显示数量和状态，不输出 Key 内容。
 
 ## 3. 常用启动方式
 
@@ -81,6 +81,8 @@ agent "分析当前项目并给出修改建议"
 ```
 
 普通任务输入完成后按一次 `Enter` 即提交。终端随后会显示“正在处理请求，请稍候...”，这表示 Agent 已开始调用 DeepSeek 和工具，不再等待继续输入。空回车不会执行任务，会提示正确用法。运行中需要返回交互界面时按 `Ctrl+C`，随后可 `/resume` 继续会话。
+
+0.8.0 提交后还会持续显示 `Thinking` 已用秒数、当前执行模式、模型轮次、Task Graph 当前步骤和工具状态。DeepSeek thinking 模式返回 `reasoning_content` 时会边生成边显示，不再长时间无输出。若流式响应在已经输出部分内容后断开，Agent 不会自动重复请求，以免重复工具调用；它会保存可恢复 Session 并给出 Session ID。
 
 安全模式是默认模式。`--yolo` 自动同意普通工具调用，但仍受路径、危险命令和 sudo 策略保护。`--super-yolo` 绕过 Permission Manager 的硬限制，可允许 sudo、外部路径、特权 Docker 和破坏性命令；操作系统自身的密码和权限检查仍然有效。
 
@@ -143,6 +145,41 @@ permissions:
 - 任务按 Enter 提交后立刻显示“正在处理请求”，避免误以为仍在输入状态。
 - 运行中按 `Ctrl+C` 返回交互界面，可用 `/resume` 继续已检查点保存的会话。
 - 项目根目录识别仅接受有效 Git 元数据，不会再被空 `.git` 占位目录错误劫持。
+
+### 0.8.0：自适应深度执行与可见 Thinking
+
+发布原因：简单问题不应承担复杂任务的成本；大规模文本/代码和困难问题又不能塞进一次无界推理，否则容易超时、静默等待或遗漏范围。
+
+执行模式：
+
+```text
+simple    简单事实问答，关闭 thinking，最多 4 轮
+standard  普通分析/编码，高强度 thinking，默认 8 轮
+large     整仓库/长文档，分块扫描 + Task Graph，最多 16 轮
+deep      审计/重构/根因分析，max thinking，最多 24 轮
+```
+
+模式由本地规则选择，不额外消耗一次 API 请求。`large/deep` 会自动建立 `scope -> inspect-chunks -> implement/synthesize -> verify` 的依赖计划；读取文件、Prompt、工具输出、轮次和可见推理都有上限。短句“继续”恢复时会保留原来的 deep 策略和计划。
+
+配置：
+
+```yaml
+runtime:
+  task_mode: auto       # auto / simple / standard / large / deep
+  adaptive_thinking: true
+  max_tool_rounds: 8
+  max_tool_rounds_hard_limit: 32
+  large_project_source_files: 500
+  large_project_files: 2000
+  show_thinking: true
+
+model:
+  timeout_seconds: 300
+  network_retries: 2
+  retry_base_seconds: 1.0
+```
+
+网络超时、`408` 和临时 `5xx` 会对同一个 Key 做有限指数退避；`401/403/429` 仍切换下一个 Key。
 
 ## 5. 安全文件修改与回滚
 
@@ -277,6 +314,8 @@ daemon:
 
 `queue_enabled` 默认关闭。开启后 Daemon 才会寻找 `pending` Queue，并使用安全的 `--auto-approve` 模式执行。Queue 自带跨进程锁，防止前台与后台重复运行。
 
+单个后台 Queue 的绝对超时由 `daemon.queue_timeout_seconds` 控制，默认 3600 秒，避免任务数过多时无限等待。
+
 ## 10. MCP、HTTP、Browser 与 OCR
 
 MCP 配置：
@@ -327,17 +366,16 @@ agent health --reset
 
 能力状态：Available、Unavailable、Need Config、Disabled、Broken。Unavailable/Broken 能力不会放入模型 Tool Schema 和 Prompt 能力摘要。
 
-当前 0.7.1 验收：
+当前 0.8.0 验收：
 
 ```text
-58 tests passed
+79 tests passed（含真实 PTY）
 Ruff check passed
 Ruff format check passed
 compileall passed
-DeepSeek online check: 5/5 keys ready
-Docker hello-world passed
-Daemon run-once cleanup passed
-All enabled capabilities healthy
+DeepSeek streaming/tool-call assembly passed
+网络重试与部分流禁止重放 passed
+路径、符号链接、Queue 并发、Docker 参数与进程组超时回归 passed
 ```
 
 ## 13. 参考工程取舍
@@ -357,3 +395,19 @@ All enabled capabilities healthy
 5. 为成功、失败、超时、路径越界和缺少依赖添加测试。
 6. 副作用通过 Event Bus 记录，敏感值必须脱敏。
 7. 重型功能默认关闭，配置迁移只增加新默认值，不覆盖用户值。
+
+## 15. 风险与回滚
+
+- `show_thinking` 展示的是 DeepSeek API 返回的 reasoning 内容，可能较长；可在配置中关闭。
+- 已输出部分 reasoning 后的流断线不会自动重放，需要 `/resume`，这是避免重复工具副作用的安全设计。
+- `--super-yolo` 仍会绕过 Permission Manager；普通模式和 `--yolo` 已增加 Docker host/root/socket/device 防护。
+
+回滚到上一版不会删除配置、Memory 或项目数据：
+
+```bash
+cd ~/AI-Agent
+git switch --detach v0.7.1
+.venv/bin/pip install -e .
+```
+
+恢复最新版执行 `git switch main`。0.8.0 的新增配置是 add-only，0.7.1 会忽略不认识的键。

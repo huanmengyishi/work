@@ -111,7 +111,8 @@ class SessionManager:
 
     def list_sessions(self, limit: int = 20) -> list[SessionInfo]:
         items: list[SessionInfo] = []
-        for path in sorted(self.session_dir.glob("*.json"), reverse=True):
+        paths = sorted(self.session_dir.glob("*.json"), key=lambda item: item.stat().st_mtime_ns, reverse=True)
+        for path in paths:
             try:
                 payload = json.loads(path.read_text(encoding="utf-8"))
                 state = payload.get("state") or {}
@@ -159,7 +160,7 @@ class SessionManager:
 
     @staticmethod
     def _atomic_write(path: Path, content: str) -> None:
-        temp = path.with_suffix(path.suffix + ".tmp")
+        temp = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
         temp.write_text(content, encoding="utf-8")
         temp.replace(path)
 

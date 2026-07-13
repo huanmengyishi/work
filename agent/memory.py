@@ -419,22 +419,76 @@ class MemoryStore:
 
     @classmethod
     def _duplicate_groups(cls, items: list[MemoryItem], threshold: float) -> list[list[MemoryItem]]:
-        remaining = sorted(items, key=cls._memory_preference, reverse=True)
+        partitions: dict[tuple[str, str | None], list[MemoryItem]] = {}
+        for item in items:
+            partitions.setdefault((item.kind, item.project_id), []).append(item)
         groups: list[list[MemoryItem]] = []
-        while remaining:
-            keeper = remaining.pop(0)
-            duplicates = [
-                item
-                for item in remaining
-                if keeper.kind == item.kind
-                and keeper.project_id == item.project_id
-                and cls._memory_similarity(keeper, item) >= threshold
-            ]
-            if duplicates:
-                groups.append([keeper, *duplicates])
-                duplicate_ids = {item.id for item in duplicates}
-                remaining = [item for item in remaining if item.id not in duplicate_ids]
+        for candidates in partitions.values():
+            ordered = sorted(candidates, key=cls._memory_preference, reverse=True)
+            item_by_id = {item.id: item for item in ordered}
+            # Small partitions are cheap enough to compare exactly. Larger ones use
+            # character shingles instead of whole-token buckets: this preserves
+            # recall for near-identical identifiers/typos while common prose words
+            # no longer make every record a candidate for every other record.
+            exact_partition = len(ordered) <= 200
+            shingle_sets = {item.id: cls._memory_shingles(item) for item in ordered}
+            inverted: dict[str, set[int]] = {}
+            if not exact_partition:
+                for item in ordered:
+                    for shingle in shingle_sets[item.id]:
+                        inverted.setdefault(shingle, set()).add(item.id)
+            remaining_ids = {item.id for item in ordered}
+            for keeper in ordered:
+                if keeper.id not in remaining_ids:
+                    continue
+                if exact_partition:
+                    candidates_ids = set(remaining_ids)
+                else:
+                    overlap_counts: dict[int, int] = {}
+                    for shingle in shingle_sets[keeper.id]:
+                        for item_id in inverted.get(shingle, ()):
+                            if item_id in remaining_ids and item_id != keeper.id:
+                                overlap_counts[item_id] = overlap_counts.get(item_id, 0) + 1
+                    candidates_ids = {
+                        item_id
+                        for item_id, overlap in overlap_counts.items()
+                        if cls._shingle_candidate(
+                            overlap,
+                            len(shingle_sets[keeper.id]),
+                            len(shingle_sets[item_id]),
+                            threshold,
+                        )
+                    }
+                candidates_ids.discard(keeper.id)
+                duplicates = [
+                    item_by_id[item_id]
+                    for item_id in candidates_ids & remaining_ids
+                    if cls._memory_similarity(keeper, item_by_id[item_id]) >= threshold
+                ]
+                if duplicates:
+                    duplicates.sort(key=cls._memory_preference, reverse=True)
+                    groups.append([keeper, *duplicates])
+                    remaining_ids.difference_update(item.id for item in duplicates)
+                remaining_ids.discard(keeper.id)
         return groups
+
+    @staticmethod
+    def _memory_shingles(item: MemoryItem, size: int = 8) -> set[str]:
+        value = f"{item.title}\n{item.content}".lower()
+        normalized = " ".join("".join(ch if ch.isalnum() else " " for ch in value).split())
+        if len(normalized) <= size:
+            return {normalized} if normalized else set()
+        return {normalized[index : index + size] for index in range(len(normalized) - size + 1)}
+
+    @staticmethod
+    def _shingle_candidate(overlap: int, left_size: int, right_size: int, threshold: float) -> bool:
+        if overlap <= 0 or not left_size or not right_size:
+            return False
+        # SequenceMatcher ratios near the configured duplicate threshold imply
+        # substantial common substrings. A conservative overlap floor keeps those
+        # pairs for exact comparison while discarding incidental shared prose.
+        minimum_ratio = max(0.15, threshold - 0.25)
+        return overlap / min(left_size, right_size) >= minimum_ratio
 
     @staticmethod
     def _parse_timestamp(value: str | None) -> datetime | None:

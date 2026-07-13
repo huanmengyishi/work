@@ -78,6 +78,7 @@ class AgentState:
     git_branch: str | None = None
     context_index_path: str | None = None
     execution_context: ExecutionContext | None = None
+    task_strategy: dict[str, Any] = field(default_factory=dict)
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
     round: int = 0
     turn: int = 1
@@ -144,6 +145,7 @@ class AgentState:
             git_branch=git_branch,
             context_index_path=value.get("context_index_path"),
             execution_context=execution_context,
+            task_strategy=dict(value.get("task_strategy") or {}),
             tool_calls=list(value.get("tool_calls") or []),
             round=int(value.get("round") or 0),
             turn=int(value.get("turn") or 1),

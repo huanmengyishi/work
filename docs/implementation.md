@@ -6,9 +6,9 @@ Deep Agent V3 is a local, project-centric coding Agent powered only by DeepSeek.
 It runs under WSL Ubuntu and can be started from any directory. Program files,
 user configuration, long-term data, and project-local context remain separate.
 
-Version `0.5.0` extends the V3 foundations with correction learning, failure
-recovery, Memory administration, MCP HTTP/SSE/Resources, bounded HTTP access,
-optional semantic indexing, queues, and Git worktree parallelism.
+Version `0.8.0` adds adaptive execution, streamed DeepSeek thinking, bounded
+large-input decomposition, transient model retry, and stronger process/path
+isolation while preserving the capability and permission boundaries.
 
 ## 2. Runtime Architecture
 
@@ -80,6 +80,7 @@ belongs in `agent/runtime.py`. Model-independent state belongs in
   snapshots/<session-id>/
   browser-sessions/<name>/
   downloads/<name>/
+  memory/<kind>/*.md
   .gitignore
 ```
 
@@ -108,6 +109,11 @@ SHA-256: 5ec7002ab0922bc1702470c0d669bff65d3a76607a75e98e34c630882899b056
 11. A terminal event finalizes session files and triggers the idempotent memory
     pipeline.
 
+Before Prompt construction, `TaskStrategySelector` classifies the request
+locally. Simple tasks avoid unnecessary thinking; large/deep tasks receive a
+starter Task Graph, chunked inspection guidance, a larger bounded round budget,
+and high/max DeepSeek reasoning effort. The decision is serialized in AgentState.
+
 ## 5. Agent State, Plans, and Resume
 
 `AgentState` stores project identity, current request, working directory, Git
@@ -121,9 +127,26 @@ agent_update_plan
 agent_update_step
 ```
 
-V3 does not force an extra planning API call for every task. This avoids
-unnecessary latency and cost. Complex tasks are instructed to create and update
-a plan through the same DeepSeek tool loop.
+V3 does not force an extra planning API call for every task. v0.8.0 locally
+creates a starter plan only for large/deep work; the same DeepSeek tool loop
+refines it. Resume keeps the more capable previous strategy, so a short
+“continue” prompt cannot downgrade a deep task.
+
+### Thinking, streaming, and timeout recovery
+
+Thinking uses DeepSeek's OpenAI-compatible `thinking` and `reasoning_effort`
+fields. Tool-calling rounds preserve `reasoning_content` in the assistant
+message as required by DeepSeek. SSE deltas are reassembled by tool-call index.
+
+The terminal shows elapsed time before the first byte. Network timeouts and
+transient 408/5xx responses receive bounded same-key retry. If a stream breaks
+after partial output, it is not replayed because that could duplicate an
+in-flight tool call; the Session is finalized as resumable and its exact ID is
+reported.
+
+Large inputs follow scope -> bounded chunks -> synthesize/implement -> verify.
+Context size, file count, line reads, tool output, model rounds, and displayed
+reasoning are all bounded.
 
 Resume commands:
 

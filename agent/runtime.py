@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Callable
 
 from .config import AppConfig
 from .context import ContextBuilder
-from .deepseek import DeepSeekClient
+from .deepseek import DeepSeekClient, DeepSeekStreamInterrupted
 from .events import EventBus, JsonlEventLogger
 from .memory import MemoryStore
 from .memory_pipeline import MemoryPipeline
@@ -12,6 +12,7 @@ from .project import Project
 from .prompt import PromptBuilder
 from .session import SessionManager
 from .state import AgentState
+from .task_strategy import TaskStrategy, TaskStrategySelector
 from .tools import ToolManager
 from .unicode_text import normalize_unicode_text
 
@@ -29,6 +30,7 @@ class AgentRuntime:
         context_builder: ContextBuilder | None = None,
         prompt_builder: PromptBuilder | None = None,
         sessions: SessionManager | None = None,
+        progress_handler: Callable[[dict[str, Any]], None] | None = None,
     ) -> None:
         self.config = config
         self.project = project
@@ -39,6 +41,8 @@ class AgentRuntime:
         self.context_builder = context_builder or ContextBuilder(config)
         self.prompt_builder = prompt_builder or PromptBuilder()
         self.sessions = sessions or SessionManager(project)
+        self.progress_handler = progress_handler
+        self.strategy_selector = TaskStrategySelector(config)
         self.last_session_id: str | None = None
         self.tools.set_event_bus(self.events)
         if config.get("events.jsonl_log", True):
@@ -75,8 +79,17 @@ class AgentRuntime:
             git_branch=context.git_branch,
             context_index_path=str(context.index_path),
         )
-        if initial_plan:
-            self.tools.plan_manager.replace(state, initial_plan)
+        selected_strategy = self.strategy_selector.select(
+            prompt,
+            source_file_count=int(context.index.get("source_file_count") or 0),
+            file_count=int(context.index.get("file_count") or 0),
+        )
+        previous_strategy = self._strategy_from_state(state) if state.task_strategy else selected_strategy
+        strategy = self._more_capable_strategy(previous_strategy, selected_strategy)
+        state.task_strategy = strategy.to_dict()
+        plan = initial_plan or self.strategy_selector.initial_plan(prompt, strategy)
+        if plan:
+            self.tools.plan_manager.replace(state, plan)
         if state.execution_context:
             state.execution_context.current_queue_id = queue_id
         messages = self.prompt_builder.build_initial(
@@ -86,6 +99,7 @@ class AgentRuntime:
             capability_summary=self.tools.capability_summary(),
         )
         self.last_session_id = state.session_id
+        self._progress("strategy.selected", state, strategy=strategy.to_dict())
         return self._execute(state, messages)
 
     def resume(self, prompt: str, session_id: str | None = None) -> str:
@@ -111,6 +125,16 @@ class AgentRuntime:
             state.execution_context.current_directory = state.working_directory
             state.execution_context.git_branch = context.git_branch
             state.execution_context.prompt_phase = "resumed"
+        selected_strategy = self.strategy_selector.select(
+            prompt,
+            source_file_count=int(context.index.get("source_file_count") or 0),
+            file_count=int(context.index.get("file_count") or 0),
+        )
+        previous_strategy = self._strategy_from_state(state) if state.task_strategy else selected_strategy
+        strategy = self._more_capable_strategy(previous_strategy, selected_strategy)
+        state.task_strategy = strategy.to_dict()
+        if strategy.require_plan and not state.plan:
+            self.tools.plan_manager.replace(state, self.strategy_selector.initial_plan(prompt, strategy))
         messages = self.prompt_builder.append_resume(
             record.messages,
             state=state,
@@ -119,6 +143,7 @@ class AgentRuntime:
             capability_summary=self.tools.capability_summary(),
         )
         self.last_session_id = state.session_id
+        self._progress("strategy.selected", state, strategy=strategy.to_dict())
         return self._execute(state, messages)
 
     def _execute(self, state: AgentState, messages: list[dict[str, Any]]) -> str:
@@ -131,7 +156,8 @@ class AgentRuntime:
             project_id=self.project.id,
             session_id=state.session_id,
         )
-        max_rounds = int(self.config.get("runtime.max_tool_rounds", 8))
+        strategy = self._strategy_from_state(state)
+        max_rounds = strategy.max_tool_rounds
         recovery_injected: set[int] = set()
         try:
             for round_number in range(1, max_rounds + 1):
@@ -143,14 +169,44 @@ class AgentRuntime:
                     project_id=self.project.id,
                     session_id=state.session_id,
                 )
-                response = self.client.chat(
-                    messages=messages,
-                    tools=self.tools.schemas(),
-                    tool_choice="auto",
+                self._progress(
+                    "model.requested",
+                    state,
+                    round=round_number,
+                    max_rounds=max_rounds,
+                    current_step=state.current_step,
                 )
+                chat_kwargs = {
+                    "messages": messages,
+                    "tools": self.tools.schemas(),
+                    "tool_choice": "auto",
+                    "thinking": strategy.thinking_enabled,
+                    "reasoning_effort": strategy.reasoning_effort,
+                }
+                if strategy.thinking_enabled and hasattr(self.client, "chat_stream"):
+                    response = self.client.chat_stream(
+                        **chat_kwargs,
+                        on_reasoning=lambda chunk: self._progress(
+                            "thinking.delta",
+                            state,
+                            round=round_number,
+                            content=chunk,
+                        ),
+                        on_content=None,
+                    )
+                else:
+                    response = self.client.chat(**chat_kwargs)
                 message = response.message
                 messages.append(message)
                 tool_calls = message.get("tool_calls") or []
+                reasoning = str(message.get("reasoning_content") or "").strip()
+                if reasoning and not (strategy.thinking_enabled and hasattr(self.client, "chat_stream")):
+                    self._progress(
+                        "thinking.content",
+                        state,
+                        round=round_number,
+                        content=reasoning[: int(self.config.get("runtime.max_reasoning_display_chars", 4000))],
+                    )
                 self.events.publish(
                     "model.responded",
                     {"run_id": state.run_id, "round": round_number, "tool_call_count": len(tool_calls)},
@@ -170,6 +226,13 @@ class AgentRuntime:
                         str(function.get("name") or ""),
                         function.get("arguments") or "{}",
                         request_id=str(call.get("id") or "") or None,
+                    )
+                    self._progress(
+                        "tool.finished",
+                        state,
+                        tool=request.capability,
+                        success=result.success,
+                        duration_ms=result.duration_ms,
                     )
                     state.record_tool_call(request.to_dict(), result.to_dict())
                     messages.append(
@@ -208,6 +271,13 @@ class AgentRuntime:
             self._publish_terminal("task.failed", state, final=final, error=state.error)
             return final
         except Exception as exc:
+            if isinstance(exc, DeepSeekStreamInterrupted):
+                state.fail(f"resumable interruption: {exc}")
+                if state.execution_context:
+                    state.execution_context.prompt_phase = "interrupted"
+                self.sessions.finalize(state, messages)
+                self._publish_terminal("task.failed", state, error=state.error)
+                raise RuntimeError(f"{exc} Session: {state.session_id}") from exc
             state.fail(str(exc))
             self.sessions.finalize(state, messages)
             self._publish_terminal("task.failed", state, error=str(exc))
@@ -238,3 +308,37 @@ class AgentRuntime:
             project_id=self.project.id,
             session_id=state.session_id,
         )
+
+    def _progress(self, event: str, state: AgentState, **payload: Any) -> None:
+        if self.progress_handler is None:
+            return
+        try:
+            self.progress_handler(
+                {
+                    "event": event,
+                    "session_id": state.session_id,
+                    "mode": (state.task_strategy or {}).get("mode", "standard"),
+                    **payload,
+                }
+            )
+        except Exception:
+            return
+
+    @staticmethod
+    def _strategy_from_state(state: AgentState) -> TaskStrategy:
+        value = state.task_strategy or {}
+        return TaskStrategy(
+            mode=str(value.get("mode") or "standard"),
+            score=int(value.get("score") or 0),
+            reasons=tuple(str(item) for item in value.get("reasons", [])),
+            thinking_enabled=bool(value.get("thinking_enabled", False)),
+            reasoning_effort=str(value.get("reasoning_effort")) if value.get("reasoning_effort") else None,
+            max_tool_rounds=max(1, int(value.get("max_tool_rounds") or 8)),
+            require_plan=bool(value.get("require_plan", False)),
+            chunked_context=bool(value.get("chunked_context", False)),
+        )
+
+    @staticmethod
+    def _more_capable_strategy(previous: TaskStrategy, selected: TaskStrategy) -> TaskStrategy:
+        ranks = {"simple": 0, "standard": 1, "large": 2, "deep": 3}
+        return previous if ranks.get(previous.mode, 1) > ranks.get(selected.mode, 1) else selected

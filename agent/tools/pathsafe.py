@@ -3,7 +3,16 @@ from __future__ import annotations
 from pathlib import Path
 
 
-PRIVATE_AGENT_DIRS = {"cache", "sessions", "snapshots", "browser-sessions"}
+PRIVATE_AGENT_DIRS = {
+    "cache",
+    "sessions",
+    "snapshots",
+    "browser-sessions",
+    "downloads",
+    "queues",
+    "parallel",
+    "memory",
+}
 
 
 def resolve_project_path(

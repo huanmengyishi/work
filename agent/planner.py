@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import warnings
 from typing import Any
 
 from .state import AgentState, PlanStep
@@ -14,6 +15,7 @@ class PlanManager:
 
     def replace(self, state: AgentState, steps: list[str | dict[str, Any]]) -> list[PlanStep]:
         normalized: list[PlanStep] = []
+        used_ids: set[str] = set()
         for index, value in enumerate(steps, start=1):
             if isinstance(value, str):
                 title = value.strip()
@@ -29,7 +31,11 @@ class PlanManager:
                 continue
             if status not in VALID_STEP_STATUSES:
                 status = "pending"
-            step_id = self._step_id(requested_id or f"step-{index}", index)
+            step_id = self._unique_step_id(
+                self._step_id(requested_id or f"step-{index}", index),
+                used_ids,
+            )
+            used_ids.add(step_id)
             dependencies = value.get("dependencies", []) if isinstance(value, dict) else []
             normalized.append(
                 PlanStep(
@@ -47,7 +53,13 @@ class PlanManager:
                 )
             )
 
-        normalized = normalized[:50]
+        if len(normalized) > 50:
+            warnings.warn(
+                f"plan truncated from {len(normalized)} to 50 steps",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            normalized = normalized[:50]
         self._validate_graph(normalized)
         state.plan = normalized
         self._refresh_derived_state(state)
@@ -85,6 +97,18 @@ class PlanManager:
     def _step_id(value: str, index: int) -> str:
         cleaned = re.sub(r"[^a-zA-Z0-9_-]+", "-", value).strip("-")
         return (cleaned or f"step-{index}")[:80]
+
+    @staticmethod
+    def _unique_step_id(value: str, used: set[str]) -> str:
+        if value not in used:
+            return value
+        suffix = 2
+        while True:
+            marker = f"-{suffix}"
+            candidate = value[: 80 - len(marker)].rstrip("-") + marker
+            if candidate not in used:
+                return candidate
+            suffix += 1
 
     @staticmethod
     def _refresh_derived_state(state: AgentState) -> None:

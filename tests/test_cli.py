@@ -1,6 +1,11 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+import os
+import pty
+import select
+import subprocess
+import time
 from pathlib import Path
 
 from agent import cli
@@ -40,3 +45,49 @@ def test_default_config_initialization_is_concurrency_safe(tmp_path: Path, monke
 
     assert results == [None] * 24
     assert (tmp_path / "config" / "deep-agent" / "config.yaml").is_file()
+
+
+def test_real_pty_enter_help_and_exit(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    master, slave = pty.openpty()
+    env = {
+        **os.environ,
+        "XDG_CONFIG_HOME": str(tmp_path / "config"),
+        "XDG_DATA_HOME": str(tmp_path / "data"),
+        "TERM": "xterm-256color",
+        "PYTHONPATH": str(Path(__file__).resolve().parents[1]),
+    }
+    process = subprocess.Popen(
+        [str(Path(__file__).resolve().parents[1] / ".venv" / "bin" / "python"), "-m", "agent"],
+        cwd=project,
+        stdin=slave,
+        stdout=slave,
+        stderr=slave,
+        env=env,
+        close_fds=True,
+    )
+    os.close(slave)
+    output = bytearray()
+
+    def read_until(needle: bytes, timeout: float = 8.0) -> None:
+        deadline = time.monotonic() + timeout
+        while needle not in output and time.monotonic() < deadline:
+            ready, _, _ = select.select([master], [], [], 0.2)
+            if ready:
+                output.extend(os.read(master, 4096))
+        assert needle in output, output.decode("utf-8", errors="replace")
+
+    try:
+        read_until(b"> ")
+        os.write(master, b"\r")
+        read_until("未输入请求".encode())
+        os.write(master, b"/help\r")
+        read_until(b"Interactive commands:")
+        os.write(master, b"/exit\r")
+        assert process.wait(timeout=8) == 0
+    finally:
+        if process.poll() is None:
+            process.terminate()
+            process.wait(timeout=5)
+        os.close(master)

@@ -121,6 +121,8 @@ class ContextBuilder:
                 if self._ignored(rel, patterns, is_dir=False):
                     continue
                 path = current_path / name
+                if path.is_symlink():
+                    continue
                 try:
                     stat = path.stat()
                 except OSError:
@@ -218,6 +220,7 @@ class ContextBuilder:
         symbol_lines = [
             f"- `{item.get('path')}:{item.get('line')}` {item.get('kind')} `{item.get('name')}`"
             for item in symbols[:100]
+            if isinstance(item, dict) and item.get("path") and item.get("kind") and item.get("name")
         ]
         sections.extend(
             [
@@ -448,6 +451,8 @@ class ContextBuilder:
         return list(dict.fromkeys(expanded))
 
     def _extract_symbols(self, path: Path, relative: str) -> list[dict[str, Any]]:
+        if path.is_symlink():
+            return []
         try:
             source = path.read_text(encoding="utf-8", errors="replace")
         except OSError:
@@ -552,12 +557,28 @@ class ContextBuilder:
 
 
 def read_git_branch(root: Path) -> str | None:
-    head = root / ".git" / "HEAD"
+    marker = root / ".git"
+    git_dir = marker
+    if marker.is_file():
+        try:
+            value = marker.read_text(encoding="utf-8", errors="replace").strip()
+        except OSError:
+            return None
+        if not value.lower().startswith("gitdir:"):
+            return None
+        target = value.split(":", 1)[1].strip()
+        git_dir = (root / target).resolve() if not Path(target).is_absolute() else Path(target)
+    head = git_dir / "HEAD"
     if not head.is_file():
         return None
     try:
         value = head.read_text(encoding="utf-8", errors="replace").strip()
     except OSError:
         return None
-    prefix = "ref: refs/heads/"
-    return value[len(prefix) :] if value.startswith(prefix) else value[:12] or None
+    if not value:
+        return None
+    prefix = "ref: "
+    if value.startswith(prefix):
+        ref = value[len(prefix) :]
+        return ref.removeprefix("refs/heads/")
+    return value[:12]

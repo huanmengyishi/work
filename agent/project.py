@@ -132,7 +132,10 @@ class ProjectManager:
 
     def _find_existing_root(self, start: Path) -> Path | None:
         for current in (start, *start.parents):
-            if (current / self.agent_dir_name).is_dir():
+            marker = current / self.agent_dir_name
+            if marker.is_symlink():
+                continue
+            if marker.is_dir():
                 return current
         return None
 
@@ -155,6 +158,10 @@ class ProjectManager:
 
     def _ensure_project(self, root: Path) -> Project:
         agent_dir = root / self.agent_dir_name
+        if agent_dir.is_symlink():
+            raise ValueError(f"project Agent directory must not be a symbolic link: {agent_dir}")
+        if agent_dir.exists() and not agent_dir.is_dir():
+            raise ValueError(f"project Agent path is not a directory: {agent_dir}")
         config_path = agent_dir / "project.yaml"
         context_path = agent_dir / "context.md"
         created = not agent_dir.exists()
@@ -169,6 +176,10 @@ class ProjectManager:
             "parallel",
         ):
             private_dir = agent_dir / private_name
+            if private_dir.is_symlink():
+                raise ValueError(f"private Agent directory must not be a symbolic link: {private_dir}")
+            if private_dir.exists() and not private_dir.is_dir():
+                raise ValueError(f"private Agent path is not a directory: {private_dir}")
             private_dir.mkdir(exist_ok=True)
             try:
                 private_dir.chmod(0o700)
@@ -297,6 +308,7 @@ class ProjectManager:
             "downloads/",
             "queues/",
             "parallel/",
+            "memory/",
             "index.json",
             "index.semantic.json",
             "workspace_memory.json",

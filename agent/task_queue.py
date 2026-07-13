@@ -74,6 +74,10 @@ class TaskQueueManager:
             lock.close()
             raise RuntimeError(f"queue is already running: {record.id}") from None
         try:
+            # Another process may have completed tasks after this caller loaded its
+            # snapshot but before it acquired the lock. Always continue from disk.
+            caller_record = record
+            record = self.load(record.id)
             record.status = "running"
             self.save(record)
             for task in record.tasks:
@@ -107,9 +111,11 @@ class TaskQueueManager:
                 if task.status == "failed" and stop_on_failure:
                     record.status = "paused"
                     self.save(record)
+                    self._copy_record(record, caller_record)
                     return record
             record.status = "completed" if all(task.status == "completed" for task in record.tasks) else "paused"
             self.save(record)
+            self._copy_record(record, caller_record)
             return record
         finally:
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
@@ -118,7 +124,7 @@ class TaskQueueManager:
     def save(self, record: QueueRecord) -> Path:
         record.updated_at = utc_now_iso()
         path = self._path(record.id)
-        temp = path.with_suffix(".json.tmp")
+        temp = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
         temp.write_text(json.dumps(record.to_dict(), ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         temp.replace(path)
         return path
@@ -129,6 +135,7 @@ class TaskQueueManager:
             if not records:
                 raise FileNotFoundError("no saved queue is available")
             return records[0]
+        self._validate_id(queue_id)
         matches = sorted(self.queue_dir.glob(f"{queue_id}*.json"))
         if len(matches) != 1:
             if not matches:
@@ -138,7 +145,8 @@ class TaskQueueManager:
 
     def list(self, limit: int = 20) -> list[QueueRecord]:
         records: list[QueueRecord] = []
-        for path in sorted(self.queue_dir.glob("*.json"), reverse=True):
+        paths = sorted(self.queue_dir.glob("*.json"), key=lambda item: item.stat().st_mtime_ns, reverse=True)
+        for path in paths:
             try:
                 records.append(self._read(path))
             except (OSError, ValueError, TypeError, json.JSONDecodeError):
@@ -173,8 +181,20 @@ class TaskQueueManager:
         )
 
     def _path(self, queue_id: str) -> Path:
+        self._validate_id(queue_id)
+        return self.queue_dir / f"{queue_id}.json"
+
+    @staticmethod
+    def _validate_id(queue_id: str) -> None:
         if not queue_id or any(
             ch not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_" for ch in queue_id
         ):
             raise ValueError("invalid queue id")
-        return self.queue_dir / f"{queue_id}.json"
+
+    @staticmethod
+    def _copy_record(source: QueueRecord, target: QueueRecord) -> None:
+        if source is target:
+            return
+        target.status = source.status
+        target.tasks = source.tasks
+        target.updated_at = source.updated_at

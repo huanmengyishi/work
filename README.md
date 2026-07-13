@@ -3,10 +3,10 @@
 Project-centric DeepSeek CLI agent for WSL. The Agent is installed as a tool;
 the directory where `agent` is started is the workspace.
 
-Current version: `0.7.1`. The runtime includes correction learning, failure
-recovery, Memory administration, MCP stdio/HTTP/SSE and Resources, bounded HTTP
-access, optional Tree-sitter indexing, resumable task queues, and threshold-gated
-Git worktree parallelism in addition to safe editing and browser persistence.
+Current version: `0.8.0`. The runtime chooses a bounded execution mode for each
+request: lightweight direct answer, standard engineering, large-scale chunked
+inspection, or deep dependency-aware execution. DeepSeek thinking can stream to
+the terminal with elapsed time, current plan step, and tool progress.
 
 Version `0.7.0` adds bounded Python/JavaScript/TypeScript diagnostics, richer
 Tree-sitter module and import relationships, Memory lifecycle maintenance,
@@ -20,6 +20,13 @@ and Enter submission are calculated correctly. Empty input gives explicit
 feedback, and a visible processing message appears immediately after a request
 is submitted. Project discovery now also requires valid Git metadata instead of
 treating an arbitrary empty `.git` directory as a repository root.
+
+Version `0.8.0` adds adaptive task strategy and large-input handling. Simple
+questions stay on a four-round lightweight path. Standard tasks keep the normal
+eight-round tool loop. Repository-wide or long-document requests use bounded
+chunks, an explicit Task Graph, 16 rounds, and DeepSeek `high` thinking. Deep
+audits/refactors use `max` effort and up to 24 rounds. Mode and limits are stored
+in AgentState, so a short `/resume` cannot downgrade an active deep task.
 
 ## Quick Start
 
@@ -44,8 +51,9 @@ agent "summarize this project"
 
 English commas (`,`) and Chinese commas (`，`) are both supported. Whitespace,
 empty values, and duplicate keys are ignored. On HTTP `401`, `403`, or `429`,
-the current request retries the next key; network and other server errors are
-not retried with another key. `agent doctor --online` validates every key and
+the current request retries the next key. Transient network, timeout, `408`, and
+`5xx` failures retry the same key with bounded exponential backoff.
+`agent doctor --online` validates every key and
 reports only counts and status codes, never key values. A value in
 `secrets.env` takes priority over a legacy shell value.
 
@@ -59,7 +67,7 @@ reports only counts and status codes, never key values. A value in
 ```
 
 Project-private runtime data is stored under `snapshots/`, `browser-sessions/`,
-and `downloads/`. `.project-agent/.gitignore` prevents those paths from being
+`downloads/`, and `memory/`. `.project-agent/.gitignore` prevents those paths from being
 committed. On Linux filesystems the private directories use mode `700`; WSL
 DrvFS mounts such as `/mnt/d` may display `777` unless metadata mounting is
 enabled.
@@ -93,6 +101,7 @@ Implemented V3 modules:
 - `EventBus`: decoupled runtime, logging, and memory events.
 - `MemoryPipeline`: idempotent Summary and Lesson/Bug/Decision persistence.
 - `PlanManager`: model-maintained plans without an extra mandatory model request.
+- `TaskStrategySelector`: local simple/standard/large/deep routing with bounded budgets.
 
 ## Commands
 
@@ -135,11 +144,41 @@ Interactive-only commands: `/new`, `/resume [session-id]`, `/sessions`,
 `/exit`. History is stored with mode `600` at
 `~/.local/share/deep-agent/cache/repl_history`.
 
-Press `Enter` once to submit a request. After submission the CLI prints a
-processing message while DeepSeek and tools run; it is no longer waiting for
-more input. An empty `Enter` keeps the session open and explains how to submit
-a task. `Ctrl+C` returns to the interactive prompt and the checkpointed Session
-can be continued with `/resume`.
+Press `Enter` once to submit a request. The CLI then shows elapsed `Thinking`
+time, selected mode, model round, current plan step, and tool status. DeepSeek
+`reasoning_content` streams under `DeepSeek Thinking`, so long requests do not
+leave the terminal silent. An empty `Enter` keeps the session open and explains
+how to submit a task. `Ctrl+C` returns to the prompt; use `/resume` to continue.
+
+## Adaptive Execution Modes
+
+```text
+simple    short factual question; thinking off; up to 4 rounds
+standard  normal coding/analysis; high thinking; configured 8 rounds
+large     repository/long document; chunked Task Graph; 16 rounds
+deep      audit/refactor/root cause; max effort; 24 rounds
+```
+
+Classification is local and consumes no extra API request. Optional overrides
+in `~/.config/deep-agent/config.yaml`:
+
+```yaml
+runtime:
+  task_mode: auto       # auto | simple | standard | large | deep
+  adaptive_thinking: true
+  max_tool_rounds: 8
+  max_tool_rounds_hard_limit: 32
+  large_project_source_files: 500
+  large_project_files: 2000
+
+model:
+  timeout_seconds: 300
+  network_retries: 2
+  retry_base_seconds: 1.0
+```
+
+Large text/code follows scope -> bounded chunks -> synthesize/implement ->
+verify. The Agent does not load an entire repository into one unbounded Prompt.
 
 Approval modes:
 
@@ -219,6 +258,7 @@ daemon:
   poll_interval_seconds: 10
   memory_maintenance_seconds: 3600
   queue_enabled: false
+  queue_timeout_seconds: 3600
 ```
 
 Use `agent daemon status` and `agent daemon stop`. Runtime files are stored in
@@ -245,7 +285,21 @@ cd ~/AI-Agent
 .venv/bin/python -m pytest
 .venv/bin/ruff check agent tests scripts
 .venv/bin/ruff format --check agent tests scripts
+.venv/bin/python -m compileall -q agent tests scripts
 ```
+
+Current v0.8.0 baseline: 79 pytest cases, including a real PTY smoke test.
 
 See `docs/implementation.md` for architecture, extension rules, Docker proxy,
 OCR, memory, and maintenance details.
+
+## Rollback
+
+```bash
+cd ~/AI-Agent
+git switch --detach v0.7.1
+.venv/bin/pip install -e .
+```
+
+Return with `git switch main`. v0.8.0 config migration is add-only; v0.7.1
+ignores the new keys.

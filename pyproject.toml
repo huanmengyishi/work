@@ -1,6 +1,6 @@
 [project]
 name = "deep-agent"
-version = "0.7.1"
+version = "0.8.0"
 description = "Local CLI AI agent runtime powered by DeepSeek."
 requires-python = ">=3.11"
 dependencies = [

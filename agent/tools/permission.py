@@ -98,9 +98,20 @@ class PermissionManager:
     @staticmethod
     def _check_docker(args: Any) -> PermissionDecision:
         values = [str(item) for item in args] if isinstance(args, list) else []
-        if "--privileged" in values:
+        normalized = " ".join(values)
+        if any(value == "--privileged" or value.startswith("--privileged=") for value in values):
             return PermissionDecision(False, "docker --privileged is denied by default")
-        mounts = " ".join(values)
-        if re.search(r"(?:^|\s)(?:-v|--volume)(?:=|\s+)/:/", mounts):
+        if re.search(r"(?:^|\s)(?:-v|--volume)(?:=|\s+)/(?:[:]|$)", normalized):
             return PermissionDecision(False, "mounting the host root into Docker is denied by default")
+        if re.search(r"(?:^|\s)--mount(?:=|\s+)[^\s]*(?:src|source)=/(?:,|$)", normalized, re.IGNORECASE):
+            return PermissionDecision(False, "mounting the host root into Docker is denied by default")
+        if any(
+            value in {"--pid=host", "--network=host", "--ipc=host", "--uts=host"}
+            or value.startswith("--device=")
+            or value == "--device"
+            for value in values
+        ):
+            return PermissionDecision(False, "Docker host namespace or device access is denied by default")
+        if any("/var/run/docker.sock" in value for value in values):
+            return PermissionDecision(False, "mounting the Docker socket is denied by default")
         return PermissionDecision(True)

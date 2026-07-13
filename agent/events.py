@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -60,6 +62,10 @@ class JsonlEventLogger:
     def __init__(self, log_dir: Path | None = None) -> None:
         self.log_dir = log_dir or paths.logs_dir()
         self.log_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            self.log_dir.chmod(0o700)
+        except OSError:
+            pass
 
     def __call__(self, event: Event) -> None:
         day = event.timestamp[:10]
@@ -74,6 +80,10 @@ class JsonlEventLogger:
         }
         with path.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
 
 
 def sanitize_for_log(value: Any, *, depth: int = 0) -> Any:
@@ -103,7 +113,22 @@ def sanitize_for_log(value: Any, *, depth: int = 0) -> Any:
     if isinstance(value, (list, tuple)):
         return [sanitize_for_log(item, depth=depth + 1) for item in value[:50]]
     if isinstance(value, str):
-        return value if len(value) <= 2000 else value[:2000] + "...[truncated]"
+        redacted = _redact_secret_patterns(value)
+        return redacted if len(redacted) <= 2000 else redacted[:2000] + "...[truncated]"
     if value is None or isinstance(value, (int, float, bool)):
         return value
-    return str(value)
+    return _redact_secret_patterns(str(value))
+
+
+_SECRET_PATTERNS = (
+    re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/-]{8,}"),
+    re.compile(r"\bsk-[A-Za-z0-9_-]{8,}\b"),
+    re.compile(r"(?i)\b(DEEPSEEK_API_KEY|API_KEY|ACCESS_TOKEN|REFRESH_TOKEN)\s*[=:]\s*[^\s,;]+"),
+)
+
+
+def _redact_secret_patterns(value: str) -> str:
+    redacted = value
+    for pattern in _SECRET_PATTERNS:
+        redacted = pattern.sub("[redacted]", redacted)
+    return redacted

@@ -1,6 +1,70 @@
-# DeepSeek Agent V3 工作日志（0.7.1）
+# DeepSeek Agent V3 工作日志（0.8.0）
 
 日期：2026-07-13
+
+## 0.8.0 自适应深度执行工作
+
+### 目标
+
+逐条复核 `analysis-20260713`，修复全部能够复现的问题；同时解决困难问题思考超时、长时间无可见输出，以及大规模文本/代码不能分块处理的问题。参考 `https://gitee.com/free/claude-code` 的 Task、Thinking、Compact、Resume 思路，但保持 DeepSeek 唯一模型和现有权限架构。
+
+### 根因
+
+1. 所有请求共用同一个 8 轮策略，简单问题浪费、复杂问题预算不足。
+2. 复杂任务只依赖 Prompt 要求模型自行规划，首次长推理仍可能超时。
+3. 非流式请求在首字节前没有持续进度，用户误以为程序卡死。
+4. 网络瞬断与临时 5xx 零重试；流式部分输出若盲目重放可能重复工具副作用。
+5. 旧审查报告包含过时或误报项，同时遗漏私有 Memory、符号链接、Queue 路径穿越、Docker 参数绕过和进程组孤儿等真实问题。
+
+### 实现
+
+- 新建 `agent/task_strategy.py`，本地选择 simple/standard/large/deep。
+- large/deep 自动建立有依赖、有完成标准、有重试次数的 starter Task Graph。
+- DeepSeek thinking 按任务选择 disabled/high/max，SSE 流式重组 reasoning/content/tool calls。
+- Console 显示 elapsed Thinking、模式、轮次、当前步骤、工具状态和 reasoning delta。
+- 网络超时、408、500/502/503/504 做有限指数退避；认证/限流切 Key。
+- 部分流中断禁止自动重放，Session 标记 interrupted/resumable 并报告准确 ID。
+- Resume 继承更强的原策略和计划，不被短续写降级。
+- Planner 修复 ID 清理冲突，超过 50 步时显式警告。
+- Daemon Queue 加绝对超时；Shell 超时终止整个进程组。
+- 修复 worktree Git branch、TSX 默认语义索引、损坏 symbol 的 None 渲染。
+- Memory 候选倒排索引降低去重比较量，同时保留前缀不同的相似记录召回。
+- JSONL 内容正则脱敏，日志目录/文件使用 700/600。
+- `.project-agent/memory/` 加入 ignore 和私有路径；拒绝 Agent 目录/源码符号链接逃逸。
+- Queue ID 先校验、锁内重载 canonical 状态、唯一临时文件、按 mtime 选最新。
+- 普通/YOLO 模式拒绝 Docker root、socket、device 和 host namespace 访问。
+- 新增 GitHub Actions Python 3.11/3.12/3.13 矩阵，自动执行 Ruff、pytest 和 compileall。
+
+### 审查结论
+
+已确认并修复：C-002、C-003、C-004、C-005、C-007、C-008、S-002、T-006，以及审查未列出的 TSX、Memory 私有边界、symlink、Queue traversal/stale load、Docker 变体、子进程超时问题。
+
+不处理的旧结论：`docs/releases/` 实际已存在；React 检测和 secrets.env 引号内 `=` 已修；当前目录本来就是文档入口，不应单独初始化为第二套源码仓库；parallel 的 8 任务阈值是明确架构策略；代码/用户文档中英分工不是运行缺陷；LICENSE 需要用户选择法律许可，不能替用户假定。
+
+### 测试
+
+```text
+79 tests passed
+Ruff check passed
+Ruff format check passed
+compileall passed
+真实 PTY：空 Enter、/help、/exit passed
+DeepSeek SSE reasoning/tool call assembly passed
+超时 retry、partial stream no replay passed
+symlink/traversal/Queue stale state/Docker escape/process group passed
+Memory 1200 条候选性能回归 passed
+```
+
+### 版本与发布
+
+版本升级为 `v0.8.0`（新能力使用 minor 版本）。源码 README、实现说明、`docs/releases/v0.8.0.md`、用户 README、工作日志和 Word 文档同步更新。提交哈希、tag 和远端验证结果在发布完成后补入本节。
+
+### 下一步
+
+- 为 Parallel worker 增加按任务/全局超时与保留失败 worktree 策略。
+- 为 MCP 分页增加重复 cursor 熔断、总页数/总响应字节上限。
+- 将 Session 同记录并发写从唯一 temp 进一步提升为 record lock/CAS。
+- 若用户选择许可证，再增加 LICENSE；许可证属于法律授权，不自动假设。
 
 ## 一、工作目标
 

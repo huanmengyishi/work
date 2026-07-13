@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import subprocess
+import time
 
 from agent.memory import MemoryStore
 from agent.project import ProjectManager
@@ -81,6 +82,23 @@ def test_yolo_and_super_yolo_permission_levels(tmp_path: Path, make_config) -> N
     decision = super_yolo.permission.evaluate(request, capability, super_yolo=True)
     assert decision.allowed is True
     assert "SUPER YOLO" in decision.reason
+
+
+def test_yolo_denies_docker_host_escape_variants(tmp_path: Path, make_config) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    _, _, _, tools = build_manager(root, make_config, yolo=True)
+    capability, _ = tools.registry.resolve("docker.run")
+    assert capability is not None
+    denied = (
+        ["run", "--mount", "type=bind,src=/,dst=/host", "alpine"],
+        ["run", "--pid=host", "alpine"],
+        ["run", "-v=/var/run/docker.sock:/var/run/docker.sock", "alpine"],
+        ["run", "--device=/dev/sda", "alpine"],
+    )
+    for args in denied:
+        request = tools.registry.request("docker.run", {"args": args})
+        assert tools.permission.evaluate(request, capability).allowed is False
 
 
 def test_auto_approve_does_not_approve_shell(tmp_path: Path, make_config) -> None:
@@ -170,3 +188,18 @@ def test_git_tool_in_repository(tmp_path: Path, make_config) -> None:
 
     assert result.success is True
     assert "example.txt" in result.stdout
+
+
+def test_shell_timeout_kills_child_process_group(tmp_path: Path, make_config) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    _, _, _, tools = build_manager(root, make_config, yolo=True)
+    marker = root / "orphan.txt"
+    command = f"(sleep 2; printf orphan > {marker}) & wait"
+
+    _, result = tools.execute_model_call("shell_run", {"command": command, "timeout": 1})
+    time.sleep(2.2)
+
+    assert result.success is False
+    assert "timeout" in result.stderr
+    assert not marker.exists()

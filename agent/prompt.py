@@ -17,6 +17,9 @@ Operating rules:
 - Inspect relevant files and verify changes before claiming completion.
 - For multi-step tasks, first publish a dependency-aware Task Graph with agent_update_plan. Include completion
   criteria, retries, and allow_parallel only when justified. Start only steps whose dependencies are complete.
+- Follow the selected execution mode. Simple mode should answer directly when tools are unnecessary. Large/deep
+  modes must first decompose the request into bounded, dependency-aware steps, inspect in chunks, and checkpoint
+  after each completed step. Never try to solve a repository-wide task in one unbounded reasoning pass.
 - Keep durable project facts in .project-agent/context.md only when they will matter in future sessions.
 - Store reusable lessons, bugs, decisions, or knowledge through memory_add when the information is genuinely durable.
 - If the user explicitly corrects or rejects an earlier answer, behavior, path, port, API, or fact in this
@@ -86,6 +89,7 @@ class PromptBuilder:
         capability_summary: str,
     ) -> str:
         execution = state.execution_context
+        strategy = state.task_strategy or {}
         plan_lines = [
             f"- `{step.id}` {step.status}; deps={','.join(step.dependencies) or '-'}; "
             f"retries={step.retry_count}/{step.max_retries}; parallel={str(step.allow_parallel).lower()}; "
@@ -113,7 +117,12 @@ class PromptBuilder:
                 f"- Session: `{state.session_id}`\n"
                 f"- Turn: `{state.turn}`\n"
                 f"- Working directory: `{state.working_directory}`\n"
-                f"- Git branch: `{state.git_branch or 'not detected'}`",
+                f"- Git branch: `{state.git_branch or 'not detected'}`\n"
+                f"- Execution mode: `{strategy.get('mode', 'standard')}`\n"
+                f"- Thinking: `{str(bool(strategy.get('thinking_enabled', False))).lower()}`\n"
+                f"- Reasoning effort: `{strategy.get('reasoning_effort') or 'default'}`\n"
+                f"- Chunked context: `{str(bool(strategy.get('chunked_context', False))).lower()}`\n"
+                f"- Plan required: `{str(bool(strategy.get('require_plan', False))).lower()}`",
                 "## Task Graph\n\n" + "\n".join(plan_lines or ["No task graph has been published."]),
                 "## Execution Context\n\n" + "\n".join(execution_lines),
                 context.rendered,

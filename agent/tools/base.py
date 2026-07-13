@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import signal
 import subprocess
 import time
 from dataclasses import asdict, dataclass, field, replace
@@ -81,33 +83,45 @@ def run_command(
 ) -> ToolResult:
     started = time.monotonic()
     try:
-        completed = subprocess.run(
+        process = subprocess.Popen(
             args if not shell else " ".join(args),
             cwd=str(cwd),
-            input=input_text,
+            stdin=subprocess.PIPE if input_text is not None else subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            capture_output=True,
-            timeout=timeout,
             shell=shell,
-            check=False,
             env=env,
+            start_new_session=True,
         )
     except FileNotFoundError as exc:
         return ToolResult(False, "", f"command not found: {exc}", duration_ms=elapsed_ms(started))
+    try:
+        output, error = process.communicate(input=input_text, timeout=timeout)
     except subprocess.TimeoutExpired as exc:
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+            output, error = process.communicate(timeout=2)
+        except (ProcessLookupError, subprocess.TimeoutExpired):
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            output, error = process.communicate()
+        partial_stdout = exc.stdout if isinstance(exc.stdout, str) else output or ""
         return ToolResult(
             False,
-            (exc.stdout or "") if isinstance(exc.stdout, str) else "",
+            partial_stdout.strip(),
             f"timeout after {timeout}s",
             duration_ms=elapsed_ms(started),
         )
-    output = completed.stdout or ""
-    error = completed.stderr or ""
+    output = output or ""
+    error = error or ""
     return ToolResult(
-        completed.returncode == 0,
+        process.returncode == 0,
         output.strip(),
         error.strip(),
-        {"returncode": completed.returncode, "args": args},
+        {"returncode": process.returncode, "args": args},
         elapsed_ms(started),
     )
 

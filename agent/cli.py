@@ -754,7 +754,14 @@ def repl(
     super_yolo: bool = False,
 ) -> int:
     project, memory = prepare_project(config)
-    ui = ConsoleUI(project, config.data_dir, yolo=yolo, super_yolo=super_yolo)
+    ui = ConsoleUI(
+        project,
+        config.data_dir,
+        yolo=yolo,
+        super_yolo=super_yolo,
+        show_thinking=bool(config.get("runtime.show_thinking", True)),
+        show_reasoning_content=bool(config.get("runtime.show_reasoning_content", True)),
+    )
     runtime = build_runtime(
         config,
         project,
@@ -763,6 +770,7 @@ def repl(
         auto_approve=auto_approve,
         yolo=yolo,
         super_yolo=super_yolo,
+        progress_handler=ui.update_progress,
     )
     active_session: str | None = None
     ui.banner()
@@ -857,11 +865,14 @@ def repl(
             else:
                 answer = runtime.run(prompt)
                 active_session = runtime.last_session_id
+            ui.stop_progress()
             ui.answer(answer)
         except KeyboardInterrupt:
+            ui.stop_progress()
             active_session = runtime.last_session_id or active_session
             ui.info("请求已中断。可使用 /resume 继续当前会话，或使用 /new 开始新会话。")
         except Exception as exc:
+            ui.stop_progress()
             ui.error(str(exc))
 
 
@@ -916,6 +927,7 @@ def build_runtime(
     auto_approve: bool = False,
     yolo: bool = False,
     super_yolo: bool = False,
+    progress_handler=None,
 ) -> AgentRuntime:
     tools = ToolManager(
         config,
@@ -926,7 +938,13 @@ def build_runtime(
         yolo=yolo,
         super_yolo=super_yolo,
     )
-    return AgentRuntime(config=config, project=project, memory=memory, tools=tools)
+    return AgentRuntime(
+        config=config,
+        project=project,
+        memory=memory,
+        tools=tools,
+        progress_handler=progress_handler,
+    )
 
 
 def which(command: str) -> str:

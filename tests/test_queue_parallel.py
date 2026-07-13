@@ -40,6 +40,25 @@ def test_task_queue_resume_skips_completed_tasks(tmp_path: Path, make_config) ->
     assert calls == ["one", "two", "two", "three"]
 
 
+def test_queue_rejects_traversal_and_reloads_after_lock(tmp_path: Path, make_config) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    project = ProjectManager(make_config()).resolve_project(root)
+    queues = TaskQueueManager(project)
+    stale = queues.create(["one"])
+    with pytest.raises(ValueError, match="invalid queue id"):
+        queues.load("../escape")
+
+    canonical = queues.load(stale.id)
+    canonical.tasks[0].status = "completed"
+    canonical.status = "completed"
+    queues.save(canonical)
+    calls: list[str] = []
+    result = queues.run(stale, lambda task, record: (calls.append(task.prompt) or "ok", None, "completed"))
+    assert calls == []
+    assert result.status == "completed"
+
+
 def test_parallel_threshold_dirty_guard_and_patch_merge(tmp_path: Path, make_config, monkeypatch) -> None:
     root = tmp_path / "project"
     root.mkdir()
