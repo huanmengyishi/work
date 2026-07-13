@@ -7,6 +7,7 @@ from .config import AppConfig
 from .events import Event, EventBus
 from .memory import MemoryStore
 from .project import Project
+from .reflection import ReflectionEngine
 
 
 class MemoryPipeline:
@@ -24,6 +25,7 @@ class MemoryPipeline:
         self.project = project
         self.memory = memory
         self.events = events
+        self.reflection = ReflectionEngine(config)
         events.subscribe("task.finished", self.handle)
         events.subscribe("task.failed", self.handle)
 
@@ -81,6 +83,35 @@ class MemoryPipeline:
             self.events.publish(
                 "memory.experience.persisted",
                 {"memory_id": experience_id, "kind": kind, "run_id": run_id},
+                project_id=self.project.id,
+                session_id=session_id,
+            )
+
+        reflection = self.reflection.reflect(
+            prompt=prompt,
+            final=final,
+            error=error,
+            tool_calls=tool_calls,
+            success=success,
+        )
+        if reflection:
+            reflection_id = self.memory.add_memory(
+                kind="Reflection",
+                title=f"Reflection: {self._title(prompt)}",
+                content=reflection,
+                tags=["reflection", "automatic", "success" if success else "failed"],
+                project_id=self.project.id,
+            )
+            self.memory.persist_lesson_file(
+                kind="Reflection",
+                title=f"Reflection: {self._title(prompt)}",
+                content=reflection,
+                project=self.project,
+                global_memory=False,
+            )
+            self.events.publish(
+                "memory.reflection.persisted",
+                {"memory_id": reflection_id, "run_id": run_id},
                 project_id=self.project.id,
                 session_id=session_id,
             )

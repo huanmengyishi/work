@@ -50,7 +50,13 @@ class AgentRuntime:
             events=self.events,
         )
 
-    def run(self, prompt: str) -> str:
+    def run(
+        self,
+        prompt: str,
+        *,
+        initial_plan: list[str | dict[str, Any]] | None = None,
+        queue_id: str | None = None,
+    ) -> str:
         prompt = normalize_unicode_text(prompt).strip()
         if not prompt:
             raise ValueError("prompt must not be empty")
@@ -65,6 +71,10 @@ class AgentRuntime:
             git_branch=context.git_branch,
             context_index_path=str(context.index_path),
         )
+        if initial_plan:
+            self.tools.plan_manager.replace(state, initial_plan)
+        if state.execution_context:
+            state.execution_context.current_queue_id = queue_id
         messages = self.prompt_builder.build_initial(
             state=state,
             context=context,
@@ -89,6 +99,10 @@ class AgentRuntime:
         state.loaded_tools = [item.name for item in self.tools.capabilities(enabled_only=True)]
         state.git_branch = context.git_branch
         state.context_index_path = str(context.index_path)
+        if state.execution_context:
+            state.execution_context.current_directory = state.working_directory
+            state.execution_context.git_branch = context.git_branch
+            state.execution_context.prompt_phase = "resumed"
         messages = self.prompt_builder.append_resume(
             record.messages,
             state=state,

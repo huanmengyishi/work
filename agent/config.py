@@ -31,6 +31,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "queue_stop_on_failure": True,
         "parallel_min_tasks": 8,
         "parallel_max_workers": 4,
+        "capability_failure_threshold": 3,
     },
     "project": {
         "agent_dir": ".project-agent",
@@ -59,6 +60,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "vector_path": str(paths.vector_dir()),
         "retrieval_limit": 8,
         "vector_enabled": True,
+        "smart_reflection": False,
     },
     "context": {
         "max_files": 5000,
@@ -206,7 +208,7 @@ DEFAULT_TOOLS = {
 
 DEFAULT_MEMORY = {
     "memory": {
-        "lesson_tags": ["lesson", "correction", "bug", "decision", "knowledge"],
+        "lesson_tags": ["lesson", "correction", "reflection", "bug", "decision", "knowledge"],
         "auto_index": True,
         "fts": True,
         "chroma_optional": True,

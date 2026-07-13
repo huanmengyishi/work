@@ -3,10 +3,15 @@
 Project-centric DeepSeek CLI agent for WSL. The Agent is installed as a tool;
 the directory where `agent` is started is the workspace.
 
-Current version: `0.5.0`. The runtime includes correction learning, failure
+Current version: `0.6.0`. The runtime includes correction learning, failure
 recovery, Memory administration, MCP stdio/HTTP/SSE and Resources, bounded HTTP
 access, optional Tree-sitter indexing, resumable task queues, and threshold-gated
 Git worktree parallelism in addition to safe editing and browser persistence.
+
+Version `0.6.0` adds a dependency-aware Task Graph, project Workspace Memory,
+rule-based and optional smart Reflection, resumable Execution Context, and
+persisted Capability Health. Queue and parallel Sessions now carry the same
+Task Graph fields instead of using separate planning semantics.
 
 ## Quick Start
 

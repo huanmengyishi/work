@@ -20,19 +20,19 @@ def test_task_queue_resume_skips_completed_tasks(tmp_path: Path, make_config) ->
     record = queues.create(["one", "two", "three"])
     calls: list[str] = []
 
-    def first_runner(prompt: str):
-        calls.append(prompt)
-        if prompt == "two":
+    def first_runner(task, queue_record):
+        calls.append(task.prompt)
+        if task.prompt == "two":
             return "failed", "session-two", "failed"
-        return f"done {prompt}", f"session-{prompt}", "completed"
+        return f"done {task.prompt}", f"session-{task.prompt}", "completed"
 
     queues.run(record, first_runner, stop_on_failure=True)
     assert record.status == "paused"
     assert [task.status for task in record.tasks] == ["completed", "failed", "pending"]
 
-    def resume_runner(prompt: str):
-        calls.append(prompt)
-        return f"done {prompt}", f"session-{prompt}", "completed"
+    def resume_runner(task, queue_record):
+        calls.append(task.prompt)
+        return f"done {task.prompt}", f"session-{task.prompt}", "completed"
 
     queues.run(queues.load(record.id), resume_runner)
     restored = queues.load(record.id)

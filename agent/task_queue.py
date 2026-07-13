@@ -35,7 +35,7 @@ class QueueRecord:
         return asdict(self)
 
 
-QueueRunner = Callable[[str], tuple[str, str | None, str]]
+QueueRunner = Callable[[QueueTask, "QueueRecord"], tuple[str, str | None, str]]
 
 
 class TaskQueueManager:
@@ -77,7 +77,7 @@ class TaskQueueManager:
             task.updated_at = utc_now_iso()
             self.save(record)
             try:
-                result, session_id, session_status = runner(task.prompt)
+                result, session_id, session_status = runner(task, record)
                 task.result = result
                 task.session_id = session_id
                 task.status = "completed" if session_status == "completed" else "failed"

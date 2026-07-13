@@ -42,6 +42,7 @@ COMMANDS = {
     "mcp",
     "queue",
     "parallel",
+    "health",
 }
 
 
@@ -124,6 +125,8 @@ def main(argv: list[str] | None = None) -> int:
         )
     if args.command == "parallel":
         return cmd_parallel(config, args, yolo=yolo, super_yolo=super_yolo)
+    if args.command == "health":
+        return cmd_health(config, args.reset)
     return 2
 
 
@@ -157,7 +160,7 @@ def build_help_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "commands",
         nargs="?",
-        help="Commands: doctor, projects, init, config, memory, sessions, resume, context, tools, mcp, queue, parallel",
+        help="Commands: doctor, projects, init, config, memory, sessions, resume, context, tools, mcp, queue, parallel, health",
     )
     return parser
 
@@ -180,7 +183,9 @@ def build_command_parser() -> argparse.ArgumentParser:
     memory_search.add_argument("--global-only", action="store_true")
     memory_search.add_argument("--limit", type=int, default=8)
     memory_add = memory_sub.add_parser("add", help="Add memory.")
-    memory_add.add_argument("kind", choices=["Lesson", "Correction", "Bug", "Decision", "Knowledge", "Summary"])
+    memory_add.add_argument(
+        "kind", choices=["Lesson", "Correction", "Reflection", "Bug", "Decision", "Knowledge", "Summary"]
+    )
     memory_add.add_argument("title")
     memory_add.add_argument("content")
     memory_add.add_argument("--tag", action="append", default=[])
@@ -218,6 +223,8 @@ def build_command_parser() -> argparse.ArgumentParser:
     parallel_parser = subparsers.add_parser("parallel", help="Run at least 8 independent tasks in Git worktrees.")
     parallel_parser.add_argument("tasks", nargs="+")
     parallel_parser.add_argument("--workers", type=int)
+    health_parser = subparsers.add_parser("health", help="Show capability health and broken-tool state.")
+    health_parser.add_argument("--reset", nargs="?", const="*", help="Reset one capability or all health failures.")
     return parser
 
 
@@ -528,6 +535,20 @@ def cmd_tools(config: AppConfig, include_disabled: bool) -> int:
     return 0
 
 
+def cmd_health(config: AppConfig, reset: str | None = None) -> int:
+    project, memory = prepare_project(config)
+    manager = ToolManager(config, project, memory)
+    try:
+        if reset:
+            manager.health.reset(None if reset == "*" else reset)
+        rows = manager.health_report()
+        for item in rows:
+            print(f"{item.name:<40} {item.status:<12} failures={item.consecutive_failures:<3} {item.reason}")
+        return 1 if any(item.status == "Broken" for item in rows) else 0
+    finally:
+        manager.close()
+
+
 def cmd_mcp(config: AppConfig, action: str) -> int:
     if action == "config":
         print(config.config_dir / "mcp.yaml")
@@ -605,11 +626,27 @@ def cmd_queue(
         super_yolo=super_yolo,
     )
 
-    def runner(prompt: str) -> tuple[str, str | None, str]:
-        result = runtime.run(prompt)
+    def runner(task, queue_record) -> tuple[str, str | None, str]:
+        plan = []
+        for index, item in enumerate(queue_record.tasks):
+            dependencies = [queue_record.tasks[index - 1].id] if index > 0 else []
+            plan.append(
+                {
+                    "id": item.id,
+                    "title": item.prompt,
+                    "description": "Persistent queue task",
+                    "dependencies": dependencies,
+                    "status": "in_progress" if item.id == task.id else item.status,
+                    "retry_count": 0,
+                    "max_retries": 1,
+                    "allow_parallel": False,
+                    "completion_criteria": "The task Session completes successfully.",
+                }
+            )
+        result = runtime.run(task.prompt, initial_plan=plan, queue_id=record.id)
         session_id = runtime.last_session_id
         status = runtime.sessions.load(session_id).state.status if session_id else "failed"
-        print(f"[{record.id}] {prompt}\n{result}\n")
+        print(f"[{record.id}] {task.prompt}\n{result}\n")
         return result, session_id, status
 
     try:
@@ -784,7 +821,15 @@ def run_once(
         super_yolo=super_yolo,
     )
     try:
-        print(runtime.run(prompt))
+        initial_plan = None
+        raw_plan = os.environ.get("DEEP_AGENT_INITIAL_PLAN_JSON")
+        if raw_plan:
+            try:
+                value = json.loads(raw_plan)
+                initial_plan = value if isinstance(value, list) else None
+            except json.JSONDecodeError:
+                initial_plan = None
+        print(runtime.run(prompt, initial_plan=initial_plan))
     except Exception as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1

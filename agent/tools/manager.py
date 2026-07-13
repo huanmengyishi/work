@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from ..config import AppConfig
+from ..capability_health import CapabilityHealthManager
 from ..events import EventBus
 from ..memory import MemoryStore
 from ..planner import PlanManager
@@ -56,6 +57,7 @@ class ToolManager:
         self.plan_manager = PlanManager()
         self.permission = PermissionManager(config, project.root)
         self.registry = ToolCapabilityRegistry(config)
+        self.health = CapabilityHealthManager(config, project.id)
         self.shell = ShellTool(self.cwd, int(config.get("tools.shell.timeout_seconds", 120)))
         self.python = PythonTool(self.cwd, int(config.get("tools.python.timeout_seconds", 120)))
         self.git = GitTool(self.cwd, int(config.get("tools.git.timeout_seconds", 120)))
@@ -89,10 +91,17 @@ class ToolManager:
         self.events = events
 
     def schemas(self) -> list[dict[str, Any]]:
-        return self.registry.schemas()
+        return [
+            item.schema()
+            for item in self.capabilities(enabled_only=True)
+            if self.health.evaluate(item).status == "Available"
+        ]
 
     def capabilities(self, *, enabled_only: bool = False) -> list[ToolCapability]:
         return self.registry.capabilities(enabled_only=enabled_only)
+
+    def health_report(self) -> list:
+        return self.health.report(self.capabilities(enabled_only=False))
 
     def capability_summary(self) -> str:
         lines = []
@@ -183,6 +192,10 @@ class ToolManager:
         except Exception as exc:
             result = ToolResult(False, "", str(exc))
         result = result.with_execution(request_id=request.request_id, duration_ms=elapsed_ms(started))
+        if result.success:
+            self.health.record(capability.name, success=True)
+        elif self._is_health_failure(result):
+            self.health.record(capability.name, success=False, error=result.stderr)
         self._publish("tool.finished", request, result)
         return result
 
@@ -572,11 +585,19 @@ class ToolManager:
                     "memory",
                     "add",
                     "memory_add",
-                    "Store a durable lesson, correction, bug, decision, knowledge item, or summary.",
+                    "Store a durable lesson, correction, reflection, bug, decision, knowledge item, or summary.",
                     {
                         "kind": {
                             "type": "string",
-                            "enum": ["Lesson", "Correction", "Bug", "Decision", "Knowledge", "Summary"],
+                            "enum": [
+                                "Lesson",
+                                "Correction",
+                                "Reflection",
+                                "Bug",
+                                "Decision",
+                                "Knowledge",
+                                "Summary",
+                            ],
                         },
                         "title": {"type": "string"},
                         "content": {"type": "string"},
@@ -626,6 +647,12 @@ class ToolManager:
                                 "properties": {
                                     "id": {"type": "string"},
                                     "title": {"type": "string"},
+                                    "description": {"type": "string"},
+                                    "dependencies": {"type": "array", "items": {"type": "string"}},
+                                    "retry_count": {"type": "integer", "minimum": 0},
+                                    "max_retries": {"type": "integer", "minimum": 0, "maximum": 10},
+                                    "allow_parallel": {"type": "boolean"},
+                                    "completion_criteria": {"type": "string"},
                                     "status": {
                                         "type": "string",
                                         "enum": ["pending", "in_progress", "completed", "failed", "skipped"],
@@ -821,13 +848,27 @@ class ToolManager:
 
     def _agent_update_plan(self, steps: list[str | dict[str, Any]]) -> ToolResult:
         state = self._require_state()
-        plan = self.plan_manager.replace(state, steps)
-        return ToolResult(True, json.dumps([item.__dict__ for item in plan], ensure_ascii=False, indent=2))
+        try:
+            plan = self.plan_manager.replace(state, steps)
+        except (TypeError, ValueError) as exc:
+            return ToolResult(False, "", str(exc))
+        data = {
+            "steps": [item.__dict__ for item in plan],
+            "ready_steps": [item.id for item in self.plan_manager.ready_steps(state)],
+        }
+        return ToolResult(True, json.dumps(data, ensure_ascii=False, indent=2), data=data)
 
     def _agent_update_step(self, step_id: str, status: str) -> ToolResult:
         state = self._require_state()
-        step = self.plan_manager.update_step(state, step_id, status)
-        return ToolResult(True, json.dumps(step.__dict__, ensure_ascii=False, indent=2))
+        try:
+            step = self.plan_manager.update_step(state, step_id, status)
+        except ValueError as exc:
+            return ToolResult(False, "", str(exc))
+        data = {
+            "step": step.__dict__,
+            "ready_steps": [item.id for item in self.plan_manager.ready_steps(state)],
+        }
+        return ToolResult(True, json.dumps(data, ensure_ascii=False, indent=2), data=data)
 
     def _require_state(self) -> AgentState:
         if self.state is None:
@@ -856,6 +897,24 @@ class ToolManager:
         if not isinstance(values, list):
             return {"file.apply", "file.undo"}
         return {str(item) for item in values}
+
+    @staticmethod
+    def _is_health_failure(result: ToolResult) -> bool:
+        error = result.stderr.lower()
+        markers = (
+            "timeout",
+            "timed out",
+            "command not found",
+            "dependency",
+            "unavailable",
+            "could not start",
+            "connection refused",
+            "connection reset",
+            "not installed",
+            "closed its input",
+            "broken pipe",
+        )
+        return any(marker in error for marker in markers)
 
     def _publish(self, event_name: str, request: ToolRequest, result: ToolResult | None) -> None:
         if not self.events:

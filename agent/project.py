@@ -288,6 +288,7 @@ class ProjectManager:
             "parallel/",
             "index.json",
             "index.semantic.json",
+            "workspace_memory.json",
         )
         existing = gitignore_path.read_text(encoding="utf-8", errors="replace") if gitignore_path.exists() else ""
         merged_lines: list[str] = []

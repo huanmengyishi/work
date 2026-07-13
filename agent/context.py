@@ -13,6 +13,7 @@ from typing import Any
 from .config import AppConfig
 from .project import Project
 from .timeutil import utc_now_iso
+from .workspace_memory import WorkspaceMemoryManager
 
 
 CONTEXT_FILENAMES = (
@@ -86,7 +87,9 @@ class ContextBuilder:
         if bool(self.config.get("context.semantic_index_enabled", False)):
             semantic_index = self._build_semantic_index(project, records, fingerprint, refresh=refresh)
 
-        rendered, loaded_files = self._render_context(project, index, semantic_index)
+        workspace_memory = WorkspaceMemoryManager(project).refresh(records, fingerprint=fingerprint)
+
+        rendered, loaded_files = self._render_context(project, index, semantic_index, workspace_memory)
         generated_path = project.agent_dir / "cache" / "context.generated.md"
         generated_path.parent.mkdir(parents=True, exist_ok=True)
         generated_path.write_text(rendered.rstrip() + "\n", encoding="utf-8")
@@ -168,6 +171,7 @@ class ContextBuilder:
         project: Project,
         index: dict[str, Any],
         semantic_index: dict[str, Any] | None = None,
+        workspace_memory: dict[str, Any] | None = None,
     ) -> tuple[str, list[str]]:
         max_total = int(self.config.get("context.max_prompt_chars", 32_000))
         max_per_file = int(self.config.get("context.max_context_file_chars", 8_000))
@@ -182,6 +186,8 @@ class ContextBuilder:
             f"- Entry points: `{', '.join(index.get('entries') or []) or 'unknown'}`",
             "",
         ]
+        if workspace_memory:
+            sections.extend([WorkspaceMemoryManager.render(workspace_memory), ""])
         loaded_files: list[str] = []
         candidates = [
             project.context_path,

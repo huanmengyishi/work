@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -126,6 +127,22 @@ class ParallelWorktreeRunner:
                         "schema_version": 1,
                         "run_id": run_id,
                         "created_at": utc_now_iso(),
+                        "task_graph": [
+                            {
+                                "id": f"task-{index}",
+                                "title": prompt,
+                                "status": next(
+                                    (item.status for item in results if item.index == index),
+                                    "failed",
+                                ),
+                                "dependencies": [],
+                                "retry_count": 0,
+                                "max_retries": 0,
+                                "allow_parallel": True,
+                                "completion_criteria": "Agent subprocess exits successfully and patch applies cleanly.",
+                            }
+                            for index, prompt in enumerate(tasks, start=1)
+                        ],
                         "results": [asdict(item) for item in sorted(results, key=lambda item: item.index)],
                     },
                     ensure_ascii=False,
@@ -154,6 +171,7 @@ class ParallelWorktreeRunner:
             text=True,
             capture_output=True,
             check=False,
+            env=self._task_environment(index, prompt),
         )
         subprocess.run(
             ["git", "add", "-N", ".", ":(exclude).project-agent"],
@@ -189,6 +207,22 @@ class ParallelWorktreeRunner:
             stderr=completed.stderr[-20_000:],
             returncode=completed.returncode,
         )
+
+    def _task_environment(self, index: int, prompt: str) -> dict[str, str]:
+        plan = [
+            {
+                "id": f"task-{index}",
+                "title": prompt,
+                "description": "Git worktree parallel task",
+                "dependencies": [],
+                "status": "in_progress",
+                "retry_count": 0,
+                "max_retries": 0,
+                "allow_parallel": True,
+                "completion_criteria": "Agent subprocess exits successfully and patch applies cleanly.",
+            }
+        ]
+        return {**os.environ, "DEEP_AGENT_INITIAL_PLAN_JSON": json.dumps(plan, ensure_ascii=False)}
 
     def _require_clean_git(self) -> None:
         if not (self.project.root / ".git").exists():
