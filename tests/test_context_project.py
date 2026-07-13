@@ -114,4 +114,6 @@ def test_project_first_initialization_converges_under_concurrency(tmp_path: Path
     assert len(project_ids) == 1
     metadata = (root / ".project-agent" / "project.yaml").read_text(encoding="utf-8")
     assert next(iter(project_ids)) in metadata
+    assert (root / ".project-agent" / "README.md").is_file()
+    assert ".project.lock" in (root / ".project-agent" / ".gitignore").read_text(encoding="utf-8")
     assert ProjectRegistry(config.data_dir / "projects.db").get_by_root(root)["project_id"] in project_ids

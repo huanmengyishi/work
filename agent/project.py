@@ -175,7 +175,7 @@ class ProjectManager:
             raise ValueError(f"project Agent path is not a directory: {agent_dir}")
         config_path = agent_dir / "project.yaml"
         context_path = agent_dir / "context.md"
-        created = not agent_dir.exists()
+        created = not config_path.exists()
         agent_dir.mkdir(parents=True, exist_ok=True)
         for private_name in (
             "sessions",
@@ -314,6 +314,7 @@ class ProjectManager:
             )
         gitignore_path = agent_dir / ".gitignore"
         gitignore_entries = (
+            ".project.lock",
             "cache/",
             "sessions/",
             "snapshots/",

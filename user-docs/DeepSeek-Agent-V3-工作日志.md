@@ -33,7 +33,7 @@
 - `.project-agent/memory/` 加入 ignore 和私有路径；拒绝 Agent 目录/源码符号链接逃逸。
 - Queue ID 先校验、锁内重载 canonical 状态、唯一临时文件、按 mtime 选最新。
 - 普通/YOLO 模式拒绝 Docker root、socket、device 和 host namespace 访问。
-- 新增 GitHub Actions Python 3.11/3.12/3.13 矩阵，自动执行 Ruff、pytest 和 compileall。
+- 已生成并本地核验 GitHub Actions Python 3.11/3.12/3.13 矩阵；远端发布受当前凭据 `workflow` scope 限制，未虚报为已启用。
 - 首次 Project 初始化增加项目锁和原子 YAML；Context/Workspace 缓存改用唯一临时文件。
 - 同一 Session 的并发 Resume 增加 per-session flock，拒绝重复 turn。
 - Daemon 使用精确 argv + `/proc` starttime 身份校验；Queue 超时终止整个进程组。
