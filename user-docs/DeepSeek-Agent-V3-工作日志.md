@@ -57,7 +57,9 @@ Memory 1200 条候选性能回归 passed
 
 ### 版本与发布
 
-版本升级为 `v0.8.0`（新能力使用 minor 版本）。源码 README、实现说明、`docs/releases/v0.8.0.md`、用户 README、工作日志和 Word 文档同步更新。提交哈希、tag 和远端验证结果在发布完成后补入本节。
+版本升级为 `v0.8.0`（新能力使用 minor 版本）。源码 README、实现说明、`docs/releases/v0.8.0.md`、用户 README、工作日志和 Word 文档同步更新。
+
+源码提交：`ec7f55a`（`release: Deep Agent v0.8.0 adaptive reasoning`）。发布文档补记、tag 和远端验证结果在最终发布提交完成后补入本节。
 
 ### 下一步
 
