@@ -60,7 +60,7 @@ class PlanManager:
                 stacklevel=2,
             )
             normalized = normalized[:50]
-        self._validate_graph(normalized)
+        self._validate_graph(state, normalized)
         state.plan = normalized
         self._refresh_derived_state(state)
         state.touch()
@@ -69,6 +69,8 @@ class PlanManager:
     def update_step(self, state: AgentState, step_id: str, status: str) -> PlanStep:
         if status not in VALID_STEP_STATUSES:
             raise ValueError(f"invalid plan status: {status}")
+        if status == "skipped" and not state.can_skip_plan_step(step_id):
+            raise ValueError("only the implement step of a conditional-mutation plan can be skipped")
         for step in state.plan:
             if step.id == step_id:
                 if status == "in_progress" and not self.dependencies_satisfied(state, step):
@@ -87,7 +89,7 @@ class PlanManager:
 
     @staticmethod
     def dependencies_satisfied(state: AgentState, step: PlanStep) -> bool:
-        completed = {item.id for item in state.plan if item.status in {"completed", "skipped"}}
+        completed = {item.id for item in state.plan if state.plan_step_satisfied(item)}
         return all(dependency in completed for dependency in step.dependencies)
 
     def ready_steps(self, state: AgentState) -> list[PlanStep]:
@@ -115,7 +117,7 @@ class PlanManager:
         state.completed_steps = [step.id for step in state.plan if step.status == "completed"]
         active = next((step.id for step in state.plan if step.status == "in_progress"), None)
         if active is None:
-            completed = {step.id for step in state.plan if step.status in {"completed", "skipped"}}
+            completed = {step.id for step in state.plan if state.plan_step_satisfied(step)}
             active = next(
                 (
                     step.id
@@ -129,19 +131,21 @@ class PlanManager:
             state.execution_context.current_plan_id = active
 
     @staticmethod
-    def _validate_graph(steps: list[PlanStep]) -> None:
+    def _validate_graph(state: AgentState, steps: list[PlanStep]) -> None:
         ids = [step.id for step in steps]
         if len(ids) != len(set(ids)):
             raise ValueError("plan step IDs must be unique")
         known = set(ids)
         for step in steps:
+            if step.status == "skipped" and not state.can_skip_plan_step(step.id):
+                raise ValueError("only the implement step of a conditional-mutation plan can be skipped")
             missing = [item for item in step.dependencies if item not in known]
             if missing:
                 raise ValueError(f"unknown dependencies for {step.id}: {', '.join(missing)}")
             if step.id in step.dependencies:
                 raise ValueError(f"plan step cannot depend on itself: {step.id}")
             if step.status == "in_progress" and step.dependencies:
-                completed = {item.id for item in steps if item.status in {"completed", "skipped"}}
+                completed = {item.id for item in steps if state.plan_step_satisfied(item)}
                 if not all(item in completed for item in step.dependencies):
                     raise ValueError(f"in-progress step dependencies are not complete: {step.id}")
         visiting: set[str] = set()

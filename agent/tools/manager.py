@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import hashlib
+import inspect
 import json
 import re
 import shutil
+import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
@@ -13,7 +17,7 @@ from ..memory import MemoryStore
 from ..planner import PlanManager
 from ..project import Project
 from ..state import AgentState
-from .base import ToolRequest, ToolResult, elapsed_ms
+from .base import ToolRequest, ToolResult, _bounded_result_data, _head_tail, elapsed_ms
 from .browser import BrowserTool
 from .docker import DockerTool
 from .document import DocumentTool
@@ -22,9 +26,11 @@ from .http import HttpTool
 from .file_edit import FileEditTool
 from .lsp import LSPManager, SUPPORTED_SUFFIXES
 from .mcp import MCPManager
+from .pathsafe import resolve_project_path
 from .permission import PermissionManager
 from .python import PythonTool
 from .registry import ToolCapability, ToolCapabilityRegistry
+from .result_store import ToolResultStore, ToolResultStoreError
 from .shell import ShellTool
 from .templates import SafeTemplateTool
 
@@ -36,12 +42,23 @@ _HEALTH_ERROR_MAX_CHARS = 1000
 _EVENT_LABEL_MAX_CHARS = 200
 _EVENT_COUNT_MAX = 1000
 _EVENT_DURATION_MAX_MS = 86_400_000
+_DATE_LITERAL_RE = re.compile(r"(?<!\d)20\d{2}(?:年\s*\d{1,2}月(?:\s*\d{1,2}日)?|[-/.]\d{1,2}(?:[-/.]\d{1,2})?)(?!\d)")
 _SENSITIVE_ERROR_ASSIGNMENT = re.compile(
     r"(?i)\b(api[_-]?key|access[_-]?token|refresh[_-]?token|authorization|cookie|password|passwd|secret|token)"
     r"(\s*[=:]\s*)"
     r"(?:\"[^\"]*\"|'[^']*'|[^\s,;]+)"
 )
 _URL_CREDENTIALS = re.compile(r"(?i)\b(https?://)[^\s/@:]+:[^\s/@]+@")
+
+
+@dataclass(frozen=True)
+class _ToolExecutionOwnership:
+    """Immutable attribution captured before one ToolRequest is evaluated."""
+
+    state: AgentState | None
+    session_id: str | None
+    run_id: str | None
+    events: EventBus | None
 
 
 class ToolManager:
@@ -71,19 +88,47 @@ class ToolManager:
         self.yolo = yolo
         self.super_yolo = super_yolo
         self.state: AgentState | None = None
+        self._execution_local = threading.local()
         self.plan_manager = PlanManager()
         self.permission = PermissionManager(config, project.root)
         self.registry = ToolCapabilityRegistry(config)
         self.health = CapabilityHealthManager(config, project.id)
-        self.shell = ShellTool(self.cwd, int(config.get("tools.shell.timeout_seconds", 120)))
-        self.python = PythonTool(self.cwd, int(config.get("tools.python.timeout_seconds", 120)))
-        self.git = GitTool(self.cwd, int(config.get("tools.git.timeout_seconds", 120)))
+        max_result_bytes = int(config.get("tools.tool_result.max_attachment_bytes", 8_388_608))
+        self.result_store = ToolResultStore(
+            project.agent_dir,
+            max_attachment_bytes=max_result_bytes,
+            persist_threshold_bytes=int(config.get("tools.tool_result.persist_threshold_bytes", 12_000)),
+            preview_chars=int(config.get("tools.tool_result.preview_chars", 12_000)),
+            max_read_chars=int(config.get("tools.tool_result.max_read_chars", 32_000)),
+            max_attachments_per_session=int(config.get("tools.tool_result.max_attachments_per_session", 512)),
+            max_session_bytes=int(config.get("tools.tool_result.max_session_bytes", 268_435_456)),
+        )
+        self.shell = ShellTool(
+            self.cwd,
+            int(config.get("tools.shell.timeout_seconds", 120)),
+            max_output_bytes=max_result_bytes,
+        )
+        self.python = PythonTool(
+            self.cwd,
+            int(config.get("tools.python.timeout_seconds", 120)),
+            max_output_bytes=max_result_bytes,
+        )
+        self.git = GitTool(
+            self.cwd,
+            int(config.get("tools.git.timeout_seconds", 120)),
+            max_output_bytes=max_result_bytes,
+        )
         self.document = DocumentTool(
             self.cwd,
             int(config.get("tools.document.timeout_seconds", 180)),
             max_input_bytes=int(config.get("tools.document.max_input_bytes", 25_000_000)),
+            max_result_bytes=max_result_bytes,
         )
-        self.docker = DockerTool(self.cwd, int(config.get("tools.docker.timeout_seconds", 180)))
+        self.docker = DockerTool(
+            self.cwd,
+            int(config.get("tools.docker.timeout_seconds", 180)),
+            max_output_bytes=max_result_bytes,
+        )
         self.browser = BrowserTool(
             self.cwd,
             int(config.get("tools.browser.timeout_seconds", 180)),
@@ -108,6 +153,8 @@ class ToolManager:
         self.templates = SafeTemplateTool(
             self.cwd,
             int(config.get("tools.template.timeout_seconds", 300)),
+            max_input_bytes=int(config.get("tools.template.max_input_bytes", 67_108_864)),
+            max_result_bytes=max_result_bytes,
         )
         self.mcp = MCPManager(config, self.cwd)
         self._register_capabilities()
@@ -129,6 +176,12 @@ class ToolManager:
 
     def capabilities(self, *, enabled_only: bool = False) -> list[ToolCapability]:
         return self.registry.capabilities(enabled_only=enabled_only)
+
+    def model_function_name(self, name: str) -> str:
+        """Return the advertised model function name for any accepted alias."""
+
+        capability, _handler = self.registry.resolve(str(name))
+        return capability.model_name if capability is not None else str(name)
 
     def health_report(self) -> list:
         return self.health.report(self.capabilities(enabled_only=False))
@@ -157,30 +210,118 @@ class ToolManager:
         arguments: str | dict[str, Any] | None,
         *,
         request_id: str | None = None,
+        runtime_denied_reason: str | None = None,
     ) -> tuple[ToolRequest, ToolResult]:
         try:
             args = parse_arguments(arguments)
         except (TypeError, ValueError, json.JSONDecodeError) as exc:
             request = self.registry.request(name, {}, request_id=request_id)
-            return request, ToolResult(
-                False,
-                "",
-                f"invalid arguments for {name}: {exc}",
-                request_id=request.request_id,
+            return request, self.execute(
+                request,
+                runtime_denied_reason=runtime_denied_reason,
+                argument_error=f"invalid arguments for {name}: {exc}",
             )
         request = self.registry.request(name, args, request_id=request_id)
-        return request, self.execute(request)
+        return request, self.execute(request, runtime_denied_reason=runtime_denied_reason)
 
-    def execute(self, request: ToolRequest) -> ToolResult:
+    def capture_model_call_context(self) -> object:
+        """Capture batch ownership before work can move to a worker thread."""
+
+        return self._capture_execution_ownership()
+
+    def execute_model_call_in_context(
+        self,
+        context: object,
+        name: str,
+        arguments: str | dict[str, Any] | None,
+        *,
+        request_id: str | None = None,
+        runtime_denied_reason: str | None = None,
+    ) -> tuple[ToolRequest, ToolResult]:
+        """Execute one model call under ownership captured by its batch."""
+
+        if not isinstance(context, _ToolExecutionOwnership):
+            raise TypeError("invalid model tool execution context")
+        previous = getattr(self._execution_local, "ownership", None)
+        self._execution_local.ownership = context
+        try:
+            return self.execute_model_call(
+                name,
+                arguments,
+                request_id=request_id,
+                runtime_denied_reason=runtime_denied_reason,
+            )
+        finally:
+            if previous is None:
+                try:
+                    del self._execution_local.ownership
+                except AttributeError:
+                    pass
+            else:
+                self._execution_local.ownership = previous
+
+    def execute(
+        self,
+        request: ToolRequest,
+        *,
+        runtime_denied_reason: str | None = None,
+        argument_error: str | None = None,
+    ) -> ToolResult:
+        ownership = self._capture_execution_ownership()
+        previous = getattr(self._execution_local, "ownership", None)
+        self._execution_local.ownership = ownership
+        try:
+            return self._execute_owned(
+                request,
+                runtime_denied_reason=runtime_denied_reason,
+                argument_error=argument_error,
+                ownership=ownership,
+            )
+        finally:
+            if previous is None:
+                try:
+                    del self._execution_local.ownership
+                except AttributeError:
+                    pass
+            else:
+                self._execution_local.ownership = previous
+
+    def _execute_owned(
+        self,
+        request: ToolRequest,
+        *,
+        runtime_denied_reason: str | None,
+        argument_error: str | None,
+        ownership: _ToolExecutionOwnership,
+    ) -> ToolResult:
         capability, handler = self.registry.resolve(request.capability)
         if capability is None or handler is None:
-            return ToolResult(
-                False, "", f"unknown tool capability: {request.capability}", request_id=request.request_id
+            if runtime_denied_reason:
+                result = self._runtime_denied_result(request, runtime_denied_reason)
+                self._publish("tool.denied", request, result, ownership=ownership)
+                return result
+            return self._not_executed_result(
+                request,
+                f"unknown tool capability: {request.capability}",
             )
         decision = self.permission.evaluate(request, capability, super_yolo=self.super_yolo)
+        if runtime_denied_reason:
+            result = self._runtime_denied_result(request, runtime_denied_reason)
+            self._publish("tool.denied", request, result, ownership=ownership)
+            return result
+        if argument_error:
+            result = self._not_executed_result(request, argument_error)
+            self._publish("tool.denied", request, result, ownership=ownership)
+            return result
         if not decision.allowed:
-            result = ToolResult(False, "", decision.reason, request_id=request.request_id)
-            self._publish("tool.denied", request, result)
+            result = self._not_executed_result(request, decision.reason)
+            self._publish("tool.denied", request, result, ownership=ownership)
+            return result
+
+        handler_argument_error = self._handler_argument_error(handler, request.args, capability.name)
+        if handler_argument_error:
+            result = self._not_executed_result(request, handler_argument_error)
+            self._publish("tool.denied", request, result, ownership=ownership)
             return result
 
         auto_approved = (
@@ -190,42 +331,143 @@ class ToolManager:
             try:
                 summary = self._approval_summary(request, capability)
             except Exception as exc:
-                result = ToolResult(False, "", f"could not prepare approval: {exc}", request_id=request.request_id)
-                self._publish("tool.denied", request, result)
+                result = self._not_executed_result(request, f"could not prepare approval: {exc}")
+                self._publish("tool.denied", request, result, ownership=ownership)
                 return result
             if self.approval_handler is None:
-                result = ToolResult(
-                    False,
-                    "",
+                result = self._not_executed_result(
+                    request,
                     "operation requires user confirmation; use interactive mode or --yolo",
-                    request_id=request.request_id,
                 )
-                self._publish("tool.denied", request, result)
+                self._publish("tool.denied", request, result, ownership=ownership)
                 return result
             try:
                 approved = self.approval_handler(request, capability, summary)
             except Exception as exc:
-                result = ToolResult(False, "", f"approval failed: {exc}", request_id=request.request_id)
-                self._publish("tool.denied", request, result)
+                result = self._not_executed_result(request, f"approval failed: {exc}")
+                self._publish("tool.denied", request, result, ownership=ownership)
                 return result
             if not approved:
-                result = ToolResult(False, "", "operation denied by user", request_id=request.request_id)
-                self._publish("tool.denied", request, result)
+                result = self._not_executed_result(request, "operation denied by user")
+                self._publish("tool.denied", request, result, ownership=ownership)
                 return result
 
-        self._publish("tool.started", request, None)
+        self._publish("tool.started", request, None, ownership=ownership)
         started = time.monotonic()
         try:
             result = handler(**request.args)
             if not isinstance(result, ToolResult):
                 result = ToolResult(True, str(result))
-        except TypeError as exc:
-            result = ToolResult(False, "", f"invalid arguments for {capability.name}: {exc}")
         except Exception as exc:
             result = ToolResult(False, "", str(exc))
+        handler_result = result.with_execution(request_id=request.request_id, duration_ms=result.duration_ms)
+        if capability.name != "tool_result.read" and ownership.session_id is not None:
+            try:
+                result = self.result_store.persist(
+                    handler_result,
+                    session_id=ownership.session_id,
+                    request_id=request.request_id,
+                )
+            except ToolResultStoreError as exc:
+                # The handler has already completed and may have performed an
+                # approved side effect. Attachment failure must not rewrite
+                # that fact as a failed tool execution, which could cause the
+                # model to repeat a write, command, or network request.
+                result = self._attachment_persistence_fallback(handler_result, exc)
+        else:
+            result = handler_result
         result = result.with_execution(request_id=request.request_id, duration_ms=elapsed_ms(started))
-        self._publish("tool.finished", request, result)
+        self._publish("tool.finished", request, result, ownership=ownership)
         return result
+
+    def _capture_execution_ownership(self) -> _ToolExecutionOwnership:
+        current = getattr(self._execution_local, "ownership", None)
+        if isinstance(current, _ToolExecutionOwnership):
+            return current
+        state = self.state
+        return _ToolExecutionOwnership(
+            state=state,
+            session_id=state.session_id if state is not None else None,
+            run_id=state.run_id if state is not None else None,
+            events=self.events,
+        )
+
+    def _attachment_persistence_fallback(
+        self,
+        result: ToolResult,
+        error: ToolResultStoreError,
+    ) -> ToolResult:
+        """Return a bounded truthful result when its private attachment fails."""
+
+        if result.success:
+            stdout_chars = self.result_store.preview_chars * 3 // 4
+            stderr_chars = self.result_store.preview_chars - stdout_chars
+        else:
+            stderr_chars = self.result_store.preview_chars * 3 // 4
+            stdout_chars = self.result_store.preview_chars - stderr_chars
+        bounded_data = _bounded_result_data(result.data or {})
+        data = dict(bounded_data) if isinstance(bounded_data, dict) else {"value": bounded_data}
+        data["attachment_persistence_error"] = {
+            "type": type(error).__name__,
+            "message": self._health_error_summary(ToolResult(False, "", str(error))),
+            "result_preserved": True,
+            "full_body_available": False,
+            "stdout_chars": len(result.stdout),
+            "stderr_chars": len(result.stderr),
+            "stdout_sha256": hashlib.sha256(result.stdout.encode("utf-8", errors="replace")).hexdigest(),
+            "stderr_sha256": hashlib.sha256(result.stderr.encode("utf-8", errors="replace")).hexdigest(),
+        }
+        return ToolResult(
+            result.success,
+            _head_tail(result.stdout, stdout_chars),
+            _head_tail(result.stderr, stderr_chars),
+            data=data,
+            duration_ms=result.duration_ms,
+            request_id=result.request_id,
+        )
+
+    @staticmethod
+    def _runtime_denied_result(request: ToolRequest, reason: str) -> ToolResult:
+        return ToolManager._not_executed_result(
+            request,
+            str(reason)[:2_000],
+            data={"runtime_denied": True},
+        )
+
+    @staticmethod
+    def _not_executed_result(
+        request: ToolRequest,
+        error: str,
+        *,
+        data: dict[str, Any] | None = None,
+    ) -> ToolResult:
+        result_data = dict(data or {})
+        result_data["not_executed"] = True
+        return ToolResult(
+            False,
+            "",
+            str(error),
+            data=result_data,
+            request_id=request.request_id,
+        )
+
+    @staticmethod
+    def _handler_argument_error(
+        handler: Callable[..., ToolResult],
+        arguments: dict[str, Any],
+        capability_name: str,
+    ) -> str | None:
+        """Return a binding error without entering the handler body."""
+
+        try:
+            signature = inspect.signature(handler)
+        except (TypeError, ValueError):
+            return None
+        try:
+            signature.bind(**arguments)
+        except TypeError as exc:
+            return f"invalid arguments for {capability_name}: {exc}"
+        return None
 
     def call(self, name: str, arguments: str | dict[str, Any] | None) -> ToolResult:
         _, result = self.execute_model_call(name, arguments)
@@ -243,11 +485,18 @@ class ToolManager:
                     "file",
                     "diff",
                     "file_diff",
-                    "Create and store a unified-diff preview for one UTF-8 file. This never modifies the file.",
+                    (
+                        "Create and store a unified-diff preview for one UTF-8 file. This never modifies the file. "
+                        "When copying source from read_file, exclude its line-number and → prefix; only text after "
+                        "the → is file content."
+                    ),
                     {
                         "path": {"type": "string"},
                         "content": {"type": "string", "description": "Complete replacement content."},
-                        "old_text": {"type": "string", "description": "Exact text block to replace."},
+                        "old_text": {
+                            "type": "string",
+                            "description": "Exact file text to replace, excluding every read_file line-number/→ prefix.",
+                        },
                         "new_text": {"type": "string", "description": "Replacement for old_text."},
                         "replace_all": {"type": "boolean"},
                         "delete": {"type": "boolean"},
@@ -294,8 +543,21 @@ class ToolManager:
                         "max_entries": {"type": "integer", "minimum": 1, "maximum": 5000},
                     },
                     permissions=("read",),
+                    concurrency_safe=True,
                 ),
                 self.templates.list_dir,
+            ),
+            (
+                ToolCapability(
+                    "template",
+                    "make_dir",
+                    "make_dir",
+                    "Create a project directory and any missing parents without invoking a shell.",
+                    {"path": {"type": "string"}},
+                    ("path",),
+                    ("write",),
+                ),
+                self._make_dir,
             ),
             (
                 ToolCapability(
@@ -311,6 +573,7 @@ class ToolManager:
                     },
                     ("query",),
                     ("read",),
+                    concurrency_safe=True,
                 ),
                 self.templates.search_code,
             ),
@@ -319,7 +582,10 @@ class ToolManager:
                     "template",
                     "read_file",
                     "read_file",
-                    "Read a bounded line range from one UTF-8 project file with line numbers.",
+                    (
+                        "Read a bounded line range from one UTF-8 project file. Each output line is "
+                        "`padded line number→exact source`; the prefix through → is display metadata, not file content."
+                    ),
                     {
                         "path": {"type": "string"},
                         "start_line": {"type": "integer", "minimum": 1},
@@ -327,6 +593,7 @@ class ToolManager:
                     },
                     ("path",),
                     ("read",),
+                    concurrency_safe=True,
                 ),
                 self.templates.read_file,
             ),
@@ -342,6 +609,7 @@ class ToolManager:
                         "max_results": {"type": "integer", "minimum": 1, "maximum": 5000},
                     },
                     permissions=("read",),
+                    concurrency_safe=True,
                 ),
                 self.templates.find_files,
             ),
@@ -367,7 +635,20 @@ class ToolManager:
                     {
                         "framework": {
                             "type": "string",
-                            "enum": ["auto", "pytest", "npm", "cargo", "go", "gradle", "maven"],
+                            "enum": [
+                                "auto",
+                                "pytest",
+                                "npm",
+                                "npm:test",
+                                "npm:typecheck",
+                                "npm:check",
+                                "npm:lint",
+                                "npm:build",
+                                "cargo",
+                                "go",
+                                "gradle",
+                                "maven",
+                            ],
                         },
                         "path": {"type": "string"},
                     },
@@ -484,6 +765,25 @@ class ToolManager:
             ),
             (
                 ToolCapability(
+                    "document",
+                    "render_docx",
+                    "document_render_docx",
+                    "Render bounded Markdown into a Word .docx binary preview. Apply the returned preview_id with file_apply.",
+                    {
+                        "path": {"type": "string"},
+                        "title": {"type": "string"},
+                        "markdown": {"type": "string"},
+                    },
+                    ("path", "title", "markdown"),
+                    ("write",),
+                    int(self.config.get("tools.document.timeout_seconds", 180)),
+                    input_formats=("markdown",),
+                    output_formats=("docx-preview",),
+                ),
+                self._document_render_docx,
+            ),
+            (
+                ToolCapability(
                     "ocr",
                     "parse",
                     "ocr_parse",
@@ -558,6 +858,7 @@ class ToolManager:
                     permissions=("read",),
                     available=self._module_available("playwright"),
                     unavailable_reason="the Playwright Python package is not installed",
+                    concurrency_safe=True,
                 ),
                 self.browser.list_sessions,
             ),
@@ -612,6 +913,27 @@ class ToolManager:
             ),
             (
                 ToolCapability(
+                    "tool_result",
+                    "read",
+                    "tool_result_read",
+                    "Read one bounded character chunk from a tool result attachment in the current Session.",
+                    {
+                        "request_id": {"type": "string", "maxLength": 512},
+                        "offset": {"type": "integer", "minimum": 0},
+                        "max_chars": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": self.result_store.max_read_chars,
+                        },
+                    },
+                    ("request_id",),
+                    ("read",),
+                    concurrency_safe=True,
+                ),
+                self._tool_result_read,
+            ),
+            (
+                ToolCapability(
                     "memory",
                     "search",
                     "memory_search",
@@ -659,6 +981,7 @@ class ToolManager:
                     "Read project durable context.md.",
                     {},
                     permissions=("read",),
+                    concurrency_safe=True,
                 ),
                 self._project_read_context,
             ),
@@ -684,6 +1007,7 @@ class ToolManager:
                     {
                         "steps": {
                             "type": "array",
+                            "maxItems": 8,
                             "items": {
                                 "type": "object",
                                 "properties": {
@@ -815,6 +1139,18 @@ class ToolManager:
     def _file_undo(self, snapshot_id: str | None = None) -> ToolResult:
         return self.file_edit.undo(session_id=self._require_state().session_id, snapshot_id=snapshot_id)
 
+    def _make_dir(self, path: str) -> ToolResult:
+        try:
+            target = resolve_project_path(self.project.root, path)
+            target.mkdir(parents=True, exist_ok=True)
+        except (OSError, ValueError) as exc:
+            return ToolResult(False, "", str(exc))
+        return ToolResult(
+            True,
+            f"created directory {target.relative_to(self.project.root)}",
+            data={"path": target.relative_to(self.project.root).as_posix()},
+        )
+
     def _resolve_cwd(self, cwd: str | None) -> str | None:
         if not cwd:
             return None
@@ -834,7 +1170,49 @@ class ToolManager:
         return self.git.commit(message)
 
     def _document_parse(self, path: str, ocr: bool = True) -> ToolResult:
-        return self.document.parse(path, ocr=ocr)
+        result = self.document.parse(path, ocr=ocr)
+        data = dict(result.data or {})
+        data["date_literals"] = sorted(set(_DATE_LITERAL_RE.findall(result.stdout)))[:100]
+        return ToolResult(
+            result.success,
+            result.stdout,
+            result.stderr,
+            data=data,
+            duration_ms=result.duration_ms,
+            request_id=result.request_id,
+        )
+
+    def _document_render_docx(self, path: str, title: str, markdown: str) -> ToolResult:
+        if Path(path).suffix.lower() != ".docx":
+            return ToolResult(False, "", "document_render_docx path must end with .docx")
+        markdown_limit = max(
+            1,
+            min(int(self.config.get("tools.document.max_render_chars", 250_000)), 1_000_000),
+        )
+        if len(markdown) > markdown_limit:
+            return ToolResult(False, "", f"document_render_docx markdown exceeds {markdown_limit} characters")
+        try:
+            content, metadata = self.document.render_docx(title=title, markdown=markdown)
+            preview = self.file_edit.preview_binary(
+                path=path,
+                session_id=self._require_state().session_id,
+                content=content,
+                source="document.render_docx",
+            )
+        except Exception as exc:
+            return ToolResult(False, "", str(exc))
+        data = dict(preview.data or {})
+        data.update(metadata)
+        data["date_literals"] = sorted(set(_DATE_LITERAL_RE.findall(markdown)))[:100]
+        data["generated_metadata_dates"] = sorted(
+            {
+                date
+                for line in markdown.splitlines()
+                if ("生成" in line or "汇总" in line or "报告" in line) and ("时间" in line or "日期" in line)
+                for date in _DATE_LITERAL_RE.findall(line)
+            }
+        )[:100]
+        return ToolResult(preview.success, preview.stdout, preview.stderr, data=data)
 
     def _docker_run(self, args: list[str]) -> ToolResult:
         return self.docker.run(args)
@@ -904,6 +1282,36 @@ class ToolManager:
     def _project_read_context(self) -> ToolResult:
         return ToolResult(True, self.project.context_path.read_text(encoding="utf-8"))
 
+    def _tool_result_read(
+        self,
+        request_id: str,
+        offset: int = 0,
+        max_chars: int | None = None,
+    ) -> ToolResult:
+        try:
+            chunk = self.result_store.read_chunk(
+                session_id=self._require_state().session_id,
+                request_id=request_id,
+                offset=offset,
+                max_chars=max_chars,
+            )
+        except ToolResultStoreError as exc:
+            return ToolResult(False, "", str(exc))
+        return ToolResult(
+            True,
+            chunk.content,
+            data={
+                "request_id": chunk.request_id,
+                "offset": chunk.offset,
+                "returned_chars": len(chunk.content),
+                "next_offset": chunk.next_offset,
+                "total_chars": chunk.total_chars,
+                "bytes": chunk.total_bytes,
+                "sha256": chunk.sha256,
+                "eof": chunk.eof,
+            },
+        )
+
     def _project_write_context(self, content: str) -> ToolResult:
         temp = self.project.context_path.with_suffix(".md.tmp")
         temp.write_text(content.rstrip() + "\n", encoding="utf-8")
@@ -912,6 +1320,14 @@ class ToolManager:
 
     def _agent_update_plan(self, steps: list[str | dict[str, Any]]) -> ToolResult:
         state = self._require_state()
+        if state.plan and any(not state.plan_step_satisfied(step) for step in state.plan):
+            return ToolResult(
+                False,
+                "",
+                "a Task Graph already exists; complete its steps with agent_update_step instead of replacing it",
+            )
+        if len(steps) > 8:
+            return ToolResult(False, "", "agent_update_plan accepts at most 8 bounded steps")
         try:
             plan = self.plan_manager.replace(state, steps)
         except (TypeError, ValueError) as exc:
@@ -935,6 +1351,9 @@ class ToolManager:
         return ToolResult(True, json.dumps(data, ensure_ascii=False, indent=2), data=data)
 
     def _require_state(self) -> AgentState:
+        ownership = getattr(self._execution_local, "ownership", None)
+        if isinstance(ownership, _ToolExecutionOwnership) and ownership.state is not None:
+            return ownership.state
         if self.state is None:
             raise RuntimeError("agent state is not bound to ToolManager")
         return self.state
@@ -1020,8 +1439,15 @@ class ToolManager:
             return 0
         return max(0, min(duration, _EVENT_DURATION_MAX_MS))
 
-    def _publish(self, event_name: str, request: ToolRequest, result: ToolResult | None) -> None:
-        if not self.events:
+    def _publish(
+        self,
+        event_name: str,
+        request: ToolRequest,
+        result: ToolResult | None,
+        *,
+        ownership: _ToolExecutionOwnership,
+    ) -> None:
+        if not ownership.events:
             return
         payload: dict[str, Any] = {
             "request": {
@@ -1042,12 +1468,12 @@ class ToolManager:
                 "health_failure": health_failure,
                 "error": self._health_error_summary(result) if health_failure else "",
             }
-        self.events.publish(
+        ownership.events.publish(
             event_name,
             payload,
             project_id=self.project.id,
-            session_id=self.state.session_id if self.state else None,
-            run_id=self.state.run_id if self.state else None,
+            session_id=ownership.session_id,
+            run_id=ownership.run_id,
         )
 
 

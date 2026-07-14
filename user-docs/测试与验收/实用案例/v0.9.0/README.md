@@ -22,12 +22,12 @@
 然后进入示例项目：
 
 ```bash
-cd /mnt/d/detail/deepseek/实用案例-v0.9.0/order-summary-demo
+cd /mnt/d/detail/deepseek/测试与验收/实用案例/v0.9.0/order-summary-demo
 agent init
 agent
 ```
 
-普通输入按一次 `Enter` 提交。终端会显示任务模式、DeepSeek 档位、Thinking 已用时间、模型轮次和工具状态。
+普通输入按一次 `Enter` 提交。终端会显示任务模式、DeepSeek 档位、Thinking 已用时间、工具轮次和工具状态。
 
 ## 3. 推荐体验顺序
 

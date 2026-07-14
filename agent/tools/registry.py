@@ -28,6 +28,7 @@ class ToolCapability:
     available: bool = True
     unavailable_reason: str = ""
     requires_confirmation: bool = False
+    concurrency_safe: bool = False
 
     @property
     def name(self) -> str:
@@ -64,6 +65,7 @@ class ToolCapability:
             "active": self.active,
             "unavailable_reason": self.unavailable_reason,
             "requires_confirmation": self.requires_confirmation,
+            "concurrency_safe": self.concurrency_safe,
             "input": self.properties,
             "input_formats": list(self.input_formats),
             "output_formats": list(self.output_formats),

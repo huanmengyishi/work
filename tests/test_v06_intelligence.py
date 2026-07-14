@@ -78,7 +78,7 @@ def test_task_graph_dependencies_retries_and_old_state(tmp_path: Path, make_conf
     assert restored.context_manifest == {}
     assert restored.schema_version == 1
     restored.resume("continue legacy session")
-    assert restored.schema_version == 2
+    assert restored.schema_version == 6
 
 
 def test_workspace_memory_detects_project_and_preserves_manual(tmp_path: Path, make_config) -> None:

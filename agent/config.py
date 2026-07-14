@@ -19,6 +19,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "base_url": "https://api.deepseek.com",
         "chat_path": "/chat/completions",
         "model": "deepseek-v4-pro",
+        "context_window_tokens": 65_536,
         "temperature": 0.2,
         "max_tokens": 4096,
         "api_key_env": "DEEPSEEK_API_KEY",
@@ -54,6 +55,26 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "parallel_min_tasks": 8,
         "parallel_max_workers": 4,
         "capability_failure_threshold": 3,
+        "convergence": {
+            "enabled": True,
+            "max_consecutive_exploration_rounds": 6,
+            "reserved_tool_rounds": 4,
+            "max_tool_calls_per_round": 16,
+            "max_parallel_read_tools": 4,
+            "max_length_continuations": 2,
+            "max_implementation_evidence_reads": 2,
+            "max_validation_attachment_reads": 2,
+            "single_tool_result_chars": 12_000,
+            "same_round_tool_result_chars": 48_000,
+            "aggregate_tool_result_chars": 96_000,
+            "output_reserve_chars": 24_000,
+            "compacted_tool_result_chars": 1_200,
+            "keep_recent_tool_results": 4,
+            "compaction_failure_limit": 3,
+            "auto_compaction_enabled": True,
+            "auto_compaction_max_tokens": 2_048,
+            "context_safety_buffer_tokens": 8_192,
+        },
     },
     "project": {
         "agent_dir": ".project-agent",
@@ -69,7 +90,20 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "docker": {"enabled": True, "timeout_seconds": 180},
         "browser": {"enabled": True, "timeout_seconds": 180, "max_download_bytes": 100_000_000},
         "file": {"enabled": True, "max_file_bytes": 2000000},
-        "template": {"enabled": True, "timeout_seconds": 300},
+        "template": {
+            "enabled": True,
+            "timeout_seconds": 300,
+            "max_input_bytes": 67_108_864,
+        },
+        "tool_result": {
+            "enabled": True,
+            "max_attachment_bytes": 8_388_608,
+            "persist_threshold_bytes": 12_000,
+            "preview_chars": 12_000,
+            "max_read_chars": 32_000,
+            "max_attachments_per_session": 512,
+            "max_session_bytes": 268_435_456,
+        },
         "http": {
             "enabled": False,
             "timeout_seconds": 30,
@@ -149,6 +183,10 @@ DEFAULT_TOOLS = {
         "allow_browser": True,
         "allow_file": True,
         "allow_template": True,
+        "document": {
+            "max_input_bytes": 25_000_000,
+            "max_render_chars": 250_000,
+        },
         "capabilities": {
             "shell": {
                 "run": {
@@ -182,7 +220,14 @@ DEFAULT_TOOLS = {
                     "timeout_seconds": 180,
                     "input": ["text", "pdf", "image", "word"],
                     "output": ["markdown"],
-                }
+                },
+                "render_docx": {
+                    "enabled": True,
+                    "permissions": ["write"],
+                    "timeout_seconds": 180,
+                    "input": ["markdown"],
+                    "output": ["docx-preview"],
+                },
             },
             "ocr": {
                 "parse": {
@@ -230,6 +275,9 @@ DEFAULT_TOOLS = {
                 "find_files": {"enabled": True, "permissions": ["read"]},
                 "git_diff_staged": {"enabled": True, "permissions": ["read"]},
                 "run_tests": {"enabled": True, "permissions": ["read", "execute"]},
+            },
+            "tool_result": {
+                "read": {"enabled": True, "permissions": ["read"]},
             },
             "http": {
                 "request": {

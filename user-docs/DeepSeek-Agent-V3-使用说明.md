@@ -1,69 +1,133 @@
-# DeepSeek Agent V3 使用说明（0.10.0）
+# DeepSeek Agent V3 使用说明（0.11.0）
 
-更新时间：2026-07-14
+更新时间：2026-07-15
 
-## 1. 系统定位
+## 1. 当前版本与项目边界
 
-Deep Agent 是安装在 WSL Ubuntu 中的项目型 CLI Agent。Agent 是工具，当前项目目录才是 Workspace。
+Deep Agent 是安装在 WSL Ubuntu 中、以项目目录为 Workspace 的 DeepSeek CLI Agent。当前版本为 `0.11.0`，AgentState schema 为 `6`。程序仍保持以下单向边界：
+
+```text
+CLI -> Runtime -> AgentState -> Prompt -> Capability -> Permission
+ContextBuilder -> ContextPackage -> PromptBuilder
+ToolRequest -> PermissionManager -> ToolResult
+```
+
+DeepSeek 是唯一推理 Provider。0.11.0 没有加入其他模型、第二套 Runtime 或绕过 Tool Manager 的命令执行入口。
+
+目录职责：
+
+```text
+~/AI-Agent/                         程序源码、测试、发布说明
+~/.config/deep-agent/              用户配置与私有 API Key
+~/.local/share/deep-agent/         SQLite、Vector、日志、指标、健康与 Daemon 状态
+<项目>/.project-agent/             项目上下文、索引、Session、快照、缓存、工具结果附件
+/mnt/d/detail/deepseek/             用户文档、验收材料与协作入口，不是程序源码目录
+```
+
+不得把 `~/.config/deep-agent` 中的真实 Key，或 `~/.local/share/deep-agent`、项目 `.project-agent` 中的 Memory、Session、日志、浏览器会话、缓存和附件复制到 Git、文档或聊天记录。
+
+## 2. 安装、升级与启动
+
+从源码创建或更新虚拟环境：
+
+```bash
+cd ~/AI-Agent
+python3 -m venv .venv
+.venv/bin/pip install --upgrade pip
+.venv/bin/pip install -e .
+.venv/bin/agent --version
+```
+
+`pip install -e .` 会安装核心运行依赖 PyYAML、`regex` 和 `wcwidth`。后两项用于按 Unicode grapheme cluster 和终端单元格宽度裁剪进度行，避免拆开 CJK、组合字符、旗帜、肤色、Keycap、VS16 和 ZWJ emoji。Browser、Vector、语义索引和文档处理的额外依赖仍按需安装。
+
+在要处理的项目目录启动，而不是固定在程序目录启动：
 
 ```bash
 cd /任意/项目目录
+agent init
 agent
+agent "分析当前项目并给出验证结论"
 ```
 
-首次运行会在项目根目录创建 `.project-agent/`，保存项目上下文、索引、会话、快照和缓存。程序、配置、全局数据与项目数据相互分离：
+首次初始化会在当前项目根目录创建 `.project-agent/`。若自然语言任务恰好以管理命令名开头，可用 `--` 取消命令分派：
 
-```text
-~/AI-Agent/                         程序、测试、发布说明
-~/.config/deep-agent/              配置和 API Key
-~/.local/share/deep-agent/         SQLite、Chroma、日志、指标、健康与 Daemon 状态
-<项目>/.project-agent/             项目上下文、索引、Session、快照
+```bash
+agent -- doctor this code path
 ```
 
-## 2. DEEPSEEK_API_KEY 设置位置
+## 3. 私有 DEEPSEEK_API_KEY
 
-推荐且程序会自动读取的位置：
+推荐且程序会自动读取的私有文件：
 
 ```text
 ~/.config/deep-agent/secrets.env
 ```
 
-编辑方法：
+编辑并收紧权限：
 
 ```bash
 nano ~/.config/deep-agent/secrets.env
+chmod 600 ~/.config/deep-agent/secrets.env
 ```
 
-单个 Key：
+文件中填写一个 Key：
 
 ```bash
-DEEPSEEK_API_KEY=sk-your-key
+DEEPSEEK_API_KEY=replace_with_your_valid_key
 ```
 
-多个 Key 可以使用英文逗号或中文逗号分隔：
+也可用英文逗号或中文逗号配置 Key 池：
 
 ```bash
 DEEPSEEK_API_KEY=key_1,key_2,key_3
 ```
 
-程序会自动去除空格、空值和重复 Key，并在 `401`、`403`、`429` 时切换下一个 Key。不要把 Key 放进项目目录、Git、README 或聊天记录。
+程序会去除空格、空值和重复项。HTTP `401`、`403`、`429` 会切换下一个 Key；网络错误、超时、`408` 和临时 `5xx` 会对同一 Key 做有限指数退避。流式响应已经输出部分内容后不会自动重放，以免重复工具副作用，而是保存 Session 供 Resume。
 
-设置后执行：
+验证配置：
 
 ```bash
-chmod 600 ~/.config/deep-agent/secrets.env
+agent doctor
 agent doctor --online
 ```
 
-本次未读取或执行真实 Key 在线验证。用户可运行 `agent doctor --online`，程序只显示数量和状态，不输出 Key 内容。
+`agent doctor --online` 只报告 Key 数量、状态码和可用性，不应输出 Key 内容。本次文档整理没有读取、打印或复制任何真实 Key。
 
-## 3. 常用启动方式
+## 4. 主要命令
 
 ```bash
-cd /mnt/d/detail/deepseek
+agent --help
+agent --version
+agent doctor
+agent doctor --online
 agent init
+agent "实现并验证这个功能"
 agent
-agent "分析当前项目并给出修改建议"
+agent sessions
+agent resume
+agent resume --session SESSION_ID "继续原任务并完成验证"
+agent context show
+agent context refresh
+agent context index
+agent tools
+agent tools --all
+agent mcp status
+agent mcp tools
+agent mcp config
+agent projects
+agent memory search "query"
+agent memory add Knowledge "title" "content" --global-memory
+agent memory list --kind Correction
+agent memory stats
+agent memory maintain
+agent memory maintain --apply
+agent queue "任务一" "任务二"
+agent queue resume --id QUEUE_ID
+agent parallel "任务1" "任务2" "任务3" "任务4" "任务5" "任务6" "任务7" "任务8"
+agent health
+agent daemon start
+agent daemon status
+agent daemon stop
 ```
 
 交互命令：
@@ -76,96 +140,113 @@ agent "分析当前项目并给出修改建议"
 /undo
 /yolo on|off
 /super-yolo on|off
+/help
 /clear
 /exit
 ```
 
-普通任务输入完成后按一次 `Enter` 即提交。终端随后会显示“正在处理请求，请稍候...”，这表示 Agent 已开始调用 DeepSeek 和工具，不再等待继续输入。空回车不会执行任务，会提示正确用法。运行中需要返回交互界面时按 `Ctrl+C`，随后可 `/resume` 继续会话。
+普通任务输入后按一次 `Enter` 提交。提交后 UI 会立即显示正在处理、Thinking 用时、执行模式、模型轮次、计划步骤和工具状态。空输入会明确提示，不会静默执行。`Ctrl+C` 返回可恢复的交互状态；之后用 `/resume` 或 `agent resume --session ...` 继续。
 
-0.9.0 提交后会持续显示 `Thinking` 已用秒数、任务模式、DeepSeek 推理档位、模型轮次、Task Graph 当前步骤和工具状态。DeepSeek thinking 模式返回 `reasoning_content` 时会边生成边显示，不再长时间无输出。若流式响应在已经输出部分内容后断开，Agent 不会自动重复请求，以免重复工具调用；它会保存可恢复 Session 并给出 Session ID。
+`agent resume` 不带补充 Prompt 时进入最新 Session 的 REPL；`--session` 可指定 ID 或唯一前缀。交互历史以 `0600` 保存于 `~/.local/share/deep-agent/cache/repl_history`。
 
-安全模式是默认模式。`--yolo` 自动同意普通工具调用，但仍受路径、危险命令和 sudo 策略保护。`--super-yolo` 绕过 Permission Manager 的硬限制，可允许 sudo、外部路径、特权 Docker 和破坏性命令；操作系统自身的密码和权限检查仍然有效。
+## 5. 0.11.0 的可靠 Agent Loop
 
-```bash
-agent --yolo
-agent --super-yolo
-```
-
-永久开关位于 `~/.config/deep-agent/config.yaml`：
-
-```yaml
-permissions:
-  yolo: false
-  super_yolo: false
-```
-
-## 4. 0.5.0、0.6.0、0.7.0 演进
-
-### 0.5.0：安全执行与外部连接基线
-
-发布原因：先建立可信修改闭环，再扩展外部能力。
-
-主要能力：`file_diff -> file_apply -> file_undo`、Git/文件快照、MCP stdio/HTTP/SSE、MCP Resources、浏览器持久会话与下载、受限 HTTP、Queue、8 任务阈值的 Git worktree 并行、Memory 管理和纠错学习。
-
-后续方向：从“工具齐全”转向“统一决策状态”。
-
-### 0.6.0：决策智能
-
-发布原因：让 Resume、Queue、Parallel 共用同一 Task Graph 和 AgentState，而不是各自维护状态。
-
-主要能力：依赖感知 Planner、Workspace Memory、Reflection、Execution Context、Capability Health。
-
-后续方向：提高修改代码后的即时反馈和大型项目长期维护能力。
-
-### 0.7.0：深度代码理解与长期维护
-
-发布原因：代码修改后需要立即诊断，Memory 需要去重与生命周期，Session 和项目索引需要长期运行而不无限膨胀。
-
-主要能力：
-
-- Python 使用 Pyright，JavaScript/TypeScript 使用 `tsc --noEmit`，每个诊断引擎可独立降级。
-- `file_apply` 成功后自动诊断，写入成功与代码诊断错误分开表达。
-- Tree-sitter 旁路索引增加模块摘要、导出符号和内部 import 关系。
-- Memory 增加可信度、使用次数、最后使用时间、过期时间和归并关系。
-- `/resume` 压缩历史工具消息，保留上次结果、AgentState、Execution Context、当前上下文和 Memory。
-- 可选 Daemon 负责增量索引和 Memory 整理，默认关闭。
-- SQLite WAL、FTS 回填、Queue 跨进程锁和更严格的日志脱敏。
-
-后续方向：V1.0 只作为规划，不在当前版本实施。目标是冻结 Runtime 接口、让 Context Builder 成为唯一上下文入口、完成 Event Bus 副作用闭环，并保持所有新能力经过 Capability Registry 与 Permission Manager。
-
-### 0.7.1：交互输入可靠性补丁
-
-发布原因：WSL/GNU Readline 彩色 Prompt 中的 ANSI 控制字符未声明为不可见字符，在窄终端或自动换行时会导致光标位置计算错误，表现为按 Enter 后看起来仍在输入。
-
-主要修复：
-
-- Readline 模式下正确标记 ANSI 颜色控制字符，不参与光标和换行长度计算。
-- 输入前刷新输出，确保 Prompt 已显示后才开始读取。
-- 空回车显示明确提示，不再静默重新等待。
-- 任务按 Enter 提交后立刻显示“正在处理请求”，避免误以为仍在输入状态。
-- 运行中按 `Ctrl+C` 返回交互界面，可用 `/resume` 继续已检查点保存的会话。
-- 项目根目录识别仅接受有效 Git 元数据，不会再被空 `.git` 占位目录错误劫持。
-
-### 0.8.0：自适应深度执行与可见 Thinking
-
-发布原因：简单问题不应承担复杂任务的成本；大规模文本/代码和困难问题又不能塞进一次无界推理，否则容易超时、静默等待或遗漏范围。
-
-执行模式：
+执行模式由本地规则选择，不额外消耗一次 API 请求：
 
 ```text
-simple    简单事实问答，关闭 thinking，最多 4 轮
-standard  普通分析/编码，高强度 thinking，默认 8 轮
-large     整仓库/长文档，分块扫描 + Task Graph，最多 16 轮
-deep      审计/重构/根因分析，max thinking，最多 24 轮
+simple    简单事实问题；thinking 关闭；4 个工具轮次软目标
+standard  普通分析/编码；high thinking；默认 8 个工具轮次软目标
+large     整仓库/长文档；分块计划；16 个工具轮次软目标
+deep      审计/重构/根因分析；max thinking；24 个工具轮次软目标
 ```
 
-模式由本地规则选择，不额外消耗一次 API 请求。`large/deep` 会自动建立 `scope -> inspect-chunks -> implement/synthesize -> verify` 的依赖计划；读取文件、Prompt、工具输出、轮次和可见推理都有上限。短句“继续”恢复时会保留原来的 deep 策略和计划。
+0.11.0 区分“模型请求”和“工具轮次”。一条 assistant 响应中的所有工具调用都获得按原顺序配对的 `ToolResult` 并完成 checkpoint 后，才增加一个工具轮次。上下文压缩、`finish_reason=length` 的有界续写、纠正响应和最终合成都有独立计数，不消耗工具轮次。
 
-配置：
+4/8/16/24 是软目标，默认硬上限为 32。只有统一执行证据门已经满足时，soft target 才会关闭工具；计划、真实非计划工具证据、单次验证证据或指定 artifact 仍缺失时，会给出一次聚合提示并继续使用剩余 hard-limit 预算。硬上限仍会停止继续执行工具。大任务会在反复读取耗尽实现和验证预算前依次关闭宽泛探索、目标读取以及 Shell/Python 探索别名，并保留实现、验证和计划迁移能力。
+
+Runtime 接受 `stop`、`tool_calls` 以及缺失/空 finish reason。`content_filter` 或未知 finish reason 会丢弃伴随的全部工具调用并零执行，最多进行一次纠正；截断的工具调用 JSON 也不会执行。工具循环关闭后进入独立、无工具的 final synthesis；结构化工具调用或已知 DeepSeek DSML 工具协议正文不会被误当成成功答案。主循环若同时出现结构化调用与 DSML 正文，会丢弃整批调用并保持零执行。
+
+这套 soft/hard 工具轮次、finish-reason 防御、DSML 拒绝和独立 final synthesis 是 Deep Agent 的本地设计，不是参考项目原生机制。
+
+## 6. 工具结果预算、压缩和私有附件
+
+每次正常请求依次经过：
+
+```text
+单个结构化 ToolResult 硬限制
+  -> 同一 assistant 轮次聚合限制
+  -> 完整工具历史 micro/metadata compaction
+  -> Tool Schema、输出预留和安全缓冲在内的完整请求估算
+  -> 必要时由同一 DeepSeek 模型生成无工具上下文摘要
+  -> 多次失败后的确定性紧急投影
+  -> 发起模型请求
+```
+
+工具调用与结果保持连续配对。每个执行批次在提交 worker 前冻结 State、Session ID、run ID 和 EventBus 归属；中断后仍在退出的只读 worker 即使遇到 ToolManager rebind，也只能写回原 Session。AgentState 只保存有界预览、哈希和附件元数据，不保存无限制原始正文。序列化结果超过 12,000 bytes 时，在安全检查和配额允许的情况下，有界结果会写到当前 Session 私有的 `.project-agent/tool-results/`；单附件上限 8 MiB，每 Session 最多 512 个、总计 256 MiB。写入检查 request ID、SHA-256、路径、符号链接、数量和总大小；`tool_result_read` 每次只返回有界片段。附件持久化失败不会把已经成功的工具副作用篡改为失败，而是保留真实 success、受限 head/tail、哈希和 `attachment_persistence_error`，避免模型重复执行副作用。
+
+micro-compaction 先缩减旧的大结果，再降为 metadata，必要时把最旧的完整 call/result 组折叠为确定性证据，不能留下半对协议消息。语义压缩连续三次失败会打开持久熔断；Resume 后仍保持熔断，直到一次成功压缩重置。熔断打开时，服务端 overflow 的第二阶段也不会再次调用模型压缩，而是直接使用确定性 fallback。关闭主动压缩不会取消硬请求限制、输出预留、附件配额或紧急投影。
+
+hard phase 不会重新开放普通探索附件。只有 `implement` 或 `verify` 活跃时，才允许从当前 Session 中由测试、诊断、文档复验、staged diff 或受限验证 shell 产生的验证附件读取最多两次、每次最多 12,000 字符。
+
+## 7. 工具编排、计划和验证语义
+
+只有连续工具调用同时满足“能力可用、显式 `concurrency_safe=True`、权限恰好为 read、无需确认”时才可并发；所有写操作和不满足条件的调用都是串行屏障。即使 `Ctrl+C` 或其他 `BaseException` 中断，已完成结果会保留，未开始或未解决调用会得到合成失败结果，完整配对后 checkpoint，再重新抛出原中断；迟到结果仍使用批次开始时冻结的归属。
+
+大任务计划通常为 `scope -> inspect-chunks -> implement/synthesize -> verify`。只有 conditional-mutation 计划中的 `implement` 可以在无独立缺陷证据时标为 skipped；`scope`、检查和 `verify` 仍必须完成。已完成的必需 Task Graph 还必须至少有一次非计划、非 Runtime-denied 的真实工具执行，不能只靠 `agent_update_step` 自报完成。验证的完成含义是执行适当命令并如实报告结果，不要求本来就有错误的研究快照被强行修到全绿。
+
+请求生成的 artifact 必须有受管写入证据；TaskRoute schema 2 最多保存 32 个清洗后的文件/目录 hint。明确目录名必须匹配成功 `make_dir`，明确文件名必须匹配成功 `file_apply`；只有类型提示时才按 `.docx` 或 `.pdf` 扩展名匹配，不能用无关写入冒充产物。Runtime 按路径重放 apply/delete/undo，创建后删除的文件不再算完成，撤销删除后才可恢复；Word 的 render、`file_apply`、重新打开解析和日期检查还绑定到同一 `preview_id` 与目标文件。artifact 意图按有界分句判断，因此“不要输出凭据”“忽略生成文件”等禁令不会跨分句误触发 artifact 要求；独立、明确的报告生成请求仍会被执行。
+
+`read_file` 输出为“右对齐六列行号 + `→` + 原始源码”，例如：
+
+```text
+     1→export const value = 1
+```
+
+箭头和箭头前的显示行号都不是源码。`file_diff` 在搜索前拒绝 `old_text == new_text`，避免无意义修改。
+
+`run_tests framework=auto` 按 Python markers、`package.json`、Cargo、Go、Gradle、Maven 的顺序选择框架。npm 只运行实际存在的 allowlist script，优先 `test`、`typecheck`、`check`、`lint`、`build`。当前尚未完整读取 bun/pnpm/yarn 的 package-manager 元数据，相关项目应在任务中明确测试命令并核对实际执行结果。
+
+任务若明确要求“只运行一次验证”，TaskRouter 会记录 `single-validation`。即使任务不需要 Task Graph，结束前也必须存在一次真实验证尝试；普通读取、Runtime-denied 和 handler 前 `not_executed` 调用不算。第一次实际测试、诊断或受识别的验证 shell 命令无论成功、缺少依赖还是遇到既有基线错误，都算这一次；之后等价的 test/LSP/shell 尝试会被 Runtime 拒绝。`uv run`、`npm --prefix`、`timeout`、`python -I -m pytest` 等包装形式会被识别；一条 shell 中含多个验证命令时会在执行前拒绝，避免验证探针级联消耗轮次和 API 余额。hard phase 还会拒绝带值的 write/apply/update/bless/accept/w/install-types 修复参数。
+
+## 8. 关键配置文件和默认值
+
+首次启动会在 `~/.config/deep-agent/` 创建并只补充缺失默认值，不覆盖已有用户值：
+
+```text
+config.yaml       Runtime、Model、Context、工具总开关、Memory、Daemon、权限和 Event
+model.yaml        DeepSeek 模型覆盖
+tools.yaml        Capability 元数据、权限和确认要求
+memory.yaml       Memory 索引行为
+mcp.yaml          MCP server 配置
+secrets.env       私有 API Key，权限 0600
+```
+
+### 8.1 Model、Runtime、收敛和 Context
 
 ```yaml
+model:
+  provider: deepseek
+  base_url: https://api.deepseek.com
+  chat_path: /chat/completions
+  model: deepseek-v4-pro
+  context_window_tokens: 65536
+  temperature: 0.2
+  max_tokens: 4096
+  api_key_env: DEEPSEEK_API_KEY
+  reasoning_effort: null
+  thinking: null
+  timeout_seconds: 300
+  network_retries: 2
+  retry_base_seconds: 1.0
+  routing:
+    enabled: true
+    tier: auto             # auto | fast | standard | deep
+    fast_model: null
+    standard_model: null
+    deep_model: null
+
 runtime:
-  task_mode: auto       # auto / simple / standard / large / deep
+  task_mode: auto          # auto | simple | standard | large | deep
   adaptive_thinking: true
   max_tool_rounds: 8
   max_tool_rounds_hard_limit: 32
@@ -174,52 +255,41 @@ runtime:
   progress_interval_seconds: 10
   show_thinking: true
   show_reasoning_content: true
-
-model:
-  timeout_seconds: 300
-  network_retries: 2
-  retry_base_seconds: 1.0
-```
-
-网络超时、`408` 和临时 `5xx` 会对同一个 Key 做有限指数退避；`401/403/429` 仍切换下一个 Key。
-
-并发和输入边界也已加固：首次 Project 初始化使用项目锁，同一 Session 不能被两个进程同时 Resume，Context/Workspace 缓存原子写入；Daemon 精确校验 argv 与进程 starttime，Queue 超时清理整个进程组；Shell 输出、HTTP 请求体/Header、文档输入、浏览器下载和 MCP 分页都有硬上限。
-
-注意：普通/YOLO 的 Docker 会拒绝 host root/socket/device/namespace。Shell/Python 仍是宿主机进程，程序能限制请求里的工作目录并拦截已知危险模式，但命令文本内部的绝对路径最终由 Linux 权限而非项目级 OS 沙箱隔离。处理不可信任务时使用默认安全模式。
-
-### 0.9.0：统一上下文、任务路由与 DeepSeek 模型路由
-
-0.9.0 将模型前的决策拆成三个本地、确定性的步骤：
-
-```text
-用户请求
-  -> Task Router：任务类型、规模、风险、simple/standard/large/deep
-  -> Model Router：DeepSeek fast/standard/deep 档位
-  -> Context Builder：统一生成受限 ContextPackage
-  -> Prompt Renderer -> Agent Runtime -> Capability -> Permission
-```
-
-Task Route 和 Model Route 会写入 Session。`/resume` 的模式和精确模型只能保持或升级，“继续”等短输入不会把深度任务降为简单任务。模型不能自行选择模型，也没有引入其他 Provider。
-
-ContextPackage 统一装配 Task、Execution、Session、项目说明、README/配置、Workspace、Semantic、Memory 和 Capability 摘要。默认字符预算按模式为 12000/32000/48000/64000，硬上限 96000；标题和分隔符也计入。只有实际进入 Package 的 Memory 才增加使用次数。失败恢复 Memory 使用每轮总计 6000 字符的有界 delta，不再无限追加。
-
-模型路由配置位于 `~/.config/deep-agent/config.yaml` 或 `model.yaml`：
-
-```yaml
-model:
-  provider: deepseek
-  model: deepseek-v4-pro
-  routing:
-    enabled: true
-    tier: auto              # auto / fast / standard / deep
-    fast_model: null
-    standard_model: null
-    deep_model: null
-
-runtime:
+  max_reasoning_display_chars: 4000
   max_user_request_chars: 250000
+  auto_summarize: true
+  write_lessons: true
+  checkpoint_each_tool: true
+  queue_stop_on_failure: true
+  parallel_min_tasks: 8
+  parallel_max_workers: 4
+  capability_failure_threshold: 3
+  convergence:
+    enabled: true
+    max_consecutive_exploration_rounds: 6
+    reserved_tool_rounds: 4
+    max_tool_calls_per_round: 16
+    max_parallel_read_tools: 4
+    max_length_continuations: 2
+    max_implementation_evidence_reads: 2
+    max_validation_attachment_reads: 2
+    single_tool_result_chars: 12000
+    same_round_tool_result_chars: 48000
+    aggregate_tool_result_chars: 96000
+    output_reserve_chars: 24000
+    compacted_tool_result_chars: 1200
+    keep_recent_tool_results: 4
+    compaction_failure_limit: 3
+    auto_compaction_enabled: true
+    auto_compaction_max_tokens: 2048
+    context_safety_buffer_tokens: 8192
 
 context:
+  max_files: 5000
+  max_index_file_bytes: 1000000
+  max_symbol_files: 500
+  max_prompt_chars: 32000
+  max_context_file_chars: 8000
   max_user_request_chars: 32000
   package_limits:
     simple: 12000
@@ -227,112 +297,73 @@ context:
     large: 48000
     deep: 64000
   max_package_chars_hard_limit: 96000
+  max_task_context_chars: 8000
+  max_session_context_chars: 6000
+  max_memory_context_chars: 8000
+  max_capability_context_chars: 8000
   max_recovery_context_chars: 6000
+  semantic_index_enabled: false
+  semantic_languages:
+    - python
+    - javascript
+    - typescript
+    - tsx
+    - java
+    - go
+    - rust
 ```
 
-三个档位默认都安全回落到 `model.model`。程序不会猜测或内置未经当前 API 验证的“快速模型”名称；只有确认某个 DeepSeek 模型可用后，才应填写对应 `*_model`。`provider` 不是 `deepseek` 时会直接拒绝启动。ContextPackage 预算包含有界的用户请求，但不包含固定 System Prompt、单独发送的 Tool Schema 和后续 ToolResult；这些输入仍由各自上限控制。超过 `runtime.max_user_request_chars` 的粘贴输入会被拒绝，并提示先保存为项目文件，再由 large/deep 模式完整分块读取，避免静默丢失大段正文。
+三个档位都是 DeepSeek 能力策略，不是多个 Provider。`fast_model`、`standard_model`、`deep_model` 默认为 `null`，会回落到 `model.model`；只填写已经由当前 DeepSeek API 确认可用的模型名。`provider` 不是 `deepseek` 时程序会拒绝启动。
 
-### 0.9.1：核心接口稳定化
+`runtime.convergence.enabled: false` 会同时关闭收敛 nudge、同轮/历史 micro-compaction 和主动摘要，但单结果限制、私有附件配额、完整请求预算和紧急投影仍然生效。`auto_compaction_enabled: false` 只关闭主动 DeepSeek 摘要，适合余额紧张时减少额外请求。
 
-0.9.1 不做大规模 Runtime 重构，而是为 v1.0 冻结现有边界：
-
-```text
-CLI -> Runtime -> AgentState -> Prompt -> Capability -> Permission
-ContextBuilder -> ContextPackage -> PromptBuilder
-```
-
-关键变化：
-
-- ContextBuilder 是进入模型前唯一的上下文选择入口。
-- PromptBuilder 只接受一个 `ContextPackage`，不再接收 State、Snapshot、Memory 或能力摘要等分散参数，也不读取文件。
-- AgentState 增加 schema 常量、`validate()` 和冻结身份字段；旧 Session 可兼容恢复，未来未知 schema 会明确拒绝。
-- TaskRouter 是唯一分类器；计划模板只消费 TaskRoute，不再重复扫描 Prompt。旧 `TaskStrategySelector` 仅作 deprecated 兼容层。
-- Model Router 增加可解释成本级别：简单低风险为 `low`，普通及大型只读任务为 `balanced`，deep/高风险/架构重构/重复失败为 `high`。这只是本地资源选择提示，不是实际账单统计。
-- Event Bus 增加稳定事件字段、`run_id`、订阅取消和订阅者异常隔离。当前仍是进程内同步总线，不提供持久化重放或跨进程保证。
-
-DeepSeek 仍是唯一 Provider。没有加入 OpenAI、Anthropic 或其他模型；三个档位仍只使用用户配置并确认可用的 DeepSeek 模型名。
-
-外部扩展若还调用旧 `PromptBuilder.append_resume()`，或向 `build_initial()` 传入分散参数，需要改为先构建 ContextPackage。程序仓库内部调用已全部迁移。
-
-### 0.10.0：Event Bus 整体迁移
-
-0.10.0 在保持上述接口与 DeepSeek 唯一 Provider 不变的前提下，将 Runtime 自动副作用统一注册到 `RuntimeEventPipelines`：
-
-```text
-EventBus
-  -> required：Session checkpoint/finalize、Context Memory usage
-  -> best-effort：自动 Memory/Reflection、Capability Health
-  -> best-effort：Audit、Metrics、UI Thinking/Progress
-```
-
-关键语义：
-
-- required 事件必须有精确 owner；缺失或写入失败会 fail-closed。
-- Session owner 是否已提交通过命名 delivery 结果区分；owner 未写入时不会从不确定状态继续 finalize，只有 owner 已成功而其他 required observer 故障时才可安全落 failed terminal。
-- Session 必须先 finalize，之后才发布 `task.finished/task.failed`，避免从未持久化终态生成 Memory 或指标。
-- 实际进入 ContextPackage 的 Memory 使用 SQLite `usage_id` 原子去重；成功后才更新 AgentState，Resume 的新 turn 可再次强化一次。
-- ToolManager 不再直写 Capability Health；权限检查和 handler 完成后才发布 `tool.finished`。Health 写失败不会改变已得到的 ToolResult。
-- Audit 只记录有界元数据，不记录 Prompt、reasoning、messages、AgentState、工具参数值、stdout/stderr、正文或凭据。
-- Metrics 只记录公开 task/model/tool 事件的计数、总工具耗时和失败数；64 KiB 以上旧指标文件不会解析。
-- Thinking 片段经 `ui.progress.updated` 实时交给 ConsoleUI，但 Audit 丢弃内容、Metrics 不统计，UI 故障不会中断任务。
-
-配置位于 `~/.config/deep-agent/config.yaml`，本次只补默认值，不覆盖已有配置：
-
-```yaml
-events:
-  jsonl_log: true
-  metrics_enabled: true
-```
-
-运行数据位置：
-
-```text
-~/.local/share/deep-agent/logs/       元数据审计 JSONL
-~/.local/share/deep-agent/metrics/    每项目聚合指标 JSON
-~/.local/share/deep-agent/capability-health/
-```
-
-Event Bus 仍是进程内同步总线，不提供跨进程 Broker、重放或进程崩溃后的 exactly-once。需要可靠重放的工具副作用应在后续实现独立 Durable Intent Journal，而不能让 Event 绕过 Permission Manager。完整开发边界见 `docs/architecture-v0.10.0.md`。
-
-## 5. 安全文件修改与回滚
-
-Agent 的源码修改流程：
-
-```text
-file_diff 生成 unified diff 预览
-    -> file_apply 校验原文件哈希
-    -> 创建 Session 快照
-    -> 原子写入
-    -> 校验写入结果
-    -> 对 Python/JS/TS 自动运行诊断
-```
-
-回滚：
-
-```text
-/undo
-```
-
-或模型调用 `file_undo`。如果文件在快照后又被人工修改，Agent 会拒绝覆盖更新内容。
-
-## 6. LSP Diagnostics
-
-手动诊断能力名为 `lsp_diagnostics`，支持 `.py`、`.js`、`.jsx`、`.ts`、`.tsx`。
-
-依赖安装位置：
-
-```text
-~/.local/share/deep-agent/node-tools
-```
-
-当前工具：Pyright 1.1.411、TypeScript 7.0.2、typescript-language-server 5.3.0。
-
-诊断返回文件、行、列、严重级别、错误代码和消息。扫描会跳过 `.git`、`.project-agent`、虚拟环境、`node_modules`、`dist`、`build` 等目录。
-
-配置：
+### 8.2 工具、附件、LSP 和 HTTP
 
 ```yaml
 tools:
+  shell:
+    enabled: true
+    timeout_seconds: 120
+  python:
+    enabled: true
+    timeout_seconds: 120
+  git:
+    enabled: true
+    timeout_seconds: 120
+  document:
+    enabled: true
+    timeout_seconds: 180
+    max_input_bytes: 25000000
+  ocr:
+    enabled: true
+    timeout_seconds: 180
+  docker:
+    enabled: true
+    timeout_seconds: 180
+  browser:
+    enabled: true
+    timeout_seconds: 180
+    max_download_bytes: 100000000
+  file:
+    enabled: true
+    max_file_bytes: 2000000
+  template:
+    enabled: true
+    timeout_seconds: 300
+    max_input_bytes: 67108864
+  tool_result:
+    enabled: true
+    max_attachment_bytes: 8388608
+    persist_threshold_bytes: 12000
+    preview_chars: 12000
+    max_read_chars: 32000
+    max_attachments_per_session: 512
+    max_session_bytes: 268435456
+  http:
+    enabled: false
+    timeout_seconds: 30
+    max_response_bytes: 1048576
+    allowed_domains: []
   lsp:
     enabled: true
     timeout_seconds: 60
@@ -340,229 +371,196 @@ tools:
     auto_after_file_apply: true
 ```
 
-## 7. Semantic Context
+HTTP 默认关闭。启用时必须配置域名 allowlist，只允许受限 GET/POST JSON，并继续经过 Capability Registry、Permission Manager、超时和 1 MiB 响应上限。
 
-默认关闭。在 `~/.config/deep-agent/config.yaml` 中启用：
+`lsp_diagnostics` 支持 `.py`、`.js`、`.jsx`、`.ts`、`.tsx`。Python 使用 Pyright，JavaScript/TypeScript 使用 `tsc --noEmit`；各引擎可独立降级。`file_apply` 成功与随后发现的诊断错误会分开表达。
 
-```yaml
-context:
-  semantic_index_enabled: true
-  semantic_languages:
-    - python
-    - javascript
-    - typescript
-    - java
-    - go
-    - rust
-```
-
-生成文件：
-
-```text
-.project-agent/index.semantic.json
-```
-
-它不会替换轻量 `index.json`。Prompt 只加载受限摘要，完整索引留在文件中；0.9.0 还会把 Semantic 与其他来源一起纳入 ContextPackage 总预算，避免长 README 将其静默挤掉。
-
-## 8. Memory 生命周期
-
-查看和维护：
-
-```bash
-agent memory list
-agent memory search "docker proxy"
-agent memory stats
-agent memory edit 123
-agent memory delete 123
-agent memory maintain
-agent memory maintain --apply
-```
-
-`maintain` 默认只预览。`--apply` 才执行：
-
-- 合并高相似度的 Correction、Lesson、Reflection。
-- 合并标签、使用次数和可信度，并保留 `merged_into` 追踪关系。
-- 删除已过期、低可信度且非保护类型的 Memory。
-- Correction 和 Decision 默认不会自动过期。
-
-配置：
+### 8.3 权限、Event、Memory 和 Daemon
 
 ```yaml
+permissions:
+  enforce: true
+  restrict_cwd_to_project: true
+  deny_capabilities: []
+  auto_approve_capabilities:
+    - file.apply
+    - file.undo
+  yolo: false
+  super_yolo: false
+
+events:
+  jsonl_log: true
+  metrics_enabled: true
+
 memory:
+  retrieval_limit: 8
+  vector_enabled: true
+  smart_reflection: false
   dedupe_similarity: 0.94
   default_confidence: 0.7
   expiry_days: 365
   protect_kinds:
     - Correction
     - Decision
-  smart_reflection: false
-```
 
-## 9. Daemon
-
-Daemon 默认关闭，只在需要后台增量维护时启动：
-
-```bash
-cd 项目目录
-agent daemon start
-agent daemon status
-agent daemon stop
-```
-
-功能：轮询文件变化、刷新 `index.json`、Workspace Memory 和可选语义索引，定期执行 Memory 生命周期维护。PID、锁、状态和日志位于：
-
-```text
-~/.local/share/deep-agent/daemon/<ProjectID>/
-```
-
-配置：
-
-```yaml
 daemon:
   enabled: false
   poll_interval_seconds: 10
   memory_maintenance_seconds: 3600
   queue_enabled: false
+  queue_timeout_seconds: 3600
 ```
 
-`queue_enabled` 默认关闭。开启后 Daemon 才会寻找 `pending` Queue，并使用安全的 `--auto-approve` 模式执行。Queue 自带跨进程锁，防止前台与后台重复运行。
+安全模式默认要求确认；`--auto-approve` 只自动同意配置的快照型能力；`--yolo` 跳过确认但保留路径、危险命令、Docker 和 sudo 硬策略；`--super-yolo` 还会绕过 Permission Manager 硬限制，必须只用于明确授权的主机操作。Linux 自身权限和密码检查仍然有效。
 
-单个后台 Queue 的绝对超时由 `daemon.queue_timeout_seconds` 控制，默认 3600 秒，避免任务数过多时无限等待。
+Event Bus 是进程内同步总线，不是跨进程 Broker 或 exactly-once 系统。Session 和实际进入 ContextPackage 的 Memory usage 是 required；自动 Memory/Reflection、Capability Health、Audit、Metrics 和 UI progress 是 best-effort。Audit 只允许有界元数据，不记录 Prompt、reasoning、消息、AgentState、工具参数值、stdout/stderr、正文或凭据。
 
-## 10. MCP、HTTP、Browser 与 OCR
+`agent memory maintain` 仅预览；加 `--apply` 才会归并高相似度记录并清理满足条件的过期记录。Correction 和 Decision 默认受保护。
 
-MCP 配置：
+Daemon 默认关闭。开启后按项目维护增量索引和 Memory；Queue 仍需显式设置 `daemon.queue_enabled: true`。
+
+### 8.4 MCP
+
+`~/.config/deep-agent/mcp.yaml` 的关键开关：
+
+```yaml
+mcp:
+  enabled: false
+  startup_timeout_seconds: 15
+  call_timeout_seconds: 120
+  resource_timeout_seconds: 60
+  max_servers: 10
+  max_tools: 80
+  servers: []
+```
+
+MCP 支持 stdio、Streamable HTTP、SSE、tools/list、tools/call 和可选 resources/read。远端能力仍经过 Registry 和 Permission Manager；URL 凭据、重定向和未经明确配置的环境变量会被拒绝。不要把 DeepSeek Key 默认透传给 MCP server。
+
+## 9. 文件修改、诊断与回滚快照
+
+受管源码修改流程：
 
 ```text
-~/.config/deep-agent/mcp.yaml
+file_diff 生成 unified diff 预览
+  -> file_apply 校验原文件 SHA-256
+  -> 创建 Session 快照
+  -> 原子写入
+  -> 校验结果
+  -> 对支持的 Python/JS/TS 文件自动诊断
 ```
 
-MCP 默认关闭，支持 stdio、Streamable HTTP、SSE、tools/list、tools/call 和可选 resources/read。远端工具仍通过 Capability Registry 和 Permission Manager。
-
-受限 HTTP 默认关闭，启用时必须配置域名白名单、30 秒超时和 1 MiB 响应限制。
-
-浏览器持久 Session：
+撤销最近一次受管修改：
 
 ```text
-.project-agent/browser-sessions/<session_name>/
+/undo
 ```
 
-下载：
+也可由模型调用 `file_undo`。如果快照后文件又被人工修改，Agent 会拒绝覆盖新内容。Git 项目只记录分支、HEAD 和状态，不会擅自 stash、切换或丢弃用户改动。
+
+## 10. Resume 的能力与边界
+
+schema 6 会保存 Session 身份、原目标、计划、阶段化模型计数、收敛状态、已见目标、压缩熔断和有界工具证据。Resume 会增加 turn，恢复上一轮错误，并重置本轮读取/停滞额度，使中断后的任务可以继续；原任务模式和模型档位只能保持或升级，不会因“继续”降级。
+
+Resume 不是 Durable Intent Journal，也不是外部副作用的 exactly-once 重放。工具在外部系统已生效但回包前中断时，仍需人工核验。它也尚未等价复刻参考项目的消息链、snip/compact 边界和 replacement-decision 重放。
+
+## 11. 参考项目与实现边界
+
+固定参考为：
 
 ```text
-.project-agent/downloads/<session_name>/
+项目：https://gitee.com/free/claude-code/tree/claude/
+commit：b17913e26fd4278ad5cd4b32ed3bde86bf1444e9
 ```
 
-OCR/文档统一调用 `document.parse()`，优先复用已有 `~/.local/bin/ai-parser`，并可降级到 pdftotext、Tesseract、ImageMagick。模型最终只处理 Markdown。
+本轮使用该固定 commit 的完整校验副本进行端到端差异审计，覆盖 Agent Loop、轮次终止、工具结果预算、micro/auto compaction 与熔断、工具编排、计划完成判定、测试命令选择、网络重试、Resume 和终端输出。参考影响包括：会话范围的本地工具结果落盘与模型可见预览、显式并发安全、工具调用/结果配对、grapheme 显示宽度以及有界压缩/恢复思路。权限、路径、符号链接、数量、总字节和哈希检查属于 Deep Agent 本地的私有附件设计，不能归因于参考项目。
 
-## 11. Queue 与 Parallel
+必须区分以下本地设计：
 
-```bash
-agent queue "任务一" "任务二"
-agent queue list
-agent queue show --id QUEUE_ID
-agent queue resume --id QUEUE_ID
-```
+- DeepSeek-only Python Runtime 和现有架构边界。
+- soft/hard 工具轮次与预留实现/验证窗口。
+- finish-reason 防御、DSML 正文拒绝和独立 final synthesis。
+- conditional-mutation、artifact/Word 完成门和验证附件例外。
+- 语义压缩失败后的 AgentState/evidence 确定性投影。
 
-Parallel 仅在至少 8 个明确独立任务时启用，要求干净 Git 工作树。每个任务在临时 worktree 中运行，补丁逐个 `git apply --check` 后应用，失败或冲突不会直接污染主工作区。
+当前没有声称与参考项目完全等价。已知差异还包括：Resume 重放边界不同；JS/TS managed test runner 未完整读取 bun/pnpm/yarn 元数据；网络重试尚无参考项目的 `Retry-After`、jitter、heartbeat 和显式 chunk watchdog；通用 `verify` 状态仍主要由模型更新，只有 Word/artifact 等流程有更强工具证据门。
 
-## 12. 健康检查与故障定位
+## 12. 验证方式与当前验收状态
 
-```bash
-agent --version
-agent doctor
-agent doctor --online
-agent health
-agent health --reset lsp.diagnostics
-agent health --reset
-```
-
-能力状态：Available、Unavailable、Need Config、Disabled、Broken。Unavailable/Broken 能力不会放入模型 Tool Schema 和 Prompt 能力摘要。
-
-当前 0.10.0 本地验收：
-
-```text
-173 tests passed（含真实 PTY Thinking 流式显示）
-Ruff check passed
-Ruff format check passed
-compileall passed
-ContextPackage 总预算、完整边界截断、私有 Memory 不落盘 passed
-Task/Model 路由、失败升级、Resume 单调保持 passed
-DeepSeek streaming/tool-call assembly passed
-网络重试与部分流禁止重放 passed
-路径、符号链接、Queue 并发、Docker 参数与进程组超时回归 passed
-Interface Contract、Event、AgentState、ContextPackage、路由与 Permission 顺序 passed
-Session required owner/顺序/失败恢复、Memory usage 幂等与 Resume passed
-Capability Health best-effort、Audit/Metrics 隐私与畸形数据 passed
-GitHub Actions：Python 3.11 / 3.12 / 3.13；发布后核验运行号
-Actions：checkout@v5、setup-python@v6，使用当前 Node.js runtime，无 Node.js 20 弃用警告
-```
-
-## 13. 参考工程取舍
-
-参考了 `https://gitee.com/free/claude-code`。采纳：有界上下文、资源路径/大小/数量审计、能力降级可观测、可恢复状态、显式 Tool Loop。
-
-未采纳：第二套 Java/Spring Runtime、多模型供应商抽象、全屏 TUI、JAR 插件体系、任意 Hook、遥测、无限制 Skills/Agents 加载。这些内容会破坏当前“DeepSeek 唯一模型”和 `CLI -> Runtime -> AgentState -> Prompt -> Capability -> Permission` 边界。
-
-## 14. 新功能扩展规则
-
-以后新增工具时：
-
-1. 在 `agent/tools/` 创建单一入口。
-2. 接受 `ToolRequest`，返回 `ToolResult`。
-3. 在 Capability Registry 注册参数、权限、超时、输入输出格式和可用性。
-4. 通过 Permission Manager，不允许 Runtime 或模型直接 `subprocess` 绕过工具层。
-5. 为成功、失败、超时、路径越界和缺少依赖添加测试。
-6. 副作用通过 Event Bus 记录，敏感值必须脱敏。
-7. 重型功能默认关闭，配置迁移只增加新默认值，不覆盖用户值。
-
-## 15. 可直接运行的实用案例
-
-当前目录新增：
-
-```text
-实用案例-v0.9.0/
-实用案例-v0.9.1/
-实用案例-v0.10.0/
-```
-
-其中 `order-summary-demo/` 是一个带真实 CSV、业务规则、故意保留缺陷和回归测试的小型订单汇总项目。先阅读 `实用案例-v0.9.0/README.md`，再依次体验 simple 解释、standard Bug 修复、large 全项目分析、deep 财务/安全审计与 `/resume`。案例基线的 2 个测试应当失败，这是用于观察 Agent 定位和修复过程的预期状态，不属于 Deep Agent 主项目测试失败。
-
-快速开始：
-
-```bash
-cd /mnt/d/detail/deepseek/实用案例-v0.9.0/order-summary-demo
-python3 -m unittest discover -s tests -v
-agent
-```
-
-0.9.1 的 `interface-routing-demo.py` 不需要 API Key，可直接观察
-TaskRouter、cost-aware ModelRouter、TaskRoute-only 计划工厂和 Event Bus：
+不调用 DeepSeek 的离线验证命令：
 
 ```bash
 cd ~/AI-Agent
-PYTHONPATH=. .venv/bin/python user-docs/实用案例-v0.9.1/interface-routing-demo.py
+.venv/bin/python -m pytest
+.venv/bin/ruff check agent tests scripts
+.venv/bin/ruff format --check agent tests scripts
+.venv/bin/python -m compileall -q agent tests scripts
+git diff --check
+.venv/bin/pip check
 ```
 
-0.10.0 的 `event-runtime-demo.py` 同样不需要 API Key，可观察 required owner、best-effort 故障隔离、Memory usage 幂等、安全 Audit 和聚合 Metrics：
+0.11.0 当前离线结果：
+
+```text
+454 tests collected；全量 pytest 通过
+Agent Loop、终止、预算、附件、压缩、并发、中断、Resume、PTY、Unicode 回归通过
+指定 artifact 路径、聚合执行证据门、soft→hard 延长、不可变工具归属和真实附件 fallback 回归通过
+针对 artifact 跨分句误判、conditional-mutation 漏判和 single-validation wrapper 的 focused 回归通过
+修复后确定性端到端：4 次 main-loop 请求 + 1 次 final synthesis 通过
+Ruff check、Ruff format check、compileall、git diff --check、pip check 通过
+18 项 CLI/Console 测试通过；真实 PTY 覆盖 40 列 Enter/空输入/help、Ctrl+C、Thinking，以及 25 列含旗帜、肤色、Keycap、ZWJ/组合字符的进度行
+全新 Python 3.14 环境安装 `.[dev,browser,semantic]`，并通过同一 454 项全量回归与 pip check；仅安装 `.[dev]` 时，可选 Browser/Semantic 集成测试需要对应 extra
+```
+
+在线验收必须单独看待：
+
+- Word 汇总案例已通过在线语义门。
+- 约 2500 字文本总结案例已通过在线语义门。
+- 最新大型 TypeScript 在线验收未通过：runner 记录 36 次逻辑请求、31 个工具轮次、1,477,342 tokens；仅 `session_completed` 门失败。
+- 该失败定位为 artifact 意图跨分句误判与 conditional-mutation 漏判。修复后已通过上述确定性 4 main + 1 final synthesis 回归；为节省用户 DeepSeek API 余额，没有再次在线重跑。
+
+因此，当前可以声明离线全量与 focused 回归通过，也可以声明 Word/文本在线案例通过；不能声明 0.11.0 大型 TypeScript 在线验收已全通过。
+
+分类后的离线实用案例位于：
+
+```text
+/mnt/d/detail/deepseek/测试与验收/实用案例/v0.9.0/
+/mnt/d/detail/deepseek/测试与验收/实用案例/v0.9.1/
+/mnt/d/detail/deepseek/测试与验收/实用案例/v0.10.0/
+~/AI-Agent/user-docs/测试与验收/实用案例/
+```
+
+订单案例故意保留两个基线失败，用于观察定位和修复流程，不代表 Deep Agent 主测试失败。无需 API Key 的示例：
 
 ```bash
 cd ~/AI-Agent
-PYTHONPATH=. .venv/bin/python user-docs/实用案例-v0.10.0/event-runtime-demo.py
+PYTHONPATH=. .venv/bin/python user-docs/测试与验收/实用案例/v0.9.1/interface-routing-demo.py
+PYTHONPATH=. .venv/bin/python user-docs/测试与验收/实用案例/v0.10.0/event-runtime-demo.py
 ```
 
-## 16. 风险与回滚
+## 13. 风险、节省余额和回滚
 
-- `show_thinking` 展示的是 DeepSeek API 返回的 reasoning 内容，可能较长；可在配置中关闭。
-- 已输出部分 reasoning 后的流断线不会自动重放，需要 `/resume`，这是避免重复工具副作用的安全设计。
-- `--super-yolo` 仍会绕过 Permission Manager；普通模式和 `--yolo` 已增加 Docker host/root/socket/device 防护。
+- 主 Agent Loop、主动语义压缩、context overflow 恢复和 final synthesis 都可能产生 DeepSeek 请求。余额紧张时先完整运行离线测试，只在离线通过且确有必要时进行一次有界在线验收；可关闭 `runtime.convergence.auto_compaction_enabled` 减少主动摘要请求。
+- 最新大型 TypeScript 案例修复后尚未再次在线验收，不能把确定性回归替代在线结论。
+- DeepSeek 网络重试有次数和退避上限，但目前没有 `Retry-After`、jitter、heartbeat 或显式 chunk watchdog。
+- `show_reasoning_content` 会显示模型返回的 reasoning，可能较长；可关闭该开关。
+- 私有附件有大小和总量上限，完整结果不一定全部进入模型上下文。
+- `--super-yolo` 会绕过 Permission Manager；Shell/Python 仍是宿主机进程，应只对可信任务使用。
+- Event Bus 和 Resume 都不提供外部副作用的 exactly-once 保证。
 
-回滚到上一版不会删除配置、Memory 或项目数据：
+回滚到 v0.10.0：
 
 ```bash
 cd ~/AI-Agent
-git switch --detach v0.9.1
+git switch --detach v0.10.0
 .venv/bin/pip install -e .
 ```
 
-恢复最新版执行 `git switch main`。0.10.0 仅新增默认值、指标文件和 SQLite 幂等表，不覆盖配置，也不删除 Session、Memory 或项目数据；0.9.1 会安全忽略这些新增数据。
+返回当前主线：
+
+```bash
+cd ~/AI-Agent
+git switch main
+.venv/bin/pip install -e .
+```
+
+0.11.0 的配置迁移只增加缺失默认值，不覆盖已有配置。不要为了回滚删除 Memory、`.project-agent`、Session 或私有工具附件。v0.10.0 不能直接 Resume schema 6 Session，会把它拒绝为未来 schema；应先在 v0.11.0 完成该 Session，或保留数据并在 v0.10.0 新建 Session。

@@ -230,7 +230,7 @@ class ContextBuilder:
             if execution:
                 candidates.append(execution)
         if request.phase == "resume":
-            candidates.append(self._resume_section(request.prior_messages))
+            candidates.append(self._resume_section(request.state, request.prior_messages))
         for memory_item in request.memory_items:
             candidates.append(self._memory_section(memory_item))
         memory_context = request.memory_context.strip()
@@ -605,6 +605,9 @@ class ContextBuilder:
             [
                 f"- Session: `{self._inline(state.session_id, 200)}`",
                 f"- Turn: `{state.turn}`",
+                f"- Original objective: {self._inline(state.objective, 3_000)}",
+                f"- Current instruction: {self._inline(state.user_request, 2_000)}",
+                f"- Consecutive failed turns: `{state.failure_count}`",
                 f"- Working directory: `{self._inline(state.working_directory, 1000)}`",
                 f"- Git branch: `{self._inline(state.git_branch or 'not detected', 300)}`",
                 f"- Execution mode: `{self._inline(strategy.get('mode', 'standard'), 40)}`",
@@ -660,11 +663,41 @@ class ContextBuilder:
         )
         return self._section("execution", "Execution Context", content, priority=30)
 
-    def _resume_section(self, messages: Sequence[dict[str, Any]]) -> ContextSection:
+    def _resume_section(self, state: AgentState, messages: Sequence[dict[str, Any]]) -> ContextSection:
         previous = self.previous_outcome(messages)
-        content = (
-            "Session resumed from a compact checkpoint. The previous raw tool transcript was removed. "
-            "Use Agent State and Execution Context as the source of truth."
+        execution_error = state.execution_context.recent_error if state.execution_context else ""
+        last_error = state.error or execution_error or "None."
+        evidence_lines = []
+        for item in state.tool_calls[-12:]:
+            request = item.get("request") if isinstance(item.get("request"), dict) else {}
+            result = item.get("result") if isinstance(item.get("result"), dict) else {}
+            args = request.get("args") if isinstance(request.get("args"), dict) else {}
+            data = result.get("data") if isinstance(result.get("data"), dict) else {}
+            label = f"{request.get('tool', '?')}.{request.get('action', '?')}"
+            target = data.get("path") or args.get("path") or args.get("pattern") or args.get("query") or ""
+            detail = self._inline(target, 300) if target else "no safe target metadata"
+            outcome = "success" if result.get("success") else "failed"
+            evidence_lines.append(
+                f"- turn {item.get('turn', '?')} round {item.get('round', '?')}: {label} {outcome}; {detail}"
+            )
+        content = "\n".join(
+            [
+                "Session resumed from a compact checkpoint. Continue the original objective; do not restart the task.",
+                "",
+                "### Original Objective",
+                "",
+                self._head_tail(state.objective, 2_500),
+                "",
+                "### Current Resume Instruction",
+                "",
+                self._head_tail(state.user_request, 1_500),
+                "",
+                "### Recent Durable Tool Evidence",
+                "",
+                *(evidence_lines or ["No completed tool calls were recorded."]),
+                "",
+                f"### Last Recorded Error\n\n{self._head_tail(last_error, 1_000)}",
+            ]
         )
         if previous:
             content += "\n\n### Previous Outcome\n\n" + previous

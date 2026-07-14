@@ -4,9 +4,17 @@ import shutil
 import json
 import sys
 import tempfile
+from io import BytesIO
 from pathlib import Path
 
-from .base import ToolResult, run_command, truncate_text
+from .base import (
+    DEFAULT_MAX_RESULT_SOURCE_BYTES,
+    BoundedByteCapture,
+    ToolResult,
+    bound_text_source,
+    bounded_result_source_bytes,
+    run_command,
+)
 from .pathsafe import resolve_project_path
 
 
@@ -43,10 +51,17 @@ AI_TOOLS_LAUNCHER = Path.home() / ".local" / "bin" / "ai-parser"
 
 
 class DocumentTool:
-    def __init__(self, cwd: Path, timeout: int = 180, max_input_bytes: int = 25_000_000) -> None:
+    def __init__(
+        self,
+        cwd: Path,
+        timeout: int = 180,
+        max_input_bytes: int = 25_000_000,
+        max_result_bytes: int = DEFAULT_MAX_RESULT_SOURCE_BYTES,
+    ) -> None:
         self.cwd = cwd
         self.timeout = timeout
         self.max_input_bytes = max(1, min(int(max_input_bytes), 100_000_000))
+        self.max_result_bytes = bounded_result_source_bytes(max_result_bytes)
 
     def parse(self, path: str, ocr: bool = True) -> ToolResult:
         file_path = self._resolve(path)
@@ -69,6 +84,49 @@ class DocumentTool:
             return ToolResult(False, "", "word parsing requires ai-parser dependencies or pandoc")
         return ToolResult(False, "", f"unsupported document type: {suffix or '<none>'}")
 
+    def render_docx(self, *, title: str, markdown: str) -> tuple[bytes, dict[str, object]]:
+        try:
+            from docx import Document
+            from docx.shared import Pt
+        except ImportError as exc:
+            raise RuntimeError("Word generation requires the python-docx package") from exc
+        document = Document()
+        styles = document.styles
+        styles["Normal"].font.name = "Microsoft YaHei"
+        styles["Normal"].font.size = Pt(10.5)
+        if title.strip():
+            document.add_heading(title.strip()[:500], level=0)
+        paragraph_count = 0
+        heading_count = 0
+        for raw_line in str(markdown).splitlines():
+            line = raw_line.rstrip()
+            if not line:
+                document.add_paragraph()
+                paragraph_count += 1
+                continue
+            stripped = line.lstrip()
+            hashes = len(stripped) - len(stripped.lstrip("#"))
+            if hashes and hashes <= 6 and stripped[hashes:].startswith(" "):
+                document.add_heading(stripped[hashes + 1 :].strip()[:1000], level=min(hashes, 9))
+                heading_count += 1
+                continue
+            if stripped.startswith(("- ", "* ")):
+                document.add_paragraph(stripped[2:].strip(), style="List Bullet")
+            elif len(stripped) > 3 and stripped[0].isdigit() and ". " in stripped[:5]:
+                document.add_paragraph(stripped.split(". ", 1)[1], style="List Number")
+            else:
+                document.add_paragraph(line)
+            paragraph_count += 1
+        stream = BytesIO()
+        document.save(stream)
+        content = stream.getvalue()
+        return content, {
+            "format": "docx",
+            "bytes": len(content),
+            "paragraph_count": paragraph_count,
+            "heading_count": heading_count,
+        }
+
     def _resolve(self, path: str) -> Path:
         return resolve_project_path(self.cwd, path, require_file=True)
 
@@ -77,11 +135,7 @@ class DocumentTool:
             text = file_path.read_text(encoding="utf-8")
         except UnicodeDecodeError:
             text = file_path.read_text(encoding="utf-8", errors="replace")
-        return ToolResult(
-            True,
-            markdown_document(file_path, truncate_text(text)),
-            data={"path": str(file_path), "parser": "text"},
-        )
+        return self._markdown_result(file_path, text, {"path": str(file_path), "parser": "text"})
 
     def _parse_pdf(self, file_path: Path, ocr: bool) -> ToolResult:
         if shutil.which("pdftotext"):
@@ -89,12 +143,13 @@ class DocumentTool:
                 ["pdftotext", "-layout", str(file_path), "-"],
                 cwd=self.cwd,
                 timeout=self.timeout,
+                max_output_bytes=self.max_result_bytes,
             )
             if result.ok and result.output.strip():
-                return ToolResult(
-                    True,
-                    markdown_document(file_path, truncate_text(result.output)),
-                    data={"path": str(file_path), "parser": "pdftotext"},
+                return self._markdown_result(
+                    file_path,
+                    result.output,
+                    {"path": str(file_path), "parser": "pdftotext", **_source_metadata(result.data)},
                 )
         if ocr:
             return self._ocr_pdf(file_path)
@@ -110,6 +165,7 @@ class DocumentTool:
                 [*command, str(file_path), "-o", str(output_dir)],
                 cwd=self.cwd,
                 timeout=self.timeout,
+                max_output_bytes=self.max_result_bytes,
             )
             if not result.ok:
                 return result
@@ -119,6 +175,19 @@ class DocumentTool:
             text = ""
             if json_files:
                 try:
+                    if json_files[0].stat().st_size > self.max_input_bytes:
+                        return ToolResult(
+                            False,
+                            "",
+                            f"ai-parser JSON output exceeds {self.max_input_bytes} bytes",
+                            data={
+                                **metadata,
+                                "source_truncated": True,
+                                "source_original_bytes": json_files[0].stat().st_size,
+                                "source_original_bytes_known": True,
+                                "source_captured_bytes": 0,
+                            },
+                        )
                     payload = json.loads(json_files[0].read_text(encoding="utf-8"))
                     text = str(payload.get("text") or "")
                     if isinstance(payload.get("metadata"), dict):
@@ -127,14 +196,23 @@ class DocumentTool:
                 except json.JSONDecodeError:
                     text = ""
             if not text and text_files:
+                if text_files[0].stat().st_size > self.max_input_bytes:
+                    return ToolResult(
+                        False,
+                        "",
+                        f"ai-parser text output exceeds {self.max_input_bytes} bytes",
+                        data={
+                            **metadata,
+                            "source_truncated": True,
+                            "source_original_bytes": text_files[0].stat().st_size,
+                            "source_original_bytes_known": True,
+                            "source_captured_bytes": 0,
+                        },
+                    )
                 text = text_files[0].read_text(encoding="utf-8", errors="replace")
             if not text.strip():
                 return ToolResult(False, result.output, "ai-parser produced no text", data=metadata)
-            return ToolResult(
-                True,
-                markdown_document(file_path, truncate_text(text)),
-                data=metadata,
-            )
+            return self._markdown_result(file_path, text, metadata)
 
     def _parse_image(self, file_path: Path) -> ToolResult:
         if not shutil.which("tesseract"):
@@ -143,19 +221,21 @@ class DocumentTool:
             ["tesseract", str(file_path), "stdout", "-l", "eng+chi_sim"],
             cwd=self.cwd,
             timeout=self.timeout,
+            max_output_bytes=self.max_result_bytes,
         )
         if not result.ok:
             result = run_command(
                 ["tesseract", str(file_path), "stdout"],
                 cwd=self.cwd,
                 timeout=self.timeout,
+                max_output_bytes=self.max_result_bytes,
             )
         if not result.ok:
             return result
-        return ToolResult(
-            True,
-            markdown_document(file_path, truncate_text(result.output)),
-            data={"path": str(file_path), "parser": "tesseract"},
+        return self._markdown_result(
+            file_path,
+            result.output,
+            {"path": str(file_path), "parser": "tesseract", **_source_metadata(result.data)},
         )
 
     def _ocr_pdf(self, file_path: Path) -> ToolResult:
@@ -173,22 +253,47 @@ class DocumentTool:
                 cmd.extend([str(file_path), str(out_pattern)])
             else:
                 cmd.extend(["-density", "180", str(file_path), str(out_pattern)])
-            convert_result = run_command(cmd, cwd=self.cwd, timeout=self.timeout)
+            convert_result = run_command(
+                cmd,
+                cwd=self.cwd,
+                timeout=self.timeout,
+                max_output_bytes=self.max_result_bytes,
+            )
             if not convert_result.ok:
                 return convert_result
-            parts = []
+            capture = BoundedByteCapture(self.max_result_bytes)
+            found_text = False
             for image in sorted(tmpdir.glob("page*.png")):
                 ocr_result = self._parse_image(image)
                 if ocr_result.ok and ocr_result.output.strip():
-                    parts.append(f"## {image.name}\n\n{ocr_result.output}")
-            if not parts:
+                    found_text = True
+                    capture.feed(f"## {image.name}\n\n{ocr_result.output}\n\n".encode("utf-8"))
+            if not found_text:
                 return ToolResult(False, "", "OCR produced no text")
-            return ToolResult(
-                True,
-                markdown_document(file_path, truncate_text("\n\n".join(parts))),
-                data={"path": str(file_path), "parser": "pdf-ocr"},
+            return self._markdown_result(
+                file_path,
+                capture.text(),
+                {"path": str(file_path), "parser": "pdf-ocr", **capture.metadata()},
             )
+
+    def _markdown_result(self, path: Path, content: str, data: dict[str, object]) -> ToolResult:
+        rendered, bounded_metadata = bound_text_source(
+            markdown_document(path, content),
+            self.max_result_bytes,
+        )
+        upstream = _source_metadata(data)
+        if upstream.get("source_truncated"):
+            bounded_metadata.update(upstream)
+        merged = dict(data)
+        merged.update(bounded_metadata)
+        return ToolResult(True, rendered, data=merged)
 
 
 def markdown_document(path: Path, content: str) -> str:
     return f"# Parsed Document\n\n- Source: `{path}`\n\n---\n\n{content.strip()}\n"
+
+
+def _source_metadata(value: object) -> dict[str, object]:
+    if not isinstance(value, dict):
+        return {}
+    return {str(key): item for key, item in value.items() if str(key).startswith("source_")}

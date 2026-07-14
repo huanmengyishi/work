@@ -34,18 +34,255 @@ def test_task_router_returns_structured_deterministic_routes(make_config) -> Non
         "medium",
         "standard",
     )
+    assert "conditional-mutation" not in bug.reasons
     assert (large.task_type, large.scale, large.risk, large.mode) == (
         "review",
         "large",
         "low",
         "large",
     )
+
+    document = router.route("总结当前目录的所有文档，新建word给我汇总内容")
+    assert document.task_type == "document_workflow"
+    assert document.scale == "large"
+    assert document.mode == "large"
+    assert document.require_plan is True
+    assert "artifact-required" in document.reasons
+    assert "word-artifact-required" in document.reasons
+
+    no_artifact = router.route("阅读材料.txt，总结安全要求，不要新建文件，完成后直接回复")
+    assert "artifact-required" not in no_artifact.reasons
+    assert no_artifact.require_plan is False
+    assert no_artifact.mode == "standard"
+
+    fix_without_report = router.route("修复这个 bug，但不要创建报告文件")
+    assert fix_without_report.task_type == "bug_fix"
+    assert "mutation-request" in fix_without_report.reasons
+    assert "artifact-required" not in fix_without_report.reasons
+    conditional_fix = router.route(
+        "忽略 node_modules、dist、构建产物和生成文件；分析整个项目。只修复证据确凿的 Bug，"
+        "若没有充分证据就不要修改代码。"
+    )
+    assert conditional_fix.task_type == "bug_fix"
+    assert "mutation-request" in conditional_fix.reasons
+    assert "conditional-mutation" in conditional_fix.reasons
+    assert "artifact-required" not in conditional_fix.reasons
     assert deep.task_type == "refactor"
     assert deep.scale == "large"
     assert deep.risk == "high"
     assert deep.mode == "deep"
     assert deep.max_tool_rounds == 24
     assert router.route("什么是 Python？").to_dict() == simple.to_dict()
+
+
+def test_task_router_does_not_confuse_prohibited_credential_output_with_artifact_request(make_config) -> None:
+    router = TaskRouter(make_config())
+    acceptance_prompt = (
+        "忽略 node_modules、dist、构建产物和生成文件；审查整个项目。"
+        "若研究快照缺少内部源码或类型而产生大量基线错误，应如实记录为验证限制，"
+        "不得为了‘全绿’而批量补文件或逐条打补丁；不得读取或输出任何真实凭据。"
+        "只运行一次项目已有的静态检查或与目标代码相称的验证，不要重复等价命令。"
+        "若没有充分证据，‘未找到可证实缺陷’是合格结论，应跳过 implement、完成 verify，不要修改代码；"
+        "最终回复必须列出项目优点、Bug 证据、修改文件、验证结果和剩余风险。"
+    )
+
+    routed = router.route(acceptance_prompt)
+
+    assert routed.task_type == "bug_fix"
+    assert "mutation-request" in routed.reasons
+    assert "conditional-mutation" in routed.reasons
+    assert "single-validation" in routed.reasons
+    assert "artifact-required" not in routed.reasons
+    assert "word-artifact-required" not in routed.reasons
+    assert "directory-artifact-required" not in routed.reasons
+
+
+def test_task_router_keeps_explicit_artifact_when_a_separate_output_is_prohibited(make_config) -> None:
+    router = TaskRouter(make_config())
+
+    positive_with_secret_guard = router.route("请创建报告文件，但不得读取或输出任何真实密钥")
+    positive_with_extra_file_guard = router.route("请创建汇总报告文件，但不要创建额外日志文件")
+    negative_then_positive = router.route("不要创建临时日志文件；请输出汇总报告文件")
+    same_clause_negative_then_positive = router.route("不要创建临时日志文件但请输出汇总报告文件")
+    negative_only = router.route("检查所有文件，不得读取或输出任何真实凭据，直接回复检查结果")
+    separate_clauses = router.route("检查项目文件；输出结论时不得包含任何凭据；直接回复即可")
+    protected_report_path = router.route("不得输出真实凭据到报告文件，直接回复检查结果")
+    english_protected_report = router.route("Do not output credentials to a report file; reply with the result.")
+    pdf_after_rejected_word = router.route("不要生成 Word 文档；请生成 PDF 报告")
+
+    assert "artifact-required" in positive_with_secret_guard.reasons
+    assert "artifact-required" in positive_with_extra_file_guard.reasons
+    assert "artifact-required" in negative_then_positive.reasons
+    assert "artifact-required" in same_clause_negative_then_positive.reasons
+    assert "artifact-required" not in negative_only.reasons
+    assert "artifact-required" not in separate_clauses.reasons
+    assert "artifact-required" not in protected_report_path.reasons
+    assert "artifact-required" not in english_protected_report.reasons
+    assert "artifact-required" in pdf_after_rejected_word.reasons
+    assert "word-artifact-required" not in pdf_after_rejected_word.reasons
+
+
+def test_task_router_uses_bounded_artifact_negation_and_filename_hints(make_config) -> None:
+    router = TaskRouter(make_config())
+
+    negative_requests = (
+        "请检查代码，不生成报告文件，直接回复。",
+        "Ensure the command does not create a report file; reply directly.",
+        "确认运行后没有生成报告文件，直接回复。",
+        "检查路由器是否会把‘生成报告文件’误判为真实请求，只需解释。",
+        'Does the quoted phrase "create a report file" trigger artifact routing? Explain only.',
+    )
+    for prompt in negative_requests:
+        routed = router.route(prompt)
+        assert "artifact-required" not in routed.reasons, prompt
+        assert "directory-artifact-required" not in routed.reasons, prompt
+        assert routed.artifact_hints == (), prompt
+
+    quoted_positive = router.route("请生成“汇总报告文件”，并保存到当前目录。")
+    filename_word = router.route("Please create an output file named summary.docx.")
+    passive_word = router.route("A Word report should be generated.")
+
+    assert "artifact-required" in quoted_positive.reasons
+    assert "word-artifact-required" in filename_word.reasons
+    assert filename_word.artifact_hints == ("summary.docx",)
+    assert "word-artifact-required" in passive_word.reasons
+    assert passive_word.artifact_hints == (".docx",)
+
+
+def test_task_router_distinguishes_directory_artifacts_from_directory_context(make_config) -> None:
+    router = TaskRouter(make_config())
+
+    positive_requests = (
+        ("Create a new output directory.", "output"),
+        ("Generate a results folder for the artifacts.", "results"),
+        ("请新建输出目录。", "输出"),
+        ("生成一个结果文件夹。", "结果"),
+    )
+    for prompt, directory_hint in positive_requests:
+        routed = router.route(prompt)
+        assert "artifact-required" in routed.reasons, prompt
+        assert "directory-artifact-required" in routed.reasons, prompt
+        assert routed.artifact_hints == (directory_hint,), prompt
+        assert routed.directory_hints == (directory_hint,), prompt
+        assert routed.schema_version == 2
+        assert TaskRoute.from_dict(routed.to_dict()) == routed
+
+    named_requests = (
+        "Generate a directory named reports.",
+        "Create the directory called reports.",
+        "Create directory reports.",
+        "创建一个名为 reports 的目录。",
+        "创建 reports 目录。",
+        "创建目录 reports。",
+    )
+    for prompt in named_requests:
+        routed = router.route(prompt)
+        assert routed.artifact_hints == ("reports",), prompt
+        assert routed.directory_hints == ("reports",), prompt
+
+    unnamed_requests = (
+        "Create a directory.",
+        "Create a new directory.",
+        "Generate a directory for the artifacts.",
+        "Create a directory under output.",
+        "Create a directory beneath output.",
+        "Create a directory below output.",
+        "Create a directory inside output.",
+        "Create a directory within output.",
+        "Create a directory near output.",
+        "Create a directory at the project root.",
+        "Create a directory where reports can be stored.",
+        "Create a temporary directory.",
+        "Create a separate directory.",
+        "Create an empty directory.",
+        "创建一个目录。",
+        "创建一个新的目录。",
+        "创建一个空目录。",
+        "创建临时目录。",
+        "创建目录在 output 下。",
+        "创建目录于 output 下。",
+        "创建目录到 output 下。",
+    )
+    for prompt in unnamed_requests:
+        routed = router.route(prompt)
+        assert "directory-artifact-required" in routed.reasons, prompt
+        assert routed.artifact_hints == (), prompt
+        assert routed.directory_hints == (), prompt
+
+    file_in_directory = router.route("Create the report file summary.md in the output directory.")
+    chinese_file_in_directory = router.route("创建汇总报告文件 summary.md 并放到输出目录。")
+    assert "artifact-required" in file_in_directory.reasons
+    assert "directory-artifact-required" not in file_in_directory.reasons
+    assert file_in_directory.directory_hints == ()
+    assert "artifact-required" in chinese_file_in_directory.reasons
+    assert "directory-artifact-required" not in chinese_file_in_directory.reasons
+    assert chinese_file_in_directory.directory_hints == ()
+
+    negative_or_meta = (
+        "Do not create a directory; reply directly.",
+        "不要创建任何文件夹，直接回复。",
+        'Does the quoted phrase "create a directory" trigger artifact routing? Explain only.',
+        "Does the wording create a directory trigger artifact routing? Explain only.",
+        "检查路由器是否会把‘创建目录’误判为真实请求，只需解释。",
+        "创建目录会不会触发 artifact 路由？只需解释。",
+    )
+    for prompt in negative_or_meta:
+        routed = router.route(prompt)
+        assert "artifact-required" not in routed.reasons, prompt
+        assert "directory-artifact-required" not in routed.reasons, prompt
+
+
+def test_task_router_distinguishes_conditional_fix_from_unconditional_and_report_only_work(make_config) -> None:
+    router = TaskRouter(make_config())
+
+    conditional_audit = router.route("审计代码；若没有找到可证实缺陷，不要修改代码")
+    unconditional_fix = router.route("修复已经确认的解析缺陷并运行测试")
+    report_only = router.route("审计代码并生成报告文件，禁止修改源码")
+    unrelated_condition = router.route("如果没有网络则记录验证限制，不要修改配置")
+
+    assert "conditional-mutation" in conditional_audit.reasons
+    assert "conditional-mutation" not in unconditional_fix.reasons
+    assert "conditional-mutation" not in report_only.reasons
+    assert "artifact-required" in report_only.reasons
+    assert "conditional-mutation" not in unrelated_condition.reasons
+
+
+def test_task_router_scopes_conditional_mutation_to_its_bounded_clause(make_config) -> None:
+    router = TaskRouter(make_config())
+
+    mixed_chinese = router.route("若没有审计问题，不要修改审计说明。修复已经确认的解析缺陷。")
+    mixed_english = router.route(
+        "If no evidence of a bug is found, do not edit the audit notes. Implement the already confirmed parser fix."
+    )
+    positive_chinese = router.route("如果发现真实缺陷就修复，否则保持原样。")
+    positive_english = router.route("If a real defect is found, fix it; otherwise leave the code unchanged.")
+
+    assert "mutation-request" in mixed_chinese.reasons
+    assert "conditional-mutation" not in mixed_chinese.reasons
+    assert "mutation-request" in mixed_english.reasons
+    assert "conditional-mutation" not in mixed_english.reasons
+    assert "conditional-mutation" in positive_chinese.reasons
+    assert "conditional-mutation" in positive_english.reasons
+
+
+def test_task_router_recognizes_one_global_validation_without_per_scope_leakage(make_config) -> None:
+    router = TaskRouter(make_config())
+
+    global_once = (
+        "Run the tests once and report the result.",
+        "验证只运行一次并报告结果。",
+        "仅运行一次静态检查。",
+    )
+    per_scope = (
+        "Only run one check per package.",
+        "Run tests once for each module.",
+        "每个模块只运行一次测试。",
+    )
+
+    for prompt in global_once:
+        assert "single-validation" in router.route(prompt).reasons, prompt
+    for prompt in per_scope:
+        assert "single-validation" not in router.route(prompt).reasons, prompt
 
 
 def test_task_router_uses_bounded_thresholds_and_hard_round_limit(make_config) -> None:
@@ -279,6 +516,88 @@ def test_resume_helpers_do_not_downgrade_or_change_equal_tier_model(make_config)
     assert more_capable_model_route(standard, deep) is deep
 
 
+def test_resume_task_upgrade_preserves_sticky_validation_and_artifact_constraints(make_config) -> None:
+    router = TaskRouter(make_config())
+    original = router.route("只运行一次静态检查并创建 output.docx 文件，再创建 output 目录。")
+    upgraded = router.route("全面审计整个仓库的所有安全问题")
+
+    resumed = more_capable_task_route(original, upgraded)
+
+    assert resumed.mode == "deep"
+    assert "single-validation" in resumed.reasons
+    assert "artifact-required" in resumed.reasons
+    assert "directory-artifact-required" in resumed.reasons
+    assert "word-artifact-required" in resumed.reasons
+    assert resumed.artifact_hints == ("output.docx", "output")
+    assert resumed.directory_hints == ("output",)
+    assert resumed.require_plan is True
+
+    original = router.route("Create directory reports.")
+    same_tier_addition = router.route("Also create directory archive.")
+    resumed = more_capable_task_route(original, same_tier_addition)
+
+    assert resumed.artifact_hints == ("reports", "archive")
+    assert resumed.directory_hints == ("reports", "archive")
+
+
+def test_task_route_artifact_hints_round_trip_and_legacy_default(make_config) -> None:
+    routed = TaskRouter(make_config()).route("Create an output file named summary.docx.")
+
+    assert TaskRoute.from_dict(routed.to_dict()) == routed
+    legacy = routed.to_dict()
+    legacy.pop("artifact_hints")
+    legacy.pop("directory_hints")
+    legacy["schema_version"] = 1
+    assert TaskRoute.from_dict(legacy).artifact_hints == ()
+    assert TaskRoute.from_dict(legacy).directory_hints == ()
+
+    unsafe = routed.to_dict()
+    unsafe["artifact_hints"] = [".docx", "../../secret.txt", "prompt text", "summary.docx"]
+    assert TaskRoute.from_dict(unsafe).artifact_hints == ("summary.docx", ".docx")
+    unsafe["directory_hints"] = ["reports", "../outside", ".", "reports"]
+    assert TaskRoute.from_dict(unsafe).directory_hints == ("reports",)
+
+
+def test_task_route_bounds_artifact_hints_before_serialization_and_resume(make_config) -> None:
+    router = TaskRouter(make_config())
+    prompt = " ".join(f"Create an output file named f{index}.md." for index in range(40))
+
+    routed = router.route(prompt)
+
+    assert len(routed.artifact_hints) == 32
+    assert routed.artifact_hints == tuple(f"f{index}.md" for index in range(32))
+    assert TaskRoute.from_dict(routed.to_dict()) == routed
+
+    previous = replace(routed, artifact_hints=tuple(f"old{index}.md" for index in range(32)))
+    selected = replace(
+        routed,
+        mode="deep",
+        score=routed.score + 10,
+        artifact_hints=tuple(f"new{index}.md" for index in range(32)),
+    )
+    resumed = more_capable_task_route(previous, selected)
+
+    assert resumed.artifact_hints == previous.artifact_hints
+    assert len(resumed.artifact_hints) == 32
+    assert TaskRoute.from_dict(resumed.to_dict()) == resumed
+
+    previous = replace(previous, directory_hints=tuple(f"old{index}" for index in range(32)))
+    selected = replace(selected, directory_hints=tuple(f"new{index}" for index in range(32)))
+    resumed = more_capable_task_route(previous, selected)
+
+    assert resumed.directory_hints == previous.directory_hints
+    assert len(resumed.directory_hints) == 32
+    assert TaskRoute.from_dict(resumed.to_dict()) == resumed
+
+    directory_prompt = " ".join(f"Create directory d{index}." for index in range(40))
+    routed_directories = router.route(directory_prompt)
+    expected_directories = tuple(f"d{index}" for index in range(32))
+
+    assert routed_directories.artifact_hints == expected_directories
+    assert routed_directories.directory_hints == expected_directories
+    assert TaskRoute.from_dict(routed_directories.to_dict()) == routed_directories
+
+
 def test_model_route_round_trip_and_strategy_selector_compatibility(make_config) -> None:
     config = make_config()
     task = TaskRouter(config).route("全面审计整个代码库并重构所有安全问题")
@@ -358,7 +677,24 @@ def test_task_plan_factory_consumes_task_route_without_classifying(make_config) 
     assert architecture_implementation.task_type == "architecture"
     assert "mutation-request" in architecture_implementation.reasons
     assert factory.build(architecture_implementation)[2]["id"] == "implement"
+    conditional = factory.build(router.route("全面审计整个大型代码库；若找到真实缺陷则修复，若没有充分证据不要修改"))
+    assert "implementation is skipped" in conditional[2]["completion_criteria"]
+    assert "exact outcomes are reported" in conditional[-1]["completion_criteria"]
+    assert "pre-existing failures" in conditional[-1]["completion_criteria"]
     assert factory.build(router.route("什么是 Python？")) == []
+    assert [item["id"] for item in factory.build(router.route("总结所有文档并直接回复"))] == [
+        "scope",
+        "parse-documents",
+        "synthesize",
+        "verify",
+    ]
+    assert [item["id"] for item in factory.build(router.route("总结所有文档并生成 Word 文件"))] == [
+        "scope",
+        "parse-documents",
+        "synthesize",
+        "render-artifact",
+        "verify",
+    ]
     with pytest.raises(TypeError, match="requires a TaskRoute"):
         factory.build({"mode": "deep"})
 

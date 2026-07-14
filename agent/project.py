@@ -61,6 +61,7 @@ class ProjectRegistry:
 
     def upsert(self, project: Project, tags: list[str] | None = None) -> None:
         now = utc_now_iso()
+        root_path = str(project.root.resolve())
         with self._connect() as con:
             row = con.execute(
                 "select created_at, tags from projects where project_id = ?",
@@ -71,6 +72,14 @@ class ProjectRegistry:
                 tags_json = row["tags"]
             else:
                 tags_json = json.dumps(tags or [], ensure_ascii=False)
+            # A user may remove/recreate .project-agent while keeping the same
+            # workspace. UUID strategy then generates a new project_id, but
+            # root_path is the durable identity. Replace the stale registry row
+            # in one transaction instead of failing the unique root index.
+            con.execute(
+                "delete from projects where root_path = ? and project_id <> ?",
+                (root_path, project.id),
+            )
             con.execute(
                 """
                 insert into projects (
@@ -87,7 +96,7 @@ class ProjectRegistry:
                 (
                     project.id,
                     project.name,
-                    str(project.root),
+                    root_path,
                     project.language,
                     created_at,
                     now,
@@ -185,6 +194,7 @@ class ProjectManager:
             "downloads",
             "queues",
             "parallel",
+            "tool-results",
         ):
             private_dir = agent_dir / private_name
             if private_dir.is_symlink():
@@ -322,6 +332,7 @@ class ProjectManager:
             "downloads/",
             "queues/",
             "parallel/",
+            "tool-results/",
             "memory/",
             "index.json",
             "index.semantic.json",

@@ -12,7 +12,7 @@ Python 脚本演示 v0.9.1 最重要的三个开发接口：
 
 ```bash
 cd ~/AI-Agent
-PYTHONPATH=. .venv/bin/python user-docs/实用案例-v0.9.1/interface-routing-demo.py
+PYTHONPATH=. .venv/bin/python user-docs/测试与验收/实用案例/v0.9.1/interface-routing-demo.py
 ```
 
 预期看到四类请求分别路由到 low、balanced 或 high，并打印 starter

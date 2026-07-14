@@ -2,16 +2,28 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from .base import ToolResult, run_command
+from .base import DEFAULT_MAX_RESULT_SOURCE_BYTES, ToolResult, run_command
 
 
 class DockerTool:
-    def __init__(self, cwd: Path, timeout: int = 180) -> None:
+    def __init__(
+        self,
+        cwd: Path,
+        timeout: int = 180,
+        *,
+        max_output_bytes: int = DEFAULT_MAX_RESULT_SOURCE_BYTES,
+    ) -> None:
         self.cwd = cwd
         self.timeout = timeout
+        self.max_output_bytes = max_output_bytes
 
     def run(self, args: list[str], timeout: int | None = None) -> ToolResult:
-        return run_command(["docker", *args], cwd=self.cwd, timeout=timeout or self.timeout)
+        return run_command(
+            ["docker", *args],
+            cwd=self.cwd,
+            timeout=timeout or self.timeout,
+            max_output_bytes=self.max_output_bytes,
+        )
 
     def ps(self) -> ToolResult:
         return self.run(["ps"])

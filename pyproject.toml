@@ -1,10 +1,12 @@
 [project]
 name = "deep-agent"
-version = "0.10.0"
+version = "0.11.0"
 description = "Local CLI AI agent runtime powered by DeepSeek."
 requires-python = ">=3.11"
 dependencies = [
   "PyYAML>=6.0.2",
+  "regex>=2024.11.6",
+  "wcwidth>=0.2.13",
 ]
 
 [project.optional-dependencies]
@@ -17,7 +19,7 @@ document = [
   "python-docx>=1.2.0",
   "docling>=2.112.0",
 ]
-dev = ["ruff>=0.6.0", "pytest>=8.0.0"]
+dev = ["ruff>=0.6.0", "pytest>=8.0.0", "python-docx>=1.2.0"]
 
 [project.scripts]
 agent = "agent.cli:main"

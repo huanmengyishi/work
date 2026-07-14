@@ -119,6 +119,8 @@ def test_resume_package_selects_previous_outcome_and_prompt_only_renders_package
     builder = ContextBuilder(config)
     snapshot = builder.build(project, refresh=True)
     state = _state(project, snapshot, request="继续")
+    state.fail("PERSISTED_FAILURE_BEFORE_RESUME")
+    state.resume("继续")
     previous = "PREVIOUS_OUTCOME_HEAD" + "x" * 8_000 + "PREVIOUS_OUTCOME_TAIL"
     history = [
         {"role": "assistant", "content": "", "tool_calls": [{"id": "call-1"}]},
@@ -141,6 +143,7 @@ def test_resume_package_selects_previous_outcome_and_prompt_only_renders_package
     assert package.used_chars <= 10_000
     assert "PREVIOUS_OUTCOME_HEAD" in package.rendered
     assert "PREVIOUS_OUTCOME_TAIL" in package.rendered
+    assert "PERSISTED_FAILURE_BEFORE_RESUME" in package.rendered
     assert "RAW_TOOL_TRANSCRIPT" not in package.rendered
     assert messages == [
         {"role": "system", "content": SYSTEM_PROMPT},

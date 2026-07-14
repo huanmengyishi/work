@@ -1,14 +1,19 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import json
 from dataclasses import fields
 from pathlib import Path
+import threading
+import time
+from types import SimpleNamespace
 
 import pytest
 
 from agent.contracts import EVENT_SCHEMA_VERSION, EVENT_SERIALIZED_FIELDS
 from agent.events import Event, EventBus, EventDispatchError, JsonlEventLogger
 from agent.project import ProjectManager
+from agent.session import SessionManager
 from agent.state import AgentState, PlanStep
 
 
@@ -62,6 +67,36 @@ def test_event_schema_round_trip_and_jsonl_record_are_stable(tmp_path: Path) -> 
     assert record == event.to_dict() | {"payload": {}}
 
 
+def test_session_load_rejects_oversized_symlink_and_invalid_messages(tmp_path: Path, make_config) -> None:
+    state = _state(tmp_path / "valid", make_config)
+    project = ProjectManager(make_config()).resolve_project(Path(state.working_directory))
+    sessions = SessionManager(project)
+    path = sessions.checkpoint(state, [])
+
+    sessions.MAX_SESSION_FILE_BYTES = 32
+    with pytest.raises(ValueError, match="checkpoint exceeds"):
+        sessions.checkpoint(state, [])
+
+    sessions.MAX_SESSION_FILE_BYTES = path.stat().st_size - 1
+    with pytest.raises(ValueError, match="exceeds"):
+        sessions.load(state.session_id)
+
+    sessions.MAX_SESSION_FILE_BYTES = SessionManager.MAX_SESSION_FILE_BYTES
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["messages"] = ["not-a-message"]
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(ValueError, match="invalid session file"):
+        sessions.load(state.session_id)
+
+    external = tmp_path / "external-session.json"
+    external.write_text(json.dumps(payload | {"messages": []}), encoding="utf-8")
+    linked = sessions.session_dir / "linked.json"
+    linked.symlink_to(external)
+    with pytest.raises(ValueError, match="not a regular file"):
+        sessions.load("linked")
+    assert all(item.session_id != "linked" for item in sessions.list_sessions(limit=20))
+
+
 def test_event_bus_supports_unsubscribe_existing_event_and_handler_isolation() -> None:
     bus = EventBus()
     seen: list[tuple[str, str]] = []
@@ -103,6 +138,33 @@ def test_nested_publish_does_not_clobber_outer_handler_errors() -> None:
 
     assert len(bus.last_errors) == 1
     assert "outer failed" in bus.last_errors[0]
+
+
+def test_concurrent_tool_events_serialize_shared_side_effect_delivery() -> None:
+    bus = EventBus()
+    gate = threading.Lock()
+    active = 0
+    max_active = 0
+    seen: list[str] = []
+
+    def shared_side_effect(event: Event) -> None:
+        nonlocal active, max_active
+        with gate:
+            active += 1
+            max_active = max(max_active, active)
+        time.sleep(0.005)
+        seen.append(event.id)
+        with gate:
+            active -= 1
+
+    bus.subscribe("tool.finished", shared_side_effect, name="shared-store")
+    events = [Event("tool.finished", {}, id=f"event-{index}") for index in range(12)]
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        list(pool.map(bus.publish, events))
+
+    assert max_active == 1
+    assert sorted(seen) == sorted(event.id for event in events)
 
 
 def test_required_dispatch_fails_closed_without_owner_or_on_required_error() -> None:
@@ -265,3 +327,95 @@ def test_legacy_state_repairs_only_derived_plan_fields(tmp_path: Path, make_conf
     assert restored.execution_context is not None
     restored.resume("continue")
     assert restored.schema_version == AgentState.SCHEMA_VERSION
+
+
+def test_agent_state_model_metrics_and_convergence_gates_are_per_turn_while_circuit_survives_resume(
+    tmp_path: Path,
+    make_config,
+) -> None:
+    state = _state(tmp_path, make_config)
+    state.convergence = {
+        "implementation_reads_used": 2,
+        "consecutive_read_only_rounds": 8,
+        "low_yield_rounds": 5,
+        "nudge_count": 2,
+        "nudge_sent_for_stall": True,
+        "hard_notice_sent": True,
+        "notice_turn": 1,
+        "seen_targets": ["template.read_file:known"],
+        "context_compaction_failure_count": 3,
+        "context_compaction_circuit_open": True,
+    }
+    state.record_model_request("main_loop")
+    state.record_model_request("context_compaction")
+    state.record_model_request("final_synthesis")
+    state.record_model_response(
+        SimpleNamespace(
+            http_attempt_count=3,
+            usage={
+                "prompt_tokens": 120,
+                "completion_tokens": 30,
+                "total_tokens": 150,
+            },
+        )
+    )
+
+    restored = AgentState.from_dict(state.to_dict())
+
+    assert restored.schema_version == 6
+    assert restored.model_request_count == 3
+    assert restored.main_loop_model_request_count == 1
+    assert restored.context_compaction_model_request_count == 1
+    assert restored.final_synthesis_model_request_count == 1
+    assert restored.model_metrics == {
+        "http_attempt_count": 3,
+        "prompt_tokens": 120,
+        "completion_tokens": 30,
+        "total_tokens": 150,
+    }
+
+    restored.resume("continue with the remaining verification")
+
+    assert restored.turn == 2
+    assert restored.model_request_count == 0
+    assert restored.main_loop_model_request_count == 0
+    assert restored.context_compaction_model_request_count == 0
+    assert restored.final_synthesis_model_request_count == 0
+    assert restored.model_metrics == {}
+    assert restored.convergence == {
+        "seen_targets": ["template.read_file:known"],
+        "context_compaction_failure_count": 3,
+        "context_compaction_circuit_open": True,
+    }
+
+
+def test_session_summary_names_persisted_tool_turns_without_implying_model_rounds(
+    tmp_path: Path,
+    make_config,
+) -> None:
+    root = tmp_path / "session-project"
+    root.mkdir()
+    project = ProjectManager(make_config()).resolve_project(root)
+    state = AgentState.create(
+        session_id="tool-turn-summary",
+        project=project,
+        user_request="inspect one file",
+        loaded_memories=[],
+        loaded_tools=[],
+        git_branch=None,
+        context_index_path=str(project.agent_dir / "index.json"),
+    )
+    state.round = 3
+    state.record_tool_call(
+        {"tool": "file", "action": "read", "args": {"path": "README.md"}},
+        {"success": True, "stdout": "ok", "duration_ms": 4},
+    )
+    state.complete("done")
+
+    json_path, markdown_path = SessionManager(project).finalize(state, [])
+
+    persisted = json.loads(json_path.read_text(encoding="utf-8"))
+    summary = markdown_path.read_text(encoding="utf-8")
+    assert persisted["state"]["schema_version"] == 6
+    assert "- tool turn 3: file.read success=True duration_ms=4" in summary
+    assert "- round 3:" not in summary

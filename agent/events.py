@@ -4,6 +4,7 @@ import json
 import os
 import re
 import stat
+import threading
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -173,6 +174,10 @@ class EventBus:
         self.last_errors: list[str] = []
         self.last_dispatch: EventDispatch | None = None
         self._delivery_depth = 0
+        # Read-only tools may execute concurrently, but their Event side
+        # effects update shared Health, Audit, and Metrics stores.  Serialize
+        # delivery while keeping the lock reentrant for nested publication.
+        self._delivery_lock = threading.RLock()
 
     def subscribe(
         self,
@@ -190,29 +195,31 @@ class EventBus:
             required=bool(required),
             name=str(name or _handler_name(handler))[:200],
         )
-        handlers = self._subscribers.setdefault(event_name, [])
-        conflicting_name = next(
-            (item for item in handlers if item.name == subscription.name and item.handler != handler),
-            None,
-        )
-        if conflicting_name is not None:
-            raise ValueError(f"event subscriber name is already registered: {event_name}: {subscription.name}")
-        if not any(item.handler == handler for item in handlers):
-            handlers.append(subscription)
+        with self._delivery_lock:
+            handlers = self._subscribers.setdefault(event_name, [])
+            conflicting_name = next(
+                (item for item in handlers if item.name == subscription.name and item.handler != handler),
+                None,
+            )
+            if conflicting_name is not None:
+                raise ValueError(f"event subscriber name is already registered: {event_name}: {subscription.name}")
+            if not any(item.handler == handler for item in handlers):
+                handlers.append(subscription)
         return lambda: self.unsubscribe(event_name, handler)
 
     def unsubscribe(self, event_name: str, handler: EventHandler) -> bool:
         event_name = _event_name(event_name)
-        handlers = self._subscribers.get(event_name)
-        if not handlers:
-            return False
-        match = next((item for item in handlers if item.handler == handler), None)
-        if match is None:
-            return False
-        handlers.remove(match)
-        if not handlers:
-            self._subscribers.pop(event_name, None)
-        return True
+        with self._delivery_lock:
+            handlers = self._subscribers.get(event_name)
+            if not handlers:
+                return False
+            match = next((item for item in handlers if item.handler == handler), None)
+            if match is None:
+                return False
+            handlers.remove(match)
+            if not handlers:
+                self._subscribers.pop(event_name, None)
+            return True
 
     def publish(
         self,
@@ -260,12 +267,14 @@ class EventBus:
     def subscriber_count(self, event_name: str) -> int:
         """Return exact subscribers; wildcard audit handlers are not owners."""
 
-        return len(self._subscribers.get(_event_name(event_name), ()))
+        with self._delivery_lock:
+            return len(self._subscribers.get(_event_name(event_name), ()))
 
     def required_subscriber_count(self, event_name: str) -> int:
         """Return exact required subscribers; observers cannot own persistence."""
 
-        return sum(1 for item in self._subscribers.get(_event_name(event_name), ()) if item.required)
+        with self._delivery_lock:
+            return sum(1 for item in self._subscribers.get(_event_name(event_name), ()) if item.required)
 
     @staticmethod
     def _event(
@@ -291,33 +300,34 @@ class EventBus:
         )
 
     def _deliver(self, event: Event) -> EventDispatch:
-        outermost = self._delivery_depth == 0
-        self._delivery_depth += 1
-        subscriptions = [*self._subscribers.get(event.name, ()), *self._subscribers.get("*", ())]
-        deliveries: list[EventDelivery] = []
-        try:
-            for subscription in subscriptions:
-                try:
-                    subscription.handler(event)
-                    deliveries.append(EventDelivery(event.name, subscription.name, subscription.required, True))
-                except Exception as exc:
-                    message = f"{event.name}: {subscription.name}: {exc}"
-                    deliveries.append(
-                        EventDelivery(
-                            event.name,
-                            subscription.name,
-                            subscription.required,
-                            False,
-                            message[:2000],
+        with self._delivery_lock:
+            outermost = self._delivery_depth == 0
+            self._delivery_depth += 1
+            subscriptions = [*self._subscribers.get(event.name, ()), *self._subscribers.get("*", ())]
+            deliveries: list[EventDelivery] = []
+            try:
+                for subscription in subscriptions:
+                    try:
+                        subscription.handler(event)
+                        deliveries.append(EventDelivery(event.name, subscription.name, subscription.required, True))
+                    except Exception as exc:
+                        message = f"{event.name}: {subscription.name}: {exc}"
+                        deliveries.append(
+                            EventDelivery(
+                                event.name,
+                                subscription.name,
+                                subscription.required,
+                                False,
+                                message[:2000],
+                            )
                         )
-                    )
-        finally:
-            self._delivery_depth -= 1
-        dispatch = EventDispatch(event, tuple(deliveries))
-        if outermost:
-            self.last_dispatch = dispatch
-            self.last_errors = list(dispatch.errors)
-        return dispatch
+            finally:
+                self._delivery_depth -= 1
+            dispatch = EventDispatch(event, tuple(deliveries))
+            if outermost:
+                self.last_dispatch = dispatch
+                self.last_errors = list(dispatch.errors)
+            return dispatch
 
 
 class JsonlEventLogger:

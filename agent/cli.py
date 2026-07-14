@@ -103,6 +103,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "sessions":
         return cmd_sessions(config, args.limit)
     if args.command == "resume":
+        if not args.prompt:
+            return repl(
+                config,
+                auto_approve=auto_approve,
+                yolo=yolo,
+                super_yolo=super_yolo,
+                initial_session=args.session or "",
+            )
         return cmd_resume(
             config,
             " ".join(args.prompt),
@@ -140,7 +148,9 @@ def build_help_parser() -> argparse.ArgumentParser:
         description="Project-centric DeepSeek CLI agent. Run from any project directory.",
         epilog=(
             'Direct task example: agent "summarize this project"\n'
-            "If a task starts with a command name, use: agent -- doctor this code"
+            "If a task starts with a command name, use: agent -- doctor this code\n"
+            "Management commands: doctor, projects, init, config, memory, sessions, resume, context, "
+            "tools, mcp, queue, parallel, health, daemon"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -161,11 +171,6 @@ def build_help_parser() -> argparse.ArgumentParser:
         help="Skip confirmations and Permission Manager hard policies, including sudo restrictions.",
     )
     parser.add_argument("task", nargs="*", help="Natural-language task. No subcommand is required.")
-    parser.add_argument(
-        "commands",
-        nargs="?",
-        help="Commands: doctor, projects, init, config, memory, sessions, resume, context, tools, mcp, queue, parallel, health, daemon",
-    )
     return parser
 
 
@@ -214,7 +219,7 @@ def build_command_parser() -> argparse.ArgumentParser:
     sessions_parser.add_argument("--limit", type=int, default=20)
     resume_parser = subparsers.add_parser("resume", help="Resume the latest or selected session.")
     resume_parser.add_argument("--session", help="Exact session ID or unique prefix. Defaults to latest.")
-    resume_parser.add_argument("prompt", nargs="+", help="Continuation request.")
+    resume_parser.add_argument("prompt", nargs="*", help="Continuation request. Omit it to enter the resumed REPL.")
 
     context_parser = subparsers.add_parser("context", help="Show or rebuild generated project context.")
     context_parser.add_argument("context_command", choices=["show", "refresh", "index"], nargs="?", default="show")
@@ -544,6 +549,8 @@ def cmd_resume(
     except Exception as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
+    finally:
+        runtime.close()
     return 0
 
 
@@ -752,6 +759,7 @@ def repl(
     auto_approve: bool = False,
     yolo: bool = False,
     super_yolo: bool = False,
+    initial_session: str | None = None,
 ) -> int:
     project, memory = prepare_project(config)
     ui = ConsoleUI(
@@ -762,6 +770,7 @@ def repl(
         show_thinking=bool(config.get("runtime.show_thinking", True)),
         show_reasoning_content=bool(config.get("runtime.show_reasoning_content", True)),
         progress_interval_seconds=int(config.get("runtime.progress_interval_seconds", 10)),
+        hard_tool_turn_limit=int(config.get("runtime.max_tool_rounds_hard_limit", 32)),
     )
     runtime = build_runtime(
         config,
@@ -774,15 +783,27 @@ def repl(
         progress_handler=ui.update_progress,
     )
     active_session: str | None = None
+    if initial_session is not None:
+        try:
+            active_session = runtime.sessions.resolve_session_id(initial_session or None)
+        except Exception as exc:
+            ui.error(str(exc))
+            runtime.close()
+            ui.close()
+            return 1
     ui.banner()
     while True:
         try:
             prompt = ui.read(active_session)
-        except (EOFError, KeyboardInterrupt):
+        except EOFError:
             print()
             runtime.close()
             ui.close()
             return 0
+        except KeyboardInterrupt:
+            print()
+            ui.info("已取消当前输入。可继续输入任务，或使用 /exit 退出。")
+            continue
         except ValueError as exc:
             ui.error(str(exc))
             continue
@@ -851,11 +872,13 @@ def repl(
         if prompt == "/sessions":
             cmd_sessions(config, 20)
             continue
+        if prompt == "resume":
+            prompt = "/resume"
         if prompt.startswith("/resume"):
             parts = prompt.split(maxsplit=1)
             try:
                 active_session = runtime.sessions.resolve_session_id(parts[1] if len(parts) == 2 else None)
-                ui.info(f"Active session: {active_session}")
+                ui.info(f"已选择会话：{active_session}。请输入“继续完成原任务并验证”或更具体的续跑要求。")
             except Exception as exc:
                 ui.error(str(exc))
             continue
@@ -874,7 +897,10 @@ def repl(
             ui.info("请求已中断。可使用 /resume 继续当前会话，或使用 /new 开始新会话。")
         except Exception as exc:
             ui.stop_progress()
+            active_session = runtime.last_session_id or active_session
             ui.error(str(exc))
+            if active_session:
+                ui.info(f"会话已保存：{active_session}。输入 /resume {active_session} 后可继续。")
 
 
 def run_once(

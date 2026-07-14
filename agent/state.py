@@ -129,7 +129,9 @@ class AgentState:
 
     session_id: str
     project: dict[str, Any]
+    objective: str
     user_request: str
+    request_history: list[str]
     working_directory: str
     status: str = "initialized"
     plan: list[PlanStep] = field(default_factory=list)
@@ -144,11 +146,18 @@ class AgentState:
     task_route: dict[str, Any] = field(default_factory=dict)
     model_route: dict[str, Any] = field(default_factory=dict)
     context_manifest: dict[str, Any] = field(default_factory=dict)
+    convergence: dict[str, Any] = field(default_factory=dict)
+    model_metrics: dict[str, Any] = field(default_factory=dict)
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
     round: int = 0
+    model_request_count: int = 0
+    main_loop_model_request_count: int = 0
+    context_compaction_model_request_count: int = 0
+    final_synthesis_model_request_count: int = 0
     turn: int = 1
     final_answer: str = ""
     error: str = ""
+    failure_count: int = 0
     created_at: str = field(default_factory=utc_now_iso)
     updated_at: str = field(default_factory=utc_now_iso)
     schema_version: int = AGENT_STATE_SCHEMA_VERSION
@@ -176,7 +185,9 @@ class AgentState:
                 "root": str(project.root),
                 "language": project.language,
             },
+            objective=user_request,
             user_request=user_request,
+            request_history=[user_request],
             working_directory=str(project.root),
             loaded_memories=loaded_memories,
             loaded_tools=loaded_tools,
@@ -204,7 +215,10 @@ class AgentState:
         state = cls(
             session_id=str(value.get("session_id") or ""),
             project=dict(value.get("project") or {}),
+            objective=str(value.get("objective") or value.get("user_request") or ""),
             user_request=str(value.get("user_request") or ""),
+            request_history=[str(item) for item in value.get("request_history", []) if str(item).strip()]
+            or [str(value.get("user_request") or "")],
             working_directory=working_directory,
             status=str(value.get("status") or "initialized"),
             plan=plan,
@@ -219,11 +233,24 @@ class AgentState:
             task_route=dict(value.get("task_route") or {}),
             model_route=dict(value.get("model_route") or {}),
             context_manifest=dict(value.get("context_manifest") or {}),
+            convergence=dict(value.get("convergence") or {}),
+            model_metrics=dict(value.get("model_metrics") or {}),
             tool_calls=list(value.get("tool_calls") or []),
             round=int(value.get("round") or 0),
+            model_request_count=max(0, int(value.get("model_request_count") or 0)),
+            main_loop_model_request_count=max(0, int(value.get("main_loop_model_request_count") or 0)),
+            context_compaction_model_request_count=max(
+                0,
+                int(value.get("context_compaction_model_request_count") or 0),
+            ),
+            final_synthesis_model_request_count=max(
+                0,
+                int(value.get("final_synthesis_model_request_count") or 0),
+            ),
             turn=int(value.get("turn") or 1),
             final_answer=str(value.get("final_answer") or ""),
             error=str(value.get("error") or ""),
+            failure_count=max(0, int(value.get("failure_count") or 0)),
             created_at=str(value.get("created_at") or utc_now_iso()),
             updated_at=str(value.get("updated_at") or utc_now_iso()),
             schema_version=max(1, int(value.get("schema_version") or 1)),
@@ -246,6 +273,7 @@ class AgentState:
                 f"unsupported AgentState schema_version {self.schema_version}; maximum is {self.SCHEMA_VERSION}"
             )
         _non_empty_string(self.session_id, "AgentState.session_id")
+        _non_empty_string(self.objective, "AgentState.objective")
         _non_empty_string(self.user_request, "AgentState.user_request")
         _non_empty_string(self.working_directory, "AgentState.working_directory")
         if self.status not in AGENT_STATUSES:
@@ -258,14 +286,43 @@ class AgentState:
             raise ValueError("AgentState.project.root must match working_directory")
         if not _is_non_negative_int(self.round):
             raise ValueError("AgentState.round must be a non-negative integer")
+        for field_name in (
+            "model_request_count",
+            "main_loop_model_request_count",
+            "context_compaction_model_request_count",
+            "final_synthesis_model_request_count",
+        ):
+            if not _is_non_negative_int(getattr(self, field_name)):
+                raise ValueError(f"AgentState.{field_name} must be a non-negative integer")
+        if self.model_request_count != (
+            self.main_loop_model_request_count
+            + self.context_compaction_model_request_count
+            + self.final_synthesis_model_request_count
+        ):
+            raise ValueError("AgentState.model_request_count must equal the sum of request phase counters")
         if not _is_positive_int(self.turn):
             raise ValueError("AgentState.turn must be a positive integer")
+        if not _is_non_negative_int(self.failure_count):
+            raise ValueError("AgentState.failure_count must be a non-negative integer")
         if not isinstance(self.plan, list) or not all(isinstance(step, PlanStep) for step in self.plan):
             raise ValueError("AgentState.plan must contain PlanStep records")
         self._validate_plan()
         self._validate_collections()
         self._validate_routes()
         self._validate_context_manifest()
+        if not isinstance(self.convergence, dict):
+            raise ValueError("AgentState.convergence must be a dictionary")
+        implementation_reads_used = self.convergence.get("implementation_reads_used", 0)
+        if not _is_non_negative_int(implementation_reads_used) or implementation_reads_used > 4:
+            raise ValueError("AgentState.convergence.implementation_reads_used must be between 0 and 4")
+        validation_attachment_reads_used = self.convergence.get("validation_attachment_reads_used", 0)
+        if not _is_non_negative_int(validation_attachment_reads_used) or validation_attachment_reads_used > 4:
+            raise ValueError("AgentState.convergence.validation_attachment_reads_used must be between 0 and 4")
+        if not isinstance(self.model_metrics, dict):
+            raise ValueError("AgentState.model_metrics must be a dictionary")
+        for key in ("http_attempt_count", "prompt_tokens", "completion_tokens", "total_tokens"):
+            if not _is_non_negative_int(self.model_metrics.get(key, 0)):
+                raise ValueError(f"AgentState.model_metrics.{key} must be a non-negative integer")
         if self.execution_context is not None:
             if not isinstance(self.execution_context, ExecutionContext):
                 raise ValueError("AgentState.execution_context must be an ExecutionContext")
@@ -301,6 +358,17 @@ class AgentState:
             raise ValueError(f"AgentState frozen fields changed: {', '.join(changed)}")
         return self
 
+    def can_skip_plan_step(self, step_id: str) -> bool:
+        """Return whether one step has the plan-owned conditional skip exception."""
+
+        reasons = (self.task_route or {}).get("reasons")
+        return step_id == "implement" and isinstance(reasons, list) and "conditional-mutation" in reasons
+
+    def plan_step_satisfied(self, step: PlanStep) -> bool:
+        """Return whether a step may satisfy dependencies and completion gates."""
+
+        return step.status == "completed" or (step.status == "skipped" and self.can_skip_plan_step(step.id))
+
     def _normalize_legacy_derived_fields(self) -> None:
         """Repair v1 fields that were derived but not validated at write time."""
 
@@ -316,7 +384,7 @@ class AgentState:
         if len(ids) != len(set(ids)):
             raise ValueError("AgentState plan step IDs must be unique")
         known = set(ids)
-        completed = {step.id for step in self.plan if step.status in {"completed", "skipped"}}
+        completed = {step.id for step in self.plan if self.plan_step_satisfied(step)}
         for step in self.plan:
             missing = [dependency for dependency in step.dependencies if dependency not in known]
             if missing:
@@ -367,6 +435,12 @@ class AgentState:
             raise ValueError("AgentState.loaded_tools must be unique")
         if not isinstance(self.tool_calls, list) or not all(isinstance(item, dict) for item in self.tool_calls):
             raise ValueError("AgentState.tool_calls must contain dictionaries")
+        if not isinstance(self.request_history, list) or not all(
+            isinstance(item, str) and item.strip() for item in self.request_history
+        ):
+            raise ValueError("AgentState.request_history must contain non-empty strings")
+        if len(self.request_history) > 50:
+            raise ValueError("AgentState.request_history exceeds 50 turns")
         for index, item in enumerate(self.tool_calls):
             if not _is_positive_int(item.get("turn", 1)):
                 raise ValueError(f"AgentState.tool_calls[{index}].turn must be a positive integer")
@@ -436,6 +510,29 @@ class AgentState:
         self.schema_version = max(self.SCHEMA_VERSION, self.schema_version)
         self.turn += 1
         self.user_request = user_request
+        self.request_history.append(user_request)
+        self.request_history = self.request_history[-50:]
+        self.model_request_count = 0
+        self.main_loop_model_request_count = 0
+        self.context_compaction_model_request_count = 0
+        self.final_synthesis_model_request_count = 0
+        # Transport attempts, token usage, and convergence gates describe one
+        # Session turn. Preserve durable targets and compaction-circuit state,
+        # but do not carry an exhausted read/stall window into a user-initiated
+        # Resume: that would make the advertised recovery command unable to
+        # reacquire the exact evidence needed to finish the task.
+        self.model_metrics = {}
+        for key in (
+            "implementation_reads_used",
+            "validation_attachment_reads_used",
+            "consecutive_read_only_rounds",
+            "low_yield_rounds",
+            "nudge_count",
+            "nudge_sent_for_stall",
+            "hard_notice_sent",
+            "notice_turn",
+        ):
+            self.convergence.pop(key, None)
         self.start()
         self.validate_frozen_fields(self._frozen_baseline)
 
@@ -443,6 +540,7 @@ class AgentState:
         self.status = "completed"
         self.final_answer = final_answer
         self.error = ""
+        self.failure_count = 0
         if self.execution_context:
             self.execution_context.prompt_phase = "completed"
             self.execution_context.last_checkpoint_at = utc_now_iso()
@@ -453,10 +551,45 @@ class AgentState:
         self.status = "failed"
         self.error = error
         self.final_answer = final_answer
+        self.failure_count = min(10_000, self.failure_count + 1)
         if self.execution_context:
             self.execution_context.prompt_phase = "failed"
             self.execution_context.recent_error = error
             self.execution_context.last_checkpoint_at = utc_now_iso()
+        self.touch()
+        self.validate_frozen_fields(self._frozen_baseline)
+
+    def record_model_request(self, phase: str) -> None:
+        counters = {
+            "main_loop": "main_loop_model_request_count",
+            "context_compaction": "context_compaction_model_request_count",
+            "final_synthesis": "final_synthesis_model_request_count",
+        }
+        field_name = counters.get(phase)
+        if field_name is None:
+            raise ValueError(f"unsupported model request phase: {phase}")
+        setattr(self, field_name, getattr(self, field_name) + 1)
+        self.model_request_count += 1
+        self.touch()
+        self.validate_frozen_fields(self._frozen_baseline)
+
+    def record_model_response(self, response: Any) -> None:
+        usage = getattr(response, "usage", None)
+        metrics = dict(self.model_metrics)
+        metrics["http_attempt_count"] = int(metrics.get("http_attempt_count") or 0) + max(
+            0, int(getattr(response, "http_attempt_count", 0) or 0)
+        )
+        if isinstance(usage, dict):
+            aliases = {
+                "prompt_tokens": ("prompt_tokens", "input_tokens"),
+                "completion_tokens": ("completion_tokens", "output_tokens"),
+                "total_tokens": ("total_tokens",),
+            }
+            for target, source_keys in aliases.items():
+                raw = next((usage.get(key) for key in source_keys if key in usage), 0)
+                if isinstance(raw, int) and not isinstance(raw, bool) and raw >= 0:
+                    metrics[target] = int(metrics.get(target) or 0) + raw
+        self.model_metrics = metrics
         self.touch()
         self.validate_frozen_fields(self._frozen_baseline)
 

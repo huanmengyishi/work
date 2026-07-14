@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
 import re
 from pathlib import Path
 
@@ -9,6 +10,10 @@ from docx.enum.text import WD_BREAK
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.shared import Inches, Pt
+
+
+RELEASE_TIMESTAMP = datetime(2026, 7, 15, tzinfo=timezone.utc)
+RELEASE_AUTHOR = "Deep Agent"
 
 
 def add_run(paragraph, text: str, *, code: bool = False) -> None:
@@ -27,7 +32,20 @@ def shade(paragraph) -> None:
 
 
 def markdown_to_docx(source: Path, destination: Path) -> None:
+    lines = source.read_text(encoding="utf-8").splitlines()
     document = Document()
+    title = next(
+        (match.group(1).strip() for line in lines if (match := re.match(r"^#\s+(.+)$", line))),
+        source.stem,
+    )
+    properties = document.core_properties
+    properties.title = title
+    properties.author = RELEASE_AUTHOR
+    properties.last_modified_by = RELEASE_AUTHOR
+    properties.created = RELEASE_TIMESTAMP
+    properties.modified = RELEASE_TIMESTAMP
+    properties.revision = 1
+    properties.keywords = "DeepSeek Agent V3, v0.11.0, 2026-07-15"
     section = document.sections[0]
     section.top_margin = Inches(0.65)
     section.bottom_margin = Inches(0.65)
@@ -42,7 +60,6 @@ def markdown_to_docx(source: Path, destination: Path) -> None:
         styles[name]._element.rPr.rFonts.set(qn("w:eastAsia"), "Microsoft YaHei")
         styles[name].font.size = Pt(size)
 
-    lines = source.read_text(encoding="utf-8").splitlines()
     in_code = False
     code_lines: list[str] = []
 
@@ -76,10 +93,10 @@ def markdown_to_docx(source: Path, destination: Path) -> None:
             else:
                 document.add_heading(heading.group(2), level=level)
             continue
-        ordered = re.match(r"^\d+\.\s+(.+)$", line)
+        ordered = re.match(r"^(\d+)\.\s+(.+)$", line)
         if ordered:
-            paragraph = document.add_paragraph(style="List Number")
-            add_run(paragraph, ordered.group(1))
+            paragraph = document.add_paragraph()
+            add_run(paragraph, f"{ordered.group(1)}. {ordered.group(2)}")
             continue
         if line.startswith("- "):
             paragraph = document.add_paragraph(style="List Bullet")

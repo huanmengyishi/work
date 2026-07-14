@@ -117,3 +117,24 @@ def test_project_first_initialization_converges_under_concurrency(tmp_path: Path
     assert (root / ".project-agent" / "README.md").is_file()
     assert ".project.lock" in (root / ".project-agent" / ".gitignore").read_text(encoding="utf-8")
     assert ProjectRegistry(config.data_dir / "projects.db").get_by_root(root)["project_id"] in project_ids
+
+
+def test_recreated_project_agent_directory_replaces_stale_root_registration(tmp_path: Path, make_config) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    config = make_config()
+    first = ProjectManager(config).resolve_project(root)
+
+    for path in sorted(first.agent_dir.rglob("*"), key=lambda item: len(item.parts), reverse=True):
+        if path.is_file():
+            path.unlink()
+        elif path.is_dir():
+            path.rmdir()
+    first.agent_dir.rmdir()
+
+    second = ProjectManager(config).resolve_project(root)
+    row = ProjectRegistry(config.data_dir / "projects.db").get_by_root(root)
+
+    assert second.id != first.id
+    assert row is not None
+    assert row["project_id"] == second.id

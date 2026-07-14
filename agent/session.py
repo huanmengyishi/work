@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import fcntl
 import json
+import os
 import re
+import stat
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -46,6 +48,9 @@ class SessionLease:
 
 
 class SessionManager:
+    MAX_SESSION_FILE_BYTES = 64 * 1024 * 1024
+    MAX_MESSAGES = 20_000
+
     def __init__(self, project: Project) -> None:
         self.project = project
         self.session_dir = project.agent_dir / "sessions"
@@ -57,6 +62,8 @@ class SessionManager:
         return f"{stamp}-{uuid4().hex[:8]}"
 
     def checkpoint(self, state: AgentState, messages: list[dict[str, Any]]) -> Path:
+        if len(messages) > self.MAX_MESSAGES or not all(isinstance(item, dict) for item in messages):
+            raise ValueError(f"session messages exceed the {self.MAX_MESSAGES} item limit or contain invalid records")
         state.touch()
         path = self._json_path(state.session_id)
         payload = {
@@ -64,7 +71,10 @@ class SessionManager:
             "state": state.to_dict(),
             "messages": messages,
         }
-        self._atomic_write(path, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+        content = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+        if len(content.encode("utf-8")) > self.MAX_SESSION_FILE_BYTES:
+            raise ValueError(f"session checkpoint exceeds the {self.MAX_SESSION_FILE_BYTES} byte limit")
+        self._atomic_write(path, content)
         return path
 
     def finalize(self, state: AgentState, messages: list[dict[str, Any]]) -> tuple[Path, Path]:
@@ -76,7 +86,7 @@ class SessionManager:
             request = item.get("request") or {}
             result = item.get("result") or {}
             tool_lines.append(
-                f"- round {item.get('round', '-')}: {request.get('tool', '?')}.{request.get('action', '?')} "
+                f"- tool turn {item.get('round', '-')}: {request.get('tool', '?')}.{request.get('action', '?')} "
                 f"success={result.get('success', False)} duration_ms={result.get('duration_ms', 0)}"
             )
         content = "\n".join(
@@ -89,6 +99,12 @@ class SessionManager:
                 f"- Project: `{state.project.get('name', '')}`",
                 "",
                 "## User Request",
+                "",
+                "### Original Objective",
+                "",
+                state.objective.strip(),
+                "",
+                "### Current Turn Request",
                 "",
                 state.user_request.strip(),
                 "",
@@ -116,10 +132,15 @@ class SessionManager:
     def load(self, session_id: str | None = None) -> SessionRecord:
         resolved = self.resolve_session_id(session_id)
         path = self._json_path(resolved)
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = self._read_payload(path)
         state_data = payload.get("state")
         messages = payload.get("messages")
-        if not isinstance(state_data, dict) or not isinstance(messages, list):
+        if (
+            not isinstance(state_data, dict)
+            or not isinstance(messages, list)
+            or len(messages) > self.MAX_MESSAGES
+            or not all(isinstance(item, dict) for item in messages)
+        ):
             raise ValueError(f"invalid session file: {path}")
         return SessionRecord(state=AgentState.from_dict(state_data), messages=messages)
 
@@ -136,17 +157,17 @@ class SessionManager:
 
     def list_sessions(self, limit: int = 20) -> list[SessionInfo]:
         items: list[SessionInfo] = []
-        paths = sorted(self.session_dir.glob("*.json"), key=lambda item: item.stat().st_mtime_ns, reverse=True)
+        paths = sorted(self.session_dir.glob("*.json"), key=lambda item: item.lstat().st_mtime_ns, reverse=True)
         for path in paths:
             try:
-                payload = json.loads(path.read_text(encoding="utf-8"))
+                payload = self._read_payload(path)
                 state = payload.get("state") or {}
                 items.append(
                     SessionInfo(
                         session_id=str(state.get("session_id") or path.stem),
                         status=str(state.get("status") or "unknown"),
                         turn=int(state.get("turn") or 1),
-                        user_request=str(state.get("user_request") or ""),
+                        user_request=str(state.get("objective") or state.get("user_request") or ""),
                         updated_at=str(state.get("updated_at") or ""),
                         path=path,
                     )
@@ -156,6 +177,22 @@ class SessionManager:
             if len(items) >= limit:
                 break
         return items
+
+    def _read_payload(self, path: Path) -> dict[str, Any]:
+        metadata = path.lstat()
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ValueError(f"session path is not a regular file: {path}")
+        if metadata.st_size > self.MAX_SESSION_FILE_BYTES:
+            raise ValueError(f"session file exceeds the {self.MAX_SESSION_FILE_BYTES} byte limit: {path}")
+        flags = os.O_RDONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(path, flags)
+        with os.fdopen(descriptor, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        if not isinstance(payload, dict):
+            raise ValueError(f"invalid session file: {path}")
+        return payload
 
     def resolve_session_id(self, session_id: str | None) -> str:
         if not session_id:

@@ -34,7 +34,7 @@ def _parameter_names(callable_object) -> tuple[str, ...]:
 
 
 def test_core_interface_chain_and_runtime_entrypoints_are_versioned() -> None:
-    assert CORE_INTERFACE_CONTRACT_VERSION == 1
+    assert CORE_INTERFACE_CONTRACT_VERSION == 2
     assert CORE_INTERFACE_CHAIN == (
         "CLI",
         "Runtime",

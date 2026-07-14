@@ -12,7 +12,7 @@
 
 ```bash
 cd ~/AI-Agent
-PYTHONPATH=. .venv/bin/python user-docs/实用案例-v0.10.0/event-runtime-demo.py
+PYTHONPATH=. .venv/bin/python user-docs/测试与验收/实用案例/v0.10.0/event-runtime-demo.py
 ```
 
 预期最后显示 `Event Runtime demo passed.`。脚本会打印一份安全 Audit 记录和聚合 Metrics；其中不会出现脚本内的 private marker。

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import difflib
+import base64
 import hashlib
 import json
 import os
@@ -64,6 +65,8 @@ class FileEditTool:
         elif old_text is not None:
             if new_text is None:
                 return ToolResult(False, "", "new_text is required when old_text is provided")
+            if old_text == new_text:
+                return ToolResult(False, "", "no changes to preview: old_text and new_text are identical")
             occurrences = before_text.count(old_text)
             if occurrences == 0:
                 return ToolResult(False, "", "old_text was not found; refresh the file and create a new preview")
@@ -123,8 +126,18 @@ class FileEditTool:
         if self._hash(current) != record["base_hash"]:
             return ToolResult(False, "", "file changed after preview; create a fresh file_diff before applying")
 
-        after_text = record.get("content") if record.get("after_exists") else None
-        after_bytes = after_text.encode("utf-8") if isinstance(after_text, str) else None
+        if record.get("binary") and record.get("after_exists"):
+            encoded = record.get("content_base64")
+            if not isinstance(encoded, str):
+                raise ValueError("binary preview is missing content")
+            after_bytes = base64.b64decode(encoded, validate=True)
+        else:
+            after_text = record.get("content") if record.get("after_exists") else None
+            after_bytes = after_text.encode("utf-8") if isinstance(after_text, str) else None
+        if after_bytes is not None and len(after_bytes) > self.max_file_bytes:
+            return ToolResult(False, "", f"preview result exceeds file-edit limit: {len(after_bytes)} bytes")
+        if self._hash(after_bytes) != str(record.get("result_hash") or ""):
+            return ToolResult(False, "", "preview content changed after review; create a fresh preview")
         snapshot_id = uuid4().hex
         snapshot_dir = self._session_snapshot_dir(session_id) / snapshot_id
         snapshot_dir.mkdir(parents=True, exist_ok=False)
@@ -176,7 +189,52 @@ class FileEditTool:
         return ToolResult(
             True,
             f"applied {record['path']} (snapshot {snapshot_id})",
-            data={"snapshot_id": snapshot_id, "preview_id": preview_id, "path": record["path"]},
+            data={
+                "snapshot_id": snapshot_id,
+                "preview_id": preview_id,
+                "path": record["path"],
+                "before_exists": bool(manifest["before_exists"]),
+                "after_exists": bool(manifest["after_exists"]),
+            },
+        )
+
+    def preview_binary(self, *, path: str, session_id: str, content: bytes, source: str) -> ToolResult:
+        target = resolve_project_path(self.project.root, path, require_file=True)
+        before_bytes = self._read_bytes(target)
+        if len(content) > self.max_file_bytes:
+            return ToolResult(False, "", f"result exceeds file-edit limit: {len(content)} bytes")
+        if before_bytes == content:
+            return ToolResult(False, "", "preview contains no changes")
+        relative = self._relative(target)
+        preview_id = uuid4().hex
+        record = {
+            "schema_version": 1,
+            "preview_id": preview_id,
+            "session_id": session_id,
+            "path": relative,
+            "base_hash": self._hash(before_bytes),
+            "result_hash": self._hash(content),
+            "before_exists": before_bytes is not None,
+            "after_exists": True,
+            "content_base64": base64.b64encode(content).decode("ascii"),
+            "binary": True,
+            "source": source[:200],
+            "diff": f"Binary artifact preview: {relative} ({len(content)} bytes, source={source[:120]})",
+            "status": "pending",
+            "created_at": utc_now_iso(),
+        }
+        self._write_json(self._preview_path(preview_id), record)
+        return ToolResult(
+            True,
+            str(record["diff"]),
+            data={
+                "preview_id": preview_id,
+                "path": relative,
+                "base_hash": record["base_hash"],
+                "result_hash": record["result_hash"],
+                "requires_apply": True,
+                "binary": True,
+            },
         )
 
     def undo(self, *, session_id: str, snapshot_id: str | None = None) -> ToolResult:
@@ -209,7 +267,11 @@ class FileEditTool:
         return ToolResult(
             True,
             f"restored {manifest['path']} from snapshot {selected}",
-            data={"snapshot_id": selected, "path": manifest["path"]},
+            data={
+                "snapshot_id": selected,
+                "path": manifest["path"],
+                "restored_exists": bool(manifest["before_exists"]),
+            },
         )
 
     def status(self, session_id: str | None = None) -> dict[str, Any]:
