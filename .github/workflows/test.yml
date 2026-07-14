@@ -39,7 +39,7 @@ jobs:
       - name: Install project and development dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install --yes ripgrep
+          sudo apt-get install --yes pandoc ripgrep
           python -m pip install -e '.[dev,browser,semantic]'
           python -m playwright install --with-deps chromium
 
