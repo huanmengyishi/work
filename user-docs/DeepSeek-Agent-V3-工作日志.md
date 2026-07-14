@@ -2,7 +2,7 @@
 
 日期：2026-07-15
 
-状态：源码与离线回归已完成；Word/文本在线案例通过；最新大型 TypeScript 在线案例仍为失败记录，修复后只完成确定性回归，尚未再次消耗 API 余额重跑；提交、tag、推送和远端核验等待发布闭环。
+状态：v0.11.0 已发布到 GitHub；`main`、`v0.11.0` 与最终提交 `113592c` 一致，Actions 已通过。源码与离线回归完成，Word/文本在线案例通过；大型 TypeScript 候选在线案例仍有失败记录，最终发布提交尚无可明确归属的修复后大型在线成功记录。2026-07-15 已补充实例运行审计和后续改进建议。
 
 ## 1. 目标
 
@@ -186,10 +186,10 @@ pip check：无依赖冲突
 
 尚未通过：
 
-- 最新大型 TypeScript 在线验收记录为 36 次逻辑请求、31 个工具轮次、1,477,342 tokens。
-- 除 `session_completed` 外的验收门均通过；最终结果仍是 Session 未完成，因此该案例整体必须记为失败。
-- 根因是 artifact 跨分句误判与 conditional-mutation 漏判，不是简单增加工具轮次。
-- 修复后已完成 4 main + 1 final synthesis 确定性回归；为避免继续消耗用户 DeepSeek API 余额，没有再次在线重跑。
+- `final-prepublish-single-rerun` 大型 TypeScript 记录为 36 次逻辑请求、31 个工具轮次、1,477,342 tokens。除 `session_completed` 外的验收门均通过，整体仍必须记为失败。
+- 当前目录另有一条 2026-07-15 03:04 生成的 `final-20260715T025700` 失败记录：38 次逻辑请求、32 个工具轮次、1,573,936 tokens；Session、八项优点、Bug/限制和验证报告均未完成。
+- 第二条记录早于 05:54 的发布提交和 06:16 的最终修复提交，但没有保存 `git_head`、dirty 状态或源码包哈希，因此不能可靠归属到某个候选 commit；验收 runner 需要补版本清单。
+- artifact 跨分句误判与 conditional-mutation 漏判修复后已完成 4 main + 1 final synthesis 确定性回归。为避免继续消耗用户余额，最终提交没有再次在线重跑大型案例。
 
 结论边界：离线全量和 focused 回归可以声明通过，Word/文本在线案例可以声明通过；大型 TypeScript 在线案例不能声明通过，也不能把确定性模拟写成在线成功。
 
@@ -202,6 +202,9 @@ pip check：无依赖冲突
 5. 通用 verify 状态仍主要由模型调用计划工具更新；Word/artifact 才有更强的 managed-write/re-open 工具证据门。
 6. Event Bus 是进程内同步总线；Resume 也不是 Durable Intent Journal。中断中的外部副作用可能需要人工核验。
 7. 主循环、主动语义摘要、overflow 恢复和 final synthesis 都可能产生 API 请求。余额受限时必须先离线验证，再只运行一次有界在线验收；失败后先分析，不能立刻重复请求。
+8. 缺少 API Key 的全新环境在 Chroma 可用且 Vector 默认开启时，会先下载约 79.3 MiB ONNX 模型再报错；Key 预检、Vector 默认值和延迟加载需要在 v0.11.1 修复。
+9. `agent/cli.py::run_once` 对 failed/resumable Session 仍可能返回退出码 0，自动化不能只依赖进程码。
+10. 大型任务只有工具轮次上限，没有总模型请求、总 token 和总时长硬预算；两条失败记录的高消耗说明必须增加跨阶段预算。
 
 ## 8. 目录与文档整理
 
@@ -233,16 +236,16 @@ pip check：无依赖冲突
 ```text
 目标版本：v0.11.0
 AgentState schema：6
-工作分支：feat/v0.11.0-reliable-agent-loop
+发布分支：main（开发分支 feat/v0.11.0-reliable-agent-loop 已合并）
 基线：95038c9（v0.10.0）
-最终提交哈希：暂待发布闭环
-Git tag：暂待创建 v0.11.0
-GitHub main 推送：暂待发布闭环
-远端 main/tag 指向核验：暂待发布闭环
-GitHub Actions：暂待推送后核验
+最终提交哈希：113592ce32d7ee2920c1ac6d1d2bea092a2f7c
+Git tag：v0.11.0（tag object 67be913e2498eb9cf5c5496811181c7b8ee6e4db）
+GitHub main 推送：成功
+远端 main/tag 指向核验：均解引用到 113592ce32d7ee2920c1ac6d1d2bea092a2f7c
+GitHub Actions：run 29372482649，completed/success
 ```
 
-本日志不提前填写一个会因“更新提交哈希”而再次变化的自引用提交。最终发布回复必须给出实际版本、最终 commit、tag、远端核验和 Actions 结果。
+这里记录的是不可变的 v0.11.0 发布提交；发布后的审计文档提交与审计 tag 由对应交付回复和 Git 历史记录，不把文档自身提交误写成软件发布提交。
 
 文档发布阶段没有调用 DeepSeek 模型，也没有读取或输出真实 API Key。两份 0.11.0 Word 已由版本化 Markdown 完全离线生成；ZIP 完整性、Pandoc 关键章节、标题/作者和固定 `2026-07-15T00:00:00Z` 核心属性均通过验证，当前目录与源码镜像的 SHA-256 逐对一致。旧 Word 继续保存在 `老版使用说明/` 和 `老版工作日志/`。
 
@@ -260,9 +263,21 @@ git switch --detach v0.10.0
 
 下一步按顺序执行：
 
-1. 完成最终只读代码、循环和发布审计，处理任何 blocker。
-2. 再核对候选提交不含 Key、PTY、metrics、Session、Memory、缓存或 `.project-agent`。
-3. 提交 v0.11.0，fast-forward `main`，创建 `v0.11.0` tag，推送 main/tag。
-4. 核验远端 main/tag 指向同一预期 commit，并检查 GitHub Actions。
-5. 不再为本次发布在线重跑大型案例；只有用户以后明确同意新的 API 成本时，才用全新 Workspace/Session 做一次修复后验收。
-6. 后续版本再评估 package-manager 元数据、`Retry-After`/jitter/watchdog、通用 verify 证据和 Durable Intent Journal，不在 0.11.0 临时追加未验证功能。
+1. v0.11.1 优先修复缺 Key 前的 Vector 下载、failed Session 退出码和 Key/Launcher 提示，并增加自动化回归。
+2. v0.12.0 增加总模型请求、总 token、总时长预算，以及结构化 no-bug/verify 完成路径。
+3. 验收 runner 增加 `git_head`、dirty、依赖与 Prompt/fixture 哈希；没有版本清单的记录不得当作最终发布证明。
+4. 后续补 package-manager 元数据、`Retry-After`/jitter/watchdog、通用 verify 证据和 Durable Intent Journal。
+5. 只有用户明确同意新的 API 成本时，才对确定的发布 commit 做一次有预算上限的大型在线验收。
+
+## 11. 2026-07-15 实例运行审计补记
+
+本次在不读取真实 Key 的前提下重新完成：454 项 pytest、Ruff、format check、compileall、pip check、git diff check、隔离项目初始化、真实 PTY 空输入/Ctrl+C/退出，以及远端 main/tag/Actions 核验。另复现缺 Key 前触发约 79.3 MiB Vector 模型下载，并从当前代码确认 failed/resumable Session 的直接 CLI 退出码问题。
+
+完整证据、修改位置、分版本优先级和复验清单位于：
+
+```text
+/mnt/d/detail/deepseek/项目运行审计与改进建议/20260715/
+~/AI-Agent/user-docs/项目运行审计与改进建议/20260715/
+```
+
+本次只新增和校正文档，没有修改 Runtime 行为，因此软件版本仍为 0.11.0；上述代码问题不能写成已经修复。

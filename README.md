@@ -615,12 +615,23 @@ The frozen v0.11.0 candidate collected and passed 454 tests locally, including
 acceptance run. A clean Python 3.14 environment installed
 `.[dev,browser,semantic]`, passed `pip check`, and passed the same 454 tests.
 The Word and plain-text online cases passed. The last large TypeScript
-online case produced a complete evidence-based report but ended `failed`
-because the old router falsely required a managed artifact and rejected the
-conditional no-change path. The clause-bounded routing fix passed deterministic
-4-main-loop + 1-final-synthesis regression; it was not rerun online to avoid
-another high-token API charge, so this release does not claim a post-fix online
-large-case pass.
+archived prepublish case produced a complete evidence-based report but ended
+`failed` because the old router falsely required a managed artifact and rejected
+the conditional no-change path. A second local candidate record created before
+the release commits also failed after 38 logical requests and 1,573,936 reported
+tokens, but its metrics did not capture a Git commit or source hash and therefore
+cannot be attributed to the final release. The clause-bounded routing fix passed
+deterministic 4-main-loop + 1-final-synthesis regression; the final release was
+not rerun online to avoid another high-token API charge, so this release does not
+claim a post-fix online large-case pass.
+
+A 2026-07-15 read-only readiness audit reran all 454 tests, Ruff, format check,
+compileall, pip check, isolated project initialization, and a real REPL PTY. It
+also reproduced an unnecessary 79.3 MiB Chroma model download before the
+missing-key error on a fresh optional-Vector installation, and confirmed that a
+direct CLI task may return zero when its Session is failed but resumable. These
+are documented follow-up issues, not fixes in v0.11.0. See
+`user-docs/项目运行审计与改进建议/20260715/README.md` and its verification checklist.
 
 A runnable Chinese walkthrough is available at
 `user-docs/测试与验收/实用案例/v0.9.0/README.md`. Its order-summary project intentionally
