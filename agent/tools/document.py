@@ -81,7 +81,7 @@ class DocumentTool:
         if suffix in IMAGE_SUFFIXES:
             return self._parse_image(file_path)
         if suffix in WORD_SUFFIXES:
-            return ToolResult(False, "", "word parsing requires ai-parser dependencies or pandoc")
+            return self._parse_word(file_path)
         return ToolResult(False, "", f"unsupported document type: {suffix or '<none>'}")
 
     def render_docx(self, *, title: str, markdown: str) -> tuple[bytes, dict[str, object]]:
@@ -154,6 +154,23 @@ class DocumentTool:
         if ocr:
             return self._ocr_pdf(file_path)
         return ToolResult(False, "", "PDF parsing failed and OCR is disabled")
+
+    def _parse_word(self, file_path: Path) -> ToolResult:
+        if not shutil.which("pandoc"):
+            return ToolResult(False, "", "word parsing requires ai-parser dependencies or pandoc")
+        result = run_command(
+            ["pandoc", str(file_path), "--to", "gfm"],
+            cwd=self.cwd,
+            timeout=self.timeout,
+            max_output_bytes=self.max_result_bytes,
+        )
+        if not result.ok or not result.output.strip():
+            return ToolResult(False, result.output, result.error or "pandoc produced no text")
+        return self._markdown_result(
+            file_path,
+            result.output,
+            {"path": str(file_path), "parser": "pandoc", **_source_metadata(result.data)},
+        )
 
     def _parse_with_ai_tools(self, file_path: Path) -> ToolResult:
         if not AI_TOOLS_LAUNCHER.exists() and not AI_TOOLS_PARSER.exists():

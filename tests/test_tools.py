@@ -578,9 +578,11 @@ def test_make_dir_creates_bounded_project_directory(tmp_path: Path, make_config)
     assert "outside the current project" in escaped.stderr
 
 
-def test_document_render_docx_uses_binary_preview_apply_and_parse(tmp_path: Path, make_config) -> None:
+def test_document_render_docx_uses_binary_preview_apply_and_parse(tmp_path: Path, make_config, monkeypatch) -> None:
     root = tmp_path / "project"
     root.mkdir()
+    monkeypatch.setattr("agent.tools.document.AI_TOOLS_LAUNCHER", tmp_path / "missing-ai-parser-launcher")
+    monkeypatch.setattr("agent.tools.document.AI_TOOLS_PARSER", tmp_path / "missing-ai-parser.py")
     _, project, _, tools = build_manager(root, make_config, yolo=True)
     state = AgentState.create(
         session_id="docx-session",
@@ -611,6 +613,7 @@ def test_document_render_docx_uses_binary_preview_apply_and_parse(tmp_path: Path
 
     _, parsed = tools.execute_model_call("document_parse", {"path": "汇总.docx"})
     assert parsed.success is True
+    assert parsed.data["parser"] == "pandoc"
     assert "范围" in parsed.stdout
     assert "结论内容" in parsed.stdout
 
