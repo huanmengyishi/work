@@ -3,7 +3,7 @@
 Project-centric DeepSeek CLI agent for WSL. The Agent is installed as a tool;
 the directory where `agent` is started is the workspace.
 
-Current version: `0.12.0`. The core interface chain is covered by executable
+Current version: `0.12.1`. The core interface chain is covered by executable
 contract tests. ContextBuilder is the only model-context entry, PromptBuilder
 only renders a `ContextPackage`, AgentState validates its frozen schema, and the
 versioned Event Bus now owns Runtime automatic side-effect pipelines.
@@ -71,6 +71,13 @@ kinds, dry-run capacity control, protected durable kinds, and explicit
 idempotent confidence feedback. Scalar-only performance history observes but
 never tunes execution. Portable locks, shell quoting, and dependency alignment
 complete the platform reliability work.
+
+Version `0.12.1` fixes release-tool reproducibility without changing Runtime
+behavior or the schema. GitHub Actions had resolved the open-ended
+`ruff>=0.6.0` dependency to Ruff 0.16.0, whose expanded default rule set
+reported 210 historical policy findings before tests could run. The verified
+Ruff 0.15.21 toolchain is now pinned, the intended `E4/E7/E9/F` lint contract
+is explicit, and CI prints the installed Ruff version before checking sources.
 
 ## Quick Start
 
@@ -624,11 +631,13 @@ The repository includes `.github/workflows/test.yml` for Python 3.11, 3.12,
 and 3.13. It uses `actions/checkout@v5` and `actions/setup-python@v6` (current
 Node.js runtime, no Node.js 20 deprecation), then runs Ruff, the complete pytest
 suite, and compileall for pushes to `main`, pull requests, and manual dispatch.
-The v0.12.0 release worktree collected and passed 502 tests on 2026-07-26.
+The v0.12.0 runtime worktree collected and passed 502 tests on 2026-07-26.
 Ruff check, source/test/script format check, compileall, pip check, diff check,
 and isolated version/help/init/keyless/launcher smoke checks passed. The user
 explicitly deferred online DeepSeek authentication because the API balance is
-exhausted; no v0.12.0 online success is claimed.
+exhausted; no v0.12.0 or v0.12.1 online success is claimed. v0.12.1 pins Ruff
+0.15.21 and makes the established lint selection explicit so CI cannot silently
+adopt a new default ruleset.
 
 The frozen v0.11.0 candidate collected and passed 454 tests locally, including
 18 CLI/Console tests, a real 25-column complex-grapheme progress PTY, a real

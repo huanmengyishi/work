@@ -45,6 +45,7 @@ jobs:
 
       - name: Run Ruff checks
         run: |
+          ruff --version
           ruff check agent tests scripts
           ruff format --check agent tests scripts
 

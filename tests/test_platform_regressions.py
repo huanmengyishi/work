@@ -128,3 +128,12 @@ def test_optional_dependency_minimums_match_requirements_file() -> None:
 
     assert requirements["chromadb"] == project["optional-dependencies"]["vector"][0]
     assert requirements["playwright"] == project["optional-dependencies"]["browser"][0]
+
+
+def test_ruff_version_and_lint_contract_are_release_pinned() -> None:
+    root = Path(__file__).resolve().parents[1]
+    configuration = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
+
+    assert "ruff==0.15.21" in configuration["project"]["optional-dependencies"]["dev"]
+    assert configuration["tool"]["ruff"]["required-version"] == "==0.15.21"
+    assert configuration["tool"]["ruff"]["lint"]["select"] == ["E4", "E7", "E9", "F"]

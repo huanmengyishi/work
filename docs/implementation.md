@@ -6,7 +6,7 @@ Deep Agent V3 is a local, project-centric coding Agent powered only by DeepSeek.
 It runs under WSL Ubuntu and can be started from any directory. Program files,
 user configuration, long-term data, and project-local context remain separate.
 
-Version `0.12.0` keeps the interfaces stabilized in v0.9.1. ContextBuilder
+Version `0.12.1` keeps the interfaces stabilized in v0.9.1. ContextBuilder
 is the only context-selection entry, PromptBuilder only consumes a
 `ContextPackage`, AgentState has a validated/frozen schema, and the versioned
 Event Bus owns automatic Runtime side effects. The runtime remains DeepSeek-only
@@ -19,6 +19,8 @@ v0.12.0 adds bounded turn budgets, typed plan metadata and trusted progress,
 managed artifact verification receipts, Memory capacity/feedback controls,
 scalar-only performance history, lazy optional Vector loading, and portable
 file locking. It adds no second provider, Runtime, or Permission bypass.
+The patch release also pins Ruff 0.15.21 and explicitly selects the established
+`E4/E7/E9/F` lint contract after Ruff 0.16.0 expanded its defaults in CI.
 
 ## 2. Runtime Architecture
 
@@ -758,7 +760,7 @@ Run the release checks locally without exposing credentials:
 `.github/workflows/test.yml` uses `actions/checkout@v5` and
 `actions/setup-python@v6`, installs browser/semantic integration dependencies,
 and runs Ruff, the complete pytest suite, and compileall for Python 3.11, 3.12,
-and 3.13. The v0.12.0 candidate collected and passed 502 tests locally,
+and 3.13. The v0.12.0 runtime candidate collected and passed 502 tests locally,
 including real PTY interaction, grapheme width, tool interruption/pairing,
 attachments, convergence, finish reasons, Resume, and real local validation
 command selection. The CLI/Console subset has 18 tests; real PTYs cover a
