@@ -220,6 +220,14 @@ class ConsoleUI:
             return
         else:
             return
+        progress = value.get("progress") if isinstance(value.get("progress"), dict) else {}
+        total_steps = self._progress_count(progress.get("total_steps"), default=0)
+        if total_steps:
+            completed = self._progress_count(progress.get("completed_steps"), default=0)
+            skipped = self._progress_count(progress.get("skipped_steps"), default=0)
+            percent = progress.get("percent")
+            percent_label = f"{float(percent):.1f}" if isinstance(percent, (int, float)) else "0.0"
+            label += f"；计划进度 {percent_label}%（{completed + skipped}/{total_steps}）"
         # Every non-reasoning progress event is a model/tool boundary. Close a
         # streamed reasoning line before rendering the next status line.
         self.finish_reasoning()

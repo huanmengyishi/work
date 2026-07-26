@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import fcntl
 import hashlib
 import json
 import sqlite3
@@ -13,6 +12,7 @@ import yaml
 
 from . import paths
 from .config import AppConfig
+from .file_lock import lock_exclusive, unlock
 from .timeutil import utc_now_iso
 
 
@@ -142,10 +142,10 @@ class ProjectManager:
         agent_dir.mkdir(parents=True, exist_ok=True)
         lock_handle = (agent_dir / ".project.lock").open("a+")
         try:
-            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+            lock_exclusive(lock_handle)
             project = self._ensure_project(root)
         finally:
-            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+            unlock(lock_handle)
             lock_handle.close()
         self.registry.upsert(project)
         return project

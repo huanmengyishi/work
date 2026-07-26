@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import json
-import fcntl
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Callable
 from uuid import uuid4
 
+from .file_lock import FileLockUnavailable, lock_exclusive, unlock
 from .project import Project
 from .timeutil import utc_now_iso
 
@@ -69,8 +69,8 @@ class TaskQueueManager:
         lock_path = self.queue_dir / f"{record.id}.lock"
         lock = lock_path.open("a+")
         try:
-            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
+            lock_exclusive(lock, nonblocking=True)
+        except FileLockUnavailable:
             lock.close()
             raise RuntimeError(f"queue is already running: {record.id}") from None
         try:
@@ -118,7 +118,7 @@ class TaskQueueManager:
             self._copy_record(record, caller_record)
             return record
         finally:
-            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+            unlock(lock)
             lock.close()
 
     def save(self, record: QueueRecord) -> Path:

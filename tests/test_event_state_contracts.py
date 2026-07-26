@@ -10,6 +10,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from agent.artifact import ARTIFACT_VERIFICATION_METADATA_KEY
 from agent.contracts import EVENT_SCHEMA_VERSION, EVENT_SERIALIZED_FIELDS
 from agent.events import Event, EventBus, EventDispatchError, JsonlEventLogger
 from agent.project import ProjectManager
@@ -362,7 +363,7 @@ def test_agent_state_model_metrics_and_convergence_gates_are_per_turn_while_circ
 
     restored = AgentState.from_dict(state.to_dict())
 
-    assert restored.schema_version == 6
+    assert restored.schema_version == 7
     assert restored.model_request_count == 3
     assert restored.main_loop_model_request_count == 1
     assert restored.context_compaction_model_request_count == 1
@@ -416,6 +417,92 @@ def test_session_summary_names_persisted_tool_turns_without_implying_model_round
 
     persisted = json.loads(json_path.read_text(encoding="utf-8"))
     summary = markdown_path.read_text(encoding="utf-8")
-    assert persisted["state"]["schema_version"] == 6
+    assert persisted["state"]["schema_version"] == 7
     assert "- tool turn 3: file.read success=True duration_ms=4" in summary
     assert "- round 3:" not in summary
+
+
+def test_session_deliverable_status_replays_apply_delete_and_undo_lineage(
+    tmp_path: Path,
+    make_config,
+) -> None:
+    state = _state(tmp_path, make_config)
+    state.task_route = {"artifact_hints": ["report.docx"]}
+    receipt = {
+        "schema_version": 1,
+        "artifact_id": "document-parse",
+        "path": "report.docx",
+        "format": "docx",
+        "passed": True,
+        "content_complete": True,
+        "size_bytes": 1024,
+        "content_sha256": "b" * 64,
+        "checks_run": [
+            "tool_result",
+            "exists",
+            "nonempty",
+            "max_size",
+            "content",
+            "docx_zip_container",
+            "docx_package_structure",
+            "docx_zip_integrity",
+            "docx_package_xml",
+            "docx_nonempty_text",
+        ],
+        "errors": [],
+    }
+    state.tool_calls = [
+        {
+            "request": {"tool": "file", "action": "apply"},
+            "result": {
+                "success": True,
+                "data": {
+                    "path": "report.docx",
+                    "snapshot_id": "create-snapshot",
+                    "after_exists": True,
+                },
+            },
+        },
+        {
+            "request": {"tool": "document", "action": "parse", "args": {"path": "report.docx"}},
+            "result": {"success": True, "data": {ARTIFACT_VERIFICATION_METADATA_KEY: receipt}},
+        },
+    ]
+    assert "`report.docx`: `verified`" in SessionManager._deliverable_lines(state)[0]
+
+    state.tool_calls.append(
+        {
+            "request": {"tool": "file", "action": "apply"},
+            "result": {
+                "success": True,
+                "data": {
+                    "path": "report.docx",
+                    "snapshot_id": "delete-snapshot",
+                    "after_exists": False,
+                },
+            },
+        }
+    )
+    assert "`report.docx`: `missing`" in SessionManager._deliverable_lines(state)[0]
+
+    state.tool_calls.append(
+        {
+            "request": {"tool": "file", "action": "undo"},
+            "result": {
+                "success": True,
+                "data": {"snapshot_id": "delete-snapshot", "restored_exists": True},
+            },
+        }
+    )
+    assert "`report.docx`: `verified`" in SessionManager._deliverable_lines(state)[0]
+
+    state.tool_calls.append(
+        {
+            "request": {"tool": "file", "action": "undo"},
+            "result": {
+                "success": True,
+                "data": {"snapshot_id": "create-snapshot", "restored_exists": False},
+            },
+        }
+    )
+    assert "`report.docx`: `missing`" in SessionManager._deliverable_lines(state)[0]

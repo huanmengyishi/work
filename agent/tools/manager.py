@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
+from ..capability_health import CapabilityHealthManager
 from ..config import AppConfig
 from ..events import EventBus, sanitize_for_log
 from ..memory import MemoryStore
@@ -73,11 +74,8 @@ class ToolManager:
         auto_approve: bool = False,
         yolo: bool = False,
         super_yolo: bool = False,
+        health: CapabilityHealthManager | None = None,
     ) -> None:
-        # capability_health depends on tools.registry.  Resolve it only after
-        # this module is initialized so event_pipelines can be imported first.
-        from ..capability_health import CapabilityHealthManager
-
         self.config = config
         self.project = project
         self.memory = memory
@@ -92,7 +90,7 @@ class ToolManager:
         self.plan_manager = PlanManager()
         self.permission = PermissionManager(config, project.root)
         self.registry = ToolCapabilityRegistry(config)
-        self.health = CapabilityHealthManager(config, project.id)
+        self.health = health or CapabilityHealthManager(config, project.id)
         max_result_bytes = int(config.get("tools.tool_result.max_attachment_bytes", 8_388_608))
         self.result_store = ToolResultStore(
             project.agent_dir,
@@ -166,6 +164,14 @@ class ToolManager:
 
     def set_event_bus(self, events: EventBus) -> None:
         self.events = events
+
+    def configure_permissions(self, *, yolo: bool | None = None, super_yolo: bool | None = None) -> None:
+        """Update interactive approval modes through one explicit boundary."""
+
+        if yolo is not None:
+            self.yolo = bool(yolo)
+        if super_yolo is not None:
+            self.super_yolo = bool(super_yolo)
 
     def schemas(self) -> list[dict[str, Any]]:
         return [
@@ -1019,9 +1025,40 @@ class ToolManager:
                                     "max_retries": {"type": "integer", "minimum": 0, "maximum": 10},
                                     "allow_parallel": {"type": "boolean"},
                                     "completion_criteria": {"type": "string"},
+                                    "parent_id": {"type": "string"},
+                                    "step_type": {
+                                        "type": "string",
+                                        "enum": [
+                                            "scope",
+                                            "inspect",
+                                            "implement",
+                                            "synthesize",
+                                            "generate",
+                                            "render",
+                                            "verify",
+                                            "review",
+                                            "generic",
+                                        ],
+                                    },
+                                    "estimated_tool_rounds": {"type": "integer", "minimum": 0, "maximum": 64},
+                                    "artifact_ids": {
+                                        "type": "array",
+                                        "maxItems": 32,
+                                        "items": {"type": "string"},
+                                    },
+                                    "validation_rules": {
+                                        "type": "array",
+                                        "maxItems": 32,
+                                        "items": {"type": "string"},
+                                    },
+                                    "progress_weight": {
+                                        "type": "number",
+                                        "exclusiveMinimum": 0,
+                                        "maximum": 100,
+                                    },
                                     "status": {
                                         "type": "string",
-                                        "enum": ["pending", "in_progress", "completed", "failed", "skipped"],
+                                        "enum": ["pending", "in_progress"],
                                     },
                                 },
                                 "required": ["title"],
@@ -1328,6 +1365,16 @@ class ToolManager:
             )
         if len(steps) > 8:
             return ToolResult(False, "", "agent_update_plan accepts at most 8 bounded steps")
+        model_statuses = [str(item.get("status") or "pending") for item in steps if isinstance(item, dict)]
+        if any(status not in {"pending", "in_progress"} for status in model_statuses):
+            return ToolResult(
+                False,
+                "",
+                "a new Task Graph cannot pre-claim completed, failed, or skipped steps; only the implement step "
+                "of an existing conditional-mutation graph may later be skipped",
+            )
+        if model_statuses.count("in_progress") > 1:
+            return ToolResult(False, "", "a new Task Graph can have at most one in-progress step")
         try:
             plan = self.plan_manager.replace(state, steps)
         except (TypeError, ValueError) as exc:

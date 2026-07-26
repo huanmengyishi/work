@@ -1210,25 +1210,34 @@ class TaskConvergenceController:
         attachment_id = str(attachment.get("request_id") or "").strip()
         return request_id if request_id and request_id == attachment_id else ""
 
-    @staticmethod
-    def _implementation_step_active(state: Any | None) -> bool:
+    @classmethod
+    def _implementation_step_active(cls, state: Any | None) -> bool:
         if state is None:
             return False
         for step in getattr(state, "plan", ()) or ():
-            step_id = step.get("id") if isinstance(step, dict) else getattr(step, "id", "")
             status = step.get("status") if isinstance(step, dict) else getattr(step, "status", "")
-            if str(step_id) == "implement" and str(status) == "in_progress":
+            if cls._step_semantic_type(step) == "implement" and str(status) == "in_progress":
                 return True
         return False
 
-    @staticmethod
-    def _implementation_or_verification_step_active(state: Any | None) -> bool:
+    @classmethod
+    def _implementation_or_verification_step_active(cls, state: Any | None) -> bool:
         if state is None:
             return False
         for step in getattr(state, "plan", ()) or ():
-            step_id = step.get("id") if isinstance(step, dict) else getattr(step, "id", "")
             status = step.get("status") if isinstance(step, dict) else getattr(step, "status", "")
-            if str(step_id) in {"implement", "verify"} and str(status) == "in_progress":
+            if (
+                cls._step_semantic_type(step)
+                in {
+                    "implement",
+                    "synthesize",
+                    "generate",
+                    "render",
+                    "verify",
+                    "review",
+                }
+                and str(status) == "in_progress"
+            ):
                 return True
         return False
 
@@ -1240,16 +1249,35 @@ class TaskConvergenceController:
         reasons = route.get("reasons") if isinstance(route, dict) else None
         return isinstance(reasons, list) and "conditional-mutation" in reasons
 
-    @staticmethod
-    def _exploration_step_active(state: Any | None) -> bool:
+    @classmethod
+    def _exploration_step_active(cls, state: Any | None) -> bool:
         if state is None:
             return False
         for step in getattr(state, "plan", ()) or ():
-            step_id = step.get("id") if isinstance(step, dict) else getattr(step, "id", "")
             status = step.get("status") if isinstance(step, dict) else getattr(step, "status", "")
-            if str(step_id) in {"scope", "inspect-chunks"} and str(status) == "in_progress":
+            if cls._step_semantic_type(step) in {"scope", "inspect"} and str(status) == "in_progress":
                 return True
         return False
+
+    @staticmethod
+    def _step_semantic_type(step: Any) -> str:
+        if isinstance(step, dict):
+            value = step.get("step_type") or step.get("kind")
+            step_id = step.get("id")
+        else:
+            value = getattr(step, "step_type", None) or getattr(step, "kind", None)
+            step_id = getattr(step, "id", "")
+        normalized = str(value or "").strip().lower()
+        if normalized and normalized != "generic":
+            return {"validate": "verify", "validation": "verify"}.get(normalized, normalized)
+        return {
+            "scope": "scope",
+            "inspect-chunks": "inspect",
+            "implement": "implement",
+            "synthesize": "synthesize",
+            "render-artifact": "render",
+            "verify": "verify",
+        }.get(str(step_id or "").strip().lower(), "generic")
 
     @staticmethod
     def _plan_requires_transition(state: Any | None) -> bool:

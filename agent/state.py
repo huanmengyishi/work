@@ -16,6 +16,9 @@ from .timeutil import utc_now_iso
 
 
 PLAN_STEP_STATUSES = frozenset({"pending", "in_progress", "completed", "failed", "skipped"})
+PLAN_STEP_TYPES = frozenset(
+    {"scope", "inspect", "implement", "synthesize", "generate", "render", "verify", "review", "generic"}
+)
 AGENT_STATUSES = frozenset({"initialized", "running", "completed", "failed"})
 PROMPT_PHASES = frozenset({"initial", "running", "resumed", "completed", "failed", "interrupted"})
 CONTEXT_PHASES = frozenset({"initial", "resume", "recovery"})
@@ -32,6 +35,12 @@ class PlanStep:
     max_retries: int = 0
     allow_parallel: bool = False
     completion_criteria: str = ""
+    parent_id: str | None = None
+    step_type: str = "generic"
+    estimated_tool_rounds: int = 1
+    artifact_ids: list[str] = field(default_factory=list)
+    validation_rules: list[str] = field(default_factory=list)
+    progress_weight: float = 1.0
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "PlanStep":
@@ -45,6 +54,12 @@ class PlanStep:
             max_retries=max(0, int(value.get("max_retries") or 0)),
             allow_parallel=bool(value.get("allow_parallel", False)),
             completion_criteria=str(value.get("completion_criteria") or ""),
+            parent_id=str(value.get("parent_id")) if value.get("parent_id") else None,
+            step_type=_plan_step_type(value.get("step_type") or value.get("kind"), value.get("id")),
+            estimated_tool_rounds=max(0, int(value.get("estimated_tool_rounds") or 1)),
+            artifact_ids=[str(item) for item in value.get("artifact_ids", [])],
+            validation_rules=[str(item) for item in value.get("validation_rules", [])],
+            progress_weight=float(value.get("progress_weight", 1.0)),
         )
 
     def validate(self) -> "PlanStep":
@@ -68,6 +83,24 @@ class PlanStep:
             raise ValueError(f"plan step dependencies must be unique: {self.id}")
         if self.id in self.dependencies:
             raise ValueError(f"plan step cannot depend on itself: {self.id}")
+        if self.parent_id == self.id:
+            raise ValueError(f"plan step cannot be its own parent: {self.id}")
+        if self.step_type not in PLAN_STEP_TYPES:
+            raise ValueError(f"invalid plan step type for {self.id}: {self.step_type}")
+        if not _is_non_negative_int(self.estimated_tool_rounds) or self.estimated_tool_rounds > 64:
+            raise ValueError(f"plan step estimated_tool_rounds must be between 0 and 64: {self.id}")
+        for field_name, values in (
+            ("artifact_ids", self.artifact_ids),
+            ("validation_rules", self.validation_rules),
+        ):
+            if not isinstance(values, list) or not all(isinstance(item, str) and item for item in values):
+                raise ValueError(f"plan step {field_name} must contain non-empty strings: {self.id}")
+            if len(values) > 32 or len(values) != len(set(values)):
+                raise ValueError(f"plan step {field_name} must be unique and contain at most 32 items: {self.id}")
+        if isinstance(self.progress_weight, bool) or not isinstance(self.progress_weight, (int, float)):
+            raise ValueError(f"plan step progress_weight must be numeric: {self.id}")
+        if not 0 < float(self.progress_weight) <= 100:
+            raise ValueError(f"plan step progress_weight must be between 0 and 100: {self.id}")
         return self
 
 
@@ -362,7 +395,9 @@ class AgentState:
         """Return whether one step has the plan-owned conditional skip exception."""
 
         reasons = (self.task_route or {}).get("reasons")
-        return step_id == "implement" and isinstance(reasons, list) and "conditional-mutation" in reasons
+        step = next((item for item in self.plan if item.id == step_id), None)
+        implementation_step = bool(step and step.step_type == "implement") or step_id == "implement"
+        return implementation_step and isinstance(reasons, list) and "conditional-mutation" in reasons
 
     def plan_step_satisfied(self, step: PlanStep) -> bool:
         """Return whether a step may satisfy dependencies and completion gates."""
@@ -391,6 +426,8 @@ class AgentState:
                 raise ValueError(f"unknown plan dependencies for {step.id}: {', '.join(missing)}")
             if step.status == "in_progress" and not set(step.dependencies) <= completed:
                 raise ValueError(f"in-progress plan step dependencies are not complete: {step.id}")
+            if step.parent_id is not None and step.parent_id not in known:
+                raise ValueError(f"unknown plan parent for {step.id}: {step.parent_id}")
         graph = {step.id: step.dependencies for step in self.plan}
         visiting: set[str] = set()
         visited: set[str] = set()
@@ -408,6 +445,24 @@ class AgentState:
 
         for step_id in graph:
             visit(step_id)
+        visiting.clear()
+        visited.clear()
+        parents = {step.id: step.parent_id for step in self.plan}
+
+        def visit_parent(step_id: str) -> None:
+            if step_id in visiting:
+                raise ValueError("AgentState plan parent relationships contain a cycle")
+            if step_id in visited:
+                return
+            visiting.add(step_id)
+            parent_id = parents[step_id]
+            if parent_id is not None:
+                visit_parent(parent_id)
+            visiting.remove(step_id)
+            visited.add(step_id)
+
+        for step_id in parents:
+            visit_parent(step_id)
         if self.current_step is not None and self.current_step not in known:
             raise ValueError("AgentState.current_step must reference a plan step")
         expected_completed = [step.id for step in self.plan if step.status == "completed"]
@@ -533,6 +588,7 @@ class AgentState:
             "notice_turn",
         ):
             self.convergence.pop(key, None)
+        self.convergence.pop("execution_budget", None)
         self.start()
         self.validate_frozen_fields(self._frozen_baseline)
 
@@ -678,6 +734,23 @@ def _mapping_enum(mapping: dict[str, Any], key: str, allowed: set[str], section:
         choices = ", ".join(sorted(allowed))
         raise ValueError(f"AgentState.{section}.{key} must be one of: {choices}")
     return str(value)
+
+
+def _plan_step_type(value: Any, step_id: Any) -> str:
+    requested = str(value or "").strip().lower()
+    aliases = {"validate": "verify", "validation": "verify", "generation": "generate"}
+    requested = aliases.get(requested, requested)
+    if requested in PLAN_STEP_TYPES:
+        return requested
+    legacy_id = str(step_id or "").strip().lower()
+    return {
+        "scope": "scope",
+        "inspect-chunks": "inspect",
+        "implement": "implement",
+        "synthesize": "synthesize",
+        "render-artifact": "render",
+        "verify": "verify",
+    }.get(legacy_id, "generic")
 
 
 def _validate_iso_timestamp(value: Any, field_name: str) -> None:

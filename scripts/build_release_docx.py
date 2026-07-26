@@ -12,7 +12,7 @@ from docx.oxml.ns import qn
 from docx.shared import Inches, Pt
 
 
-RELEASE_TIMESTAMP = datetime(2026, 7, 15, tzinfo=timezone.utc)
+RELEASE_TIMESTAMP = datetime(2026, 7, 26, tzinfo=timezone.utc)
 RELEASE_AUTHOR = "Deep Agent"
 
 
@@ -45,7 +45,7 @@ def markdown_to_docx(source: Path, destination: Path) -> None:
     properties.created = RELEASE_TIMESTAMP
     properties.modified = RELEASE_TIMESTAMP
     properties.revision = 1
-    properties.keywords = "DeepSeek Agent V3, v0.11.0, 2026-07-15"
+    properties.keywords = "DeepSeek Agent V3, v0.12.0, 2026-07-26"
     section = document.sections[0]
     section.top_margin = Inches(0.65)
     section.bottom_margin = Inches(0.65)

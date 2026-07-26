@@ -8,7 +8,7 @@ a compatibility change and must increment ``CORE_INTERFACE_CONTRACT_VERSION``.
 from __future__ import annotations
 
 
-CORE_INTERFACE_CONTRACT_VERSION = 2
+CORE_INTERFACE_CONTRACT_VERSION = 3
 CORE_INTERFACE_CHAIN = (
     "CLI",
     "Runtime",
@@ -33,7 +33,7 @@ EVENT_SERIALIZED_FIELDS = (
     "run_id",
     "payload",
 )
-AGENT_STATE_SCHEMA_VERSION = 6
+AGENT_STATE_SCHEMA_VERSION = 7
 AGENT_STATE_SERIALIZED_FIELDS = (
     "session_id",
     "project",

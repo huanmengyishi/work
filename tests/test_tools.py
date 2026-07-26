@@ -9,6 +9,7 @@ import time
 import pytest
 
 import agent.tools.base as tool_base
+from agent.artifact import ARTIFACT_VERIFICATION_METADATA_KEY
 from agent.memory import MemoryStore
 from agent.project import ProjectManager
 from agent.state import AgentState
@@ -526,6 +527,14 @@ def test_document_render_docx_uses_preview_apply_and_parse_verification(tmp_path
     assert "核心结论" in parsed.stdout
     assert "经过验证的中文正文" in parsed.stdout
     assert parsed.data["date_literals"] == ["2025年7月"]
+    receipt = parsed.data[ARTIFACT_VERIFICATION_METADATA_KEY]
+    assert receipt["passed"] is True
+    assert receipt["path"] == "结果/汇总.docx"
+    assert receipt["content_complete"] is True
+    assert receipt["size_bytes"] == target.stat().st_size
+    assert receipt["content_sha256"] == hashlib.sha256(target.read_bytes()).hexdigest()
+    assert "docx_package_structure" in receipt["checks_run"]
+    assert "docx_nonempty_text" in receipt["checks_run"]
 
 
 def test_document_render_docx_rejects_path_escape_and_bounded_input(tmp_path: Path, make_config) -> None:
@@ -737,6 +746,42 @@ def test_implement_step_can_skip_only_for_conditional_mutation(tmp_path: Path, m
     assert state.plan_step_satisfied(plan["verify"]) is False
     assert [step.id for step in tools.plan_manager.ready_steps(state)] == ["verify"]
     assert state.current_step == "verify"
+
+
+def test_update_plan_rejects_invalid_metadata_and_parent_cycles(tmp_path: Path, make_config) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    _, project, _, tools = build_manager(root, make_config, yolo=True)
+    state = AgentState.create(
+        session_id="invalid-metadata-plan",
+        project=project,
+        user_request="plan safely",
+        loaded_memories=[],
+        loaded_tools=[],
+        git_branch=None,
+        context_index_path=str(project.agent_dir / "index.json"),
+    )
+    tools.bind_state(state)
+
+    _, invalid_weight = tools.execute_model_call(
+        "agent_update_plan",
+        {"steps": [{"id": "scope", "title": "Scope", "progress_weight": float("nan")}]},
+    )
+    _, parent_cycle = tools.execute_model_call(
+        "agent_update_plan",
+        {
+            "steps": [
+                {"id": "parent", "title": "Parent", "parent_id": "child"},
+                {"id": "child", "title": "Child", "parent_id": "parent"},
+            ]
+        },
+    )
+
+    assert invalid_weight.success is False
+    assert "progress_weight" in invalid_weight.stderr
+    assert parent_cycle.success is False
+    assert "parent relationships contain a cycle" in parent_cycle.stderr
+    assert state.plan == []
 
 
 def test_update_plan_cannot_inject_an_invalid_skipped_step(tmp_path: Path, make_config) -> None:

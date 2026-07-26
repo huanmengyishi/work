@@ -3,9 +3,11 @@ from __future__ import annotations
 import json
 import difflib
 import hashlib
+import math
 import sqlite3
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from enum import StrEnum
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -16,11 +18,53 @@ from .timeutil import utc_now_iso
 from .vector import OptionalChromaStore
 
 
+_MEMORY_PAYLOAD_BYTES_SQL = """(
+    length(cast(coalesce(kind, '') as blob))
+    + length(cast(coalesce(title, '') as blob))
+    + length(cast(coalesce(content, '') as blob))
+    + length(cast(coalesce(tags, '') as blob))
+)"""
+
+
+class MemoryKind(StrEnum):
+    """Canonical kinds accepted for new Memory records.
+
+    ``allow_unknown`` exists only for loading legacy databases.  Write paths
+    must use the strict default so a typo cannot silently create a new kind.
+    """
+
+    LESSON = "Lesson"
+    CORRECTION = "Correction"
+    REFLECTION = "Reflection"
+    BUG = "Bug"
+    DECISION = "Decision"
+    KNOWLEDGE = "Knowledge"
+    SUMMARY = "Summary"
+
+    @classmethod
+    def parse(cls, value: object, *, allow_unknown: bool = False) -> MemoryKind | str:
+        if isinstance(value, cls):
+            return value
+        if isinstance(value, str):
+            normalized = value.strip()
+            by_value = {item.value.casefold(): item for item in cls}
+            parsed = by_value.get(normalized.casefold())
+            if parsed is not None:
+                return parsed
+            if allow_unknown:
+                return normalized
+        expected = ", ".join(item.value for item in cls)
+        rendered = repr(value)
+        if len(rendered) > 100:
+            rendered = rendered[:97] + "..."
+        raise ValueError(f"unknown memory kind {rendered}; expected one of: {expected}")
+
+
 @dataclass(frozen=True)
 class MemoryItem:
     id: int
     project_id: str | None
-    kind: str
+    kind: MemoryKind | str
     title: str
     content: str
     tags: list[str]
@@ -50,7 +94,7 @@ class MemoryStore:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.vector = OptionalChromaStore(
             configured_vector,
-            enabled=bool(config.get("memory.vector_enabled", True)),
+            enabled=bool(config.get("memory.vector_enabled", False)),
         )
         self._init_db()
 
@@ -124,6 +168,15 @@ class MemoryStore:
                     run_id text not null,
                     project_id text,
                     memory_ids text not null,
+                    recorded_at text not null
+                );
+
+                create table if not exists memory_feedback_events (
+                    feedback_id text primary key,
+                    memory_id integer not null,
+                    helpful integer not null check (helpful in (0, 1)),
+                    confidence_before real not null,
+                    confidence_after real not null,
                     recorded_at text not null
                 );
                 """
@@ -205,7 +258,7 @@ class MemoryStore:
     def add_memory(
         self,
         *,
-        kind: str,
+        kind: str | MemoryKind,
         title: str,
         content: str,
         tags: Iterable[str] = (),
@@ -213,6 +266,10 @@ class MemoryStore:
         confidence: float | None = None,
         expires_at: str | None = None,
     ) -> int:
+        parsed_kind = MemoryKind.parse(kind)
+        if not isinstance(parsed_kind, MemoryKind):  # strict parse is intentionally fail closed
+            raise ValueError(f"invalid memory kind: {kind!r}")
+        kind_value = parsed_kind.value
         now = utc_now_iso()
         tag_list = list(tags)
         tags_json = json.dumps(tag_list, ensure_ascii=False)
@@ -222,8 +279,8 @@ class MemoryStore:
                 0.0, float(confidence if confidence is not None else self.config.get("memory.default_confidence", 0.7))
             ),
         )
-        protected = {str(item) for item in self.config.get("memory.protect_kinds", ["Correction", "Decision"])}
-        if expires_at is None and kind not in protected:
+        protected = self._protected_kinds()
+        if expires_at is None and kind_value not in protected:
             expiry_days = max(0, int(self.config.get("memory.expiry_days", 365)))
             if expiry_days:
                 expires_at = (datetime.now(UTC) + timedelta(days=expiry_days)).replace(microsecond=0).isoformat()
@@ -234,14 +291,14 @@ class MemoryStore:
                     project_id, kind, title, content, tags, created_at, updated_at, confidence, expires_at
                 ) values (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (project_id, kind, title, content, tags_json, now, now, confidence_value, expires_at),
+                (project_id, kind_value, title, content, tags_json, now, now, confidence_value, expires_at),
             )
             memory_id = int(cur.lastrowid)
         if self.vector.is_enabled():
             self.vector.upsert_memory(
                 memory_id=memory_id,
                 project_id=project_id,
-                kind=kind,
+                kind=kind_value,
                 title=title,
                 content=content,
                 tags=tag_list,
@@ -361,7 +418,7 @@ class MemoryStore:
                     preferred = self.get_memory(preferred.id) or preferred
 
         expired: list[int] = []
-        protected = {str(item) for item in self.config.get("memory.protect_kinds", ["Correction", "Decision"])}
+        protected = self._protected_kinds()
         now = datetime.now(UTC)
         for item in items:
             expires_at = self._parse_timestamp(item.expires_at)
@@ -369,6 +426,11 @@ class MemoryStore:
                 expired.append(item.id)
                 if apply:
                     self.delete_memory(item.id)
+        # Capacity eviction is deliberately preview-only here.  Existing daemon
+        # callers use maintain(apply=True) for duplicate/expiry cleanup; silently
+        # extending that flag to a new deletion policy would not be an explicit
+        # opt-in.  Call maintain_capacity(..., apply=True) to enforce the plan.
+        capacity = self.maintain_capacity(project_id=project_id)
         return {
             "apply": apply,
             "scanned": len(items),
@@ -376,7 +438,174 @@ class MemoryStore:
             "expired": expired,
             "merge_count": len(merges),
             "expired_count": len(expired),
+            "capacity": capacity,
         }
+
+    def maintain_capacity(self, *, project_id: str | None = None, apply: bool = False) -> dict[str, Any]:
+        """Plan or explicitly apply bounded Memory capacity eviction.
+
+        Capacity is measured from canonical text payload columns using SQLite's
+        UTF-8 byte representation.  The aggregate count does not materialize
+        records in Python, while eviction candidates are always scan-bounded.
+        Legacy unknown kinds, Corrections, Decisions, and configured protected
+        kinds are never candidates.
+        """
+
+        max_items = self._bounded_int(
+            self.config.get("memory.max_items", 5000),
+            default=5000,
+            minimum=1,
+            maximum=1_000_000,
+        )
+        max_storage_mb = self._bounded_float(
+            self.config.get("memory.max_storage_mb", 100),
+            default=100.0,
+            minimum=0.000_001,
+            maximum=10_240.0,
+        )
+        max_payload_bytes = max(1, int(max_storage_mb * 1024 * 1024))
+        scan_limit = self._bounded_int(
+            self.config.get("memory.capacity_scan_limit", 5000),
+            default=5000,
+            minimum=1,
+            maximum=10_000,
+        )
+        report_limit = self._bounded_int(
+            self.config.get("memory.capacity_report_limit", 100),
+            default=100,
+            minimum=1,
+            maximum=1000,
+        )
+        protected = self._protected_kinds()
+        scope_clause = "" if project_id is None else " where (project_id = ? or project_id is null)"
+        scope_params: list[object] = [] if project_id is None else [project_id]
+
+        with self._connect() as con:
+            before_row = con.execute(
+                f"""
+                select count(*) as item_count,
+                       coalesce(sum({_MEMORY_PAYLOAD_BYTES_SQL}), 0) as payload_bytes
+                from memories{scope_clause}
+                """,
+                scope_params,
+            ).fetchone()
+            before_count = int(before_row["item_count"] if before_row else 0)
+            before_payload_bytes = int(before_row["payload_bytes"] if before_row else 0)
+
+            candidates: list[dict[str, Any]] = []
+            if before_count > max_items or before_payload_bytes > max_payload_bytes:
+                evictable_kinds = [item.value for item in MemoryKind if item.value not in protected]
+                if evictable_kinds:
+                    clauses = [f"m.kind in ({','.join('?' for _ in evictable_kinds)})"]
+                    params = [*scope_params, *evictable_kinds, scan_limit]
+                    if project_id is not None:
+                        clauses.insert(0, "(m.project_id = ? or m.project_id is null)")
+                    where = " where " + " and ".join(clauses)
+                    rows = con.execute(
+                        f"""
+                        select m.id, m.kind, m.updated_at,
+                               {_MEMORY_PAYLOAD_BYTES_SQL} as payload_bytes
+                        from memories m
+                        {where}
+                          and not exists (select 1 from memories child where child.merged_into = m.id)
+                        order by coalesce(m.confidence, 0.7) asc,
+                                 coalesce(m.use_count, 0) asc,
+                                 coalesce(m.last_used_at, m.updated_at, '') asc,
+                                 m.id asc
+                        limit ?
+                        """,
+                        params,
+                    ).fetchall()
+                    candidates = [
+                        {
+                            "id": int(row["id"]),
+                            "kind": str(row["kind"]),
+                            "updated_at": str(row["updated_at"]),
+                            "payload_bytes": int(row["payload_bytes"] or 0),
+                        }
+                        for row in rows
+                    ]
+
+        planned: list[dict[str, Any]] = []
+        projected_count = before_count
+        projected_payload_bytes = before_payload_bytes
+        for candidate in candidates:
+            if projected_count <= max_items and projected_payload_bytes <= max_payload_bytes:
+                break
+            planned.append(candidate)
+            projected_count -= 1
+            projected_payload_bytes = max(0, projected_payload_bytes - int(candidate["payload_bytes"]))
+
+        deleted_ids: list[int] = []
+        if apply and planned:
+            # Revalidate immutable plan evidence inside one transaction.  A row
+            # edited since planning, newly protected, or used as a merge keeper
+            # is skipped rather than force-deleted.
+            with self._connect() as con:
+                for candidate in planned:
+                    kind = str(candidate["kind"])
+                    parsed_kind = MemoryKind.parse(kind, allow_unknown=True)
+                    if not isinstance(parsed_kind, MemoryKind) or parsed_kind.value in protected:
+                        continue
+                    deleted = con.execute(
+                        """
+                        delete from memories
+                        where id = ? and kind = ? and updated_at = ?
+                          and not exists (select 1 from memories child where child.merged_into = memories.id)
+                        """,
+                        (candidate["id"], kind, candidate["updated_at"]),
+                    )
+                    if deleted.rowcount == 1:
+                        deleted_ids.append(int(candidate["id"]))
+            if self.vector.is_enabled():
+                for memory_id in deleted_ids:
+                    self.vector.delete_memory(memory_id)
+
+        if apply:
+            after_count, after_payload_bytes = self._capacity_totals(project_id)
+        else:
+            after_count, after_payload_bytes = projected_count, projected_payload_bytes
+        unresolved_count = max(0, after_count - max_items)
+        unresolved_payload_bytes = max(0, after_payload_bytes - max_payload_bytes)
+        eviction_ids = [int(candidate["id"]) for candidate in planned]
+        return {
+            "apply": apply,
+            "scope": project_id or "all",
+            "max_items": max_items,
+            "max_payload_bytes": max_payload_bytes,
+            "current_count": before_count,
+            "current_payload_bytes": before_payload_bytes,
+            "payload_columns": ["kind", "title", "content", "tags"],
+            "scan_limit": scan_limit,
+            "scanned": len(candidates),
+            "protected_kinds": sorted(protected),
+            "eviction_count": len(planned),
+            "eviction_payload_bytes": sum(int(candidate["payload_bytes"]) for candidate in planned),
+            "eviction_ids": eviction_ids[:report_limit],
+            "eviction_ids_truncated": len(eviction_ids) > report_limit,
+            "deleted_count": len(deleted_ids),
+            "deleted_ids": deleted_ids[:report_limit],
+            "deleted_ids_truncated": len(deleted_ids) > report_limit,
+            "projected_count": after_count,
+            "projected_payload_bytes": after_payload_bytes,
+            "unresolved_count": unresolved_count,
+            "unresolved_payload_bytes": unresolved_payload_bytes,
+            "complete": unresolved_count == 0 and unresolved_payload_bytes == 0,
+        }
+
+    def _capacity_totals(self, project_id: str | None) -> tuple[int, int]:
+        scope_clause = "" if project_id is None else " where (project_id = ? or project_id is null)"
+        params: tuple[object, ...] = () if project_id is None else (project_id,)
+        with self._connect() as con:
+            row = con.execute(
+                f"""
+                select count(*) as item_count,
+                       coalesce(sum({_MEMORY_PAYLOAD_BYTES_SQL}), 0) as payload_bytes
+                from memories{scope_clause}
+                """,
+                params,
+            ).fetchone()
+        return (int(row["item_count"] if row else 0), int(row["payload_bytes"] if row else 0))
 
     def _merge_memory(self, keeper: MemoryItem, duplicate: MemoryItem) -> None:
         tags = self._normalize_tags([*keeper.tags, *duplicate.tags])
@@ -507,6 +736,28 @@ class MemoryStore:
         except ValueError:
             return None
         return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+
+    @staticmethod
+    def _bounded_int(value: object, *, default: int, minimum: int, maximum: int) -> int:
+        if isinstance(value, bool):
+            return default
+        try:
+            parsed = int(value)  # type: ignore[arg-type]
+        except (TypeError, ValueError, OverflowError):
+            return default
+        return min(maximum, max(minimum, parsed))
+
+    @staticmethod
+    def _bounded_float(value: object, *, default: float, minimum: float, maximum: float) -> float:
+        if isinstance(value, bool):
+            return default
+        try:
+            parsed = float(value)  # type: ignore[arg-type]
+        except (TypeError, ValueError, OverflowError):
+            return default
+        if not math.isfinite(parsed):
+            return default
+        return min(maximum, max(minimum, parsed))
 
     @staticmethod
     def _memory_similarity(first: MemoryItem, second: MemoryItem) -> float:
@@ -796,6 +1047,112 @@ class MemoryStore:
                 raise ValueError("memory usage evidence contains missing or merged IDs")
         return True
 
+    def record_feedback(self, feedback_id: str, memory_id: int, *, helpful: bool) -> bool:
+        """Apply explicit confidence feedback exactly once per feedback ID.
+
+        Retrieval and context inclusion are intentionally not treated as proof
+        of correctness; ``record_usage`` only updates usage metadata.  A caller
+        must provide an explicit helpful/not-helpful outcome here.
+        """
+
+        normalized_feedback_id = str(feedback_id).strip()
+        normalized_memory_id = int(memory_id)
+        if (
+            not normalized_feedback_id
+            or len(normalized_feedback_id) > 500
+            or len(normalized_feedback_id.encode("utf-8")) > 2000
+        ):
+            raise ValueError("memory feedback_id must contain 1 to 500 characters and at most 2000 UTF-8 bytes")
+        if normalized_memory_id <= 0:
+            raise ValueError("memory feedback requires a positive memory ID")
+        if not isinstance(helpful, bool):
+            raise ValueError("memory feedback helpful must be a boolean")
+
+        bonus = self._bounded_float(
+            self.config.get("memory.confidence.use_bonus", 0.02),
+            default=0.02,
+            minimum=0.0,
+            maximum=0.25,
+        )
+        penalty = self._bounded_float(
+            self.config.get("memory.confidence.contradiction_penalty", 0.15),
+            default=0.15,
+            minimum=0.0,
+            maximum=0.5,
+        )
+        lower_bound = self._bounded_float(
+            self.config.get("memory.confidence.lower_bound", 0.1),
+            default=0.1,
+            minimum=0.0,
+            maximum=1.0,
+        )
+        upper_bound = self._bounded_float(
+            self.config.get("memory.confidence.upper_bound", 0.95),
+            default=0.95,
+            minimum=0.0,
+            maximum=1.0,
+        )
+        if lower_bound > upper_bound:
+            lower_bound, upper_bound = 0.1, 0.95
+        now = utc_now_iso()
+        with self._connect() as con:
+            existing = con.execute(
+                "select memory_id, helpful from memory_feedback_events where feedback_id = ?",
+                (normalized_feedback_id,),
+            ).fetchone()
+            if existing is not None:
+                if int(existing["memory_id"]) != normalized_memory_id or bool(existing["helpful"]) != helpful:
+                    raise ValueError("memory feedback_id was replayed with different evidence")
+                return False
+            row = con.execute(
+                "select confidence, merged_into from memories where id = ?",
+                (normalized_memory_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError("memory feedback contains a missing memory ID")
+            if row["merged_into"] is not None:
+                raise ValueError("memory feedback contains a merged memory ID")
+
+            before = min(1.0, max(0.0, float(row["confidence"] if row["confidence"] is not None else 0.7)))
+            if helpful:
+                after = max(before, min(upper_bound, before + bonus))
+            else:
+                after = min(before, max(lower_bound, before - penalty))
+            inserted = con.execute(
+                """
+                insert into memory_feedback_events(
+                    feedback_id, memory_id, helpful, confidence_before, confidence_after, recorded_at
+                ) values (?, ?, ?, ?, ?, ?)
+                on conflict(feedback_id) do nothing
+                """,
+                (normalized_feedback_id, normalized_memory_id, int(helpful), before, after, now),
+            )
+            if inserted.rowcount == 0:
+                existing = con.execute(
+                    """
+                    select memory_id, helpful
+                    from memory_feedback_events
+                    where feedback_id = ?
+                    """,
+                    (normalized_feedback_id,),
+                ).fetchone()
+                if existing is None:
+                    raise RuntimeError("memory feedback journal conflict could not be resolved")
+                if int(existing["memory_id"]) != normalized_memory_id or bool(existing["helpful"]) != helpful:
+                    raise ValueError("memory feedback_id was replayed with different evidence")
+                return False
+            updated = con.execute(
+                """
+                update memories
+                set confidence = ?, updated_at = ?
+                where id = ? and merged_into is null and confidence = ?
+                """,
+                (after, now, normalized_memory_id, row["confidence"]),
+            )
+            if updated.rowcount != 1:
+                raise RuntimeError("memory changed while confidence feedback was being recorded")
+        return True
+
     def _record_usage(self, memory_ids: list[int]) -> None:
         if not memory_ids:
             return
@@ -842,15 +1199,19 @@ class MemoryStore:
     def persist_lesson_file(
         self,
         *,
-        kind: str,
+        kind: str | MemoryKind,
         title: str,
         content: str,
         project: Project | None,
         global_memory: bool = True,
     ) -> None:
-        base = self.data_dir / "memory" / kind.lower()
+        parsed_kind = MemoryKind.parse(kind)
+        if not isinstance(parsed_kind, MemoryKind):  # strict parse is intentionally fail closed
+            raise ValueError(f"invalid memory kind: {kind!r}")
+        kind_value = parsed_kind.value
+        base = self.data_dir / "memory" / kind_value.lower()
         if project and not global_memory:
-            base = project.agent_dir / "memory" / kind.lower()
+            base = project.agent_dir / "memory" / kind_value.lower()
         base.mkdir(parents=True, exist_ok=True)
         stamp = utc_now_iso().replace(":", "-")
         filename = f"{stamp}-{slugify(title)}.md"
@@ -865,12 +1226,12 @@ class MemoryStore:
         return MemoryItem(
             id=int(row["id"]),
             project_id=row["project_id"],
-            kind=row["kind"],
+            kind=MemoryKind.parse(row["kind"], allow_unknown=True),
             title=row["title"],
             content=row["content"],
             tags=tags if isinstance(tags, list) else [],
             updated_at=row["updated_at"],
-            confidence=float(row["confidence"] or 0.7),
+            confidence=float(row["confidence"] if row["confidence"] is not None else 0.7),
             use_count=int(row["use_count"] or 0),
             last_used_at=row["last_used_at"],
             expires_at=row["expires_at"],
@@ -898,6 +1259,21 @@ class MemoryStore:
                 values.append(tag)
                 seen.add(tag)
         return values
+
+    def _protected_kinds(self) -> set[str]:
+        # Corrections and Decisions remain protected even when an older or
+        # incomplete configuration omits memory.protect_kinds.
+        protected = {MemoryKind.CORRECTION.value, MemoryKind.DECISION.value}
+        configured = self.config.get("memory.protect_kinds", ())
+        if not isinstance(configured, (list, tuple, set, frozenset)):
+            return protected
+        for value in configured:
+            raw = str(value).strip()
+            if not raw:
+                continue
+            parsed = MemoryKind.parse(raw, allow_unknown=True)
+            protected.add(parsed.value if isinstance(parsed, MemoryKind) else parsed)
+        return protected
 
     @staticmethod
     def _recovery_tokens(value: str) -> list[str]:

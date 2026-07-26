@@ -6,7 +6,8 @@ PY="$AGENT_HOME/.venv/bin/python"
 
 if [[ ! -x "$PY" ]]; then
   echo "Deep Agent virtualenv not found: $PY" >&2
-  echo "Run: python3 -m venv \"$AGENT_HOME/.venv\" && \"$AGENT_HOME/.venv/bin/python\" -m pip install -r \"$AGENT_HOME/requirements.txt\"" >&2
+  echo "Run: python3 -m venv \"$AGENT_HOME/.venv\" && \"$AGENT_HOME/.venv/bin/python\" -m pip install -e \"$AGENT_HOME\"" >&2
+  echo "Install optional extras explicitly, for example: -e \"$AGENT_HOME[browser,semantic,document,vector]\"" >&2
   exit 1
 fi
 

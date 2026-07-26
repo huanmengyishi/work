@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import fcntl
 import json
 import os
 import signal
@@ -14,6 +13,7 @@ from typing import Any
 
 from .config import AppConfig
 from .context import ContextBuilder
+from .file_lock import FileLockUnavailable, lock_exclusive, unlock
 from .memory import MemoryStore
 from .paths import storage_key
 from .project import Project
@@ -85,8 +85,8 @@ class ProjectDaemon:
     def run(self, *, once: bool = False) -> int:
         lock_handle = self.lock_path.open("a+")
         try:
-            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
+            lock_exclusive(lock_handle, nonblocking=True)
+        except FileLockUnavailable:
             lock_handle.close()
             raise RuntimeError("daemon is already running for this project") from None
 
@@ -141,7 +141,7 @@ class ProjectDaemon:
             )
             self.pid_path.unlink(missing_ok=True)
             self.stop_path.unlink(missing_ok=True)
-            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+            unlock(lock_handle)
             lock_handle.close()
         return 0
 

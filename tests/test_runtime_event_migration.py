@@ -179,7 +179,13 @@ def test_required_session_events_are_owned_and_persist_before_terminal(tmp_path:
     assert events.subscriber_count(SESSION_FINALIZE_REQUESTED) == 1
     assert events.subscriber_count(MEMORY_USAGE_RECORDED) == 1
     assert runtime.run("explain this project") == "complete"
-    assert calls == ["session.checkpoint", "session.finalize", "session.checkpoint", "task.finished"]
+    assert calls == [
+        "session.checkpoint",
+        "session.checkpoint",
+        "session.finalize",
+        "session.checkpoint",
+        "task.finished",
+    ]
 
 
 def test_missing_required_owner_and_session_write_failure_fail_closed(tmp_path: Path, make_config) -> None:

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import os
 import shlex
-import fcntl
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -11,6 +10,7 @@ from uuid import uuid4
 import yaml
 
 from . import paths
+from .file_lock import lock_exclusive
 
 
 DEFAULT_CONFIG: dict[str, Any] = {
@@ -51,6 +51,16 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "auto_summarize": True,
         "write_lessons": True,
         "checkpoint_each_tool": True,
+        "budget": {
+            "enabled": True,
+            "max_model_requests_per_turn": 64,
+            "max_total_tokens_per_turn": 1_000_000,
+            "max_elapsed_seconds_per_turn": 3_600,
+        },
+        "resilience": {
+            "max_corrective_rounds": 2,
+            "max_abnormal_finish_recoveries": 1,
+        },
         "queue_stop_on_failure": True,
         "parallel_min_tasks": 8,
         "parallel_max_workers": 4,
@@ -121,12 +131,22 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "sqlite_path": str(paths.memory_db_path()),
         "vector_path": str(paths.vector_dir()),
         "retrieval_limit": 8,
-        "vector_enabled": True,
+        "vector_enabled": False,
         "smart_reflection": False,
         "dedupe_similarity": 0.94,
         "default_confidence": 0.7,
         "expiry_days": 365,
         "protect_kinds": ["Correction", "Decision"],
+        "max_items": 5000,
+        "max_storage_mb": 100,
+        "capacity_scan_limit": 5000,
+        "capacity_report_limit": 100,
+        "confidence": {
+            "use_bonus": 0.02,
+            "contradiction_penalty": 0.15,
+            "lower_bound": 0.1,
+            "upper_bound": 0.95,
+        },
     },
     "daemon": {
         "enabled": False,
@@ -168,6 +188,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "events": {
         "jsonl_log": True,
         "metrics_enabled": True,
+        "performance_history_enabled": True,
+        "performance_history_max_records": 200,
     },
 }
 
@@ -487,7 +509,7 @@ def ensure_default_config() -> None:
     cfg = paths.config_dir()
     lock_path = cfg / ".config.lock"
     with lock_path.open("a+") as lock:
-        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        lock_exclusive(lock)
         merge_yaml_defaults(cfg / "config.yaml", DEFAULT_CONFIG)
         merge_yaml_defaults(cfg / "tools.yaml", DEFAULT_TOOLS)
         merge_yaml_defaults(cfg / "memory.yaml", DEFAULT_MEMORY)

@@ -317,7 +317,7 @@ def test_runtime_pipeline_project_identifier_cannot_escape_data_directories(tmp_
         context_path=agent_dir / "context.md",
         language="Python",
     )
-    config = make_config()
+    config = make_config({"events": {"performance_history_max_records": 2}})
     memory = MemoryStore(config)
     tools = ToolManager(config, project, memory, yolo=True)
     pipelines = RuntimeEventPipelines(
@@ -333,6 +333,10 @@ def test_runtime_pipeline_project_identifier_cannot_escape_data_directories(tmp_
     assert pipelines.metrics.path.parent == config.data_dir / "metrics"
     assert pipelines.metrics.path.name.endswith(".json")
     assert "/" not in pipelines.metrics.path.name
+    assert pipelines.performance is not None
+    assert pipelines.performance.history.path.parent == config.data_dir / "performance"
+    assert pipelines.performance.history.max_records == 2
+    assert "/" not in pipelines.performance.history.path.name
     assert tools.health.path.parent == config.data_dir / "capability-health"
     assert "/" not in tools.health.path.name
     daemon = ProjectDaemon(config, project, memory)

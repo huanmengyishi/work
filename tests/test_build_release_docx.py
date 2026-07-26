@@ -21,8 +21,8 @@ def test_release_docx_uses_versioned_source_title_and_release_metadata(tmp_path:
     source = tmp_path / "guide.md"
     destination = tmp_path / "guide.docx"
     source.write_text(
-        "# DeepSeek Agent V3 使用说明（0.11.0）\n\n"
-        "日期：2026-07-15\n\n1. 第一项\n2. 第二项\n\n## 新列表\n\n1. 重新从一开始\n",
+        "# DeepSeek Agent V3 使用说明（0.12.0）\n\n"
+        "日期：2026-07-26\n\n1. 第一项\n2. 第二项\n\n## 新列表\n\n1. 重新从一开始\n",
         encoding="utf-8",
     )
 
@@ -30,8 +30,8 @@ def test_release_docx_uses_versioned_source_title_and_release_metadata(tmp_path:
 
     reopened = Document(destination)
     properties = reopened.core_properties
-    expected = datetime(2026, 7, 15, tzinfo=timezone.utc)
-    assert properties.title == "DeepSeek Agent V3 使用说明（0.11.0）"
+    expected = datetime(2026, 7, 26, tzinfo=timezone.utc)
+    assert properties.title == "DeepSeek Agent V3 使用说明（0.12.0）"
     assert properties.author == "Deep Agent"
     assert properties.last_modified_by == "Deep Agent"
     assert properties.created == expected
@@ -43,5 +43,5 @@ def test_release_docx_uses_versioned_source_title_and_release_metadata(tmp_path:
     assert "1. 重新从一开始" in paragraph_text
     with ZipFile(destination) as archive:
         core_xml = archive.read("docProps/core.xml").decode("utf-8")
-    assert "2026-07-15T00:00:00Z" in core_xml
+    assert "2026-07-26T00:00:00Z" in core_xml
     assert "2013-" not in core_xml

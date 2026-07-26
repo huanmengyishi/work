@@ -13,8 +13,10 @@ import termios
 import time
 from pathlib import Path
 
+import pytest
+
 from agent import cli
-from agent.config import ensure_default_config
+from agent.config import DEFAULT_CONFIG, ensure_default_config
 from agent.console import _cluster_width, _command_completer, _grapheme_clusters
 
 
@@ -80,6 +82,83 @@ def test_default_config_initialization_is_concurrency_safe(tmp_path: Path, monke
 
     assert results == [None] * 24
     assert (tmp_path / "config" / "deep-agent" / "config.yaml").is_file()
+
+
+def test_heavy_vector_memory_is_disabled_by_default() -> None:
+    assert DEFAULT_CONFIG["memory"]["vector_enabled"] is False
+    assert DEFAULT_CONFIG["memory"]["capacity_scan_limit"] == 5000
+    assert DEFAULT_CONFIG["memory"]["capacity_report_limit"] == 100
+    assert DEFAULT_CONFIG["memory"]["confidence"] == {
+        "use_bonus": 0.02,
+        "contradiction_penalty": 0.15,
+        "lower_bound": 0.1,
+        "upper_bound": 0.95,
+    }
+    assert DEFAULT_CONFIG["events"]["performance_history_max_records"] == 200
+
+
+def test_run_once_without_key_fails_before_project_or_vector_setup(make_config, monkeypatch, capsys) -> None:
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    config = make_config()
+
+    def unexpected_prepare(_config):
+        raise AssertionError("project and Memory setup must not run before the API-key preflight")
+
+    monkeypatch.setattr(cli, "prepare_project", unexpected_prepare)
+
+    assert cli.run_once(config, "summarize this project") == 1
+    error = capsys.readouterr().err
+    assert "secrets.env" in error
+    assert "model.yaml" not in error
+
+
+@pytest.mark.parametrize(
+    ("session_status", "session_error", "expected"),
+    [
+        ("completed", "", 0),
+        ("failed", "hard_limit reached: verification is incomplete", 2),
+        ("failed", "runtime error: provider connection failed", 1),
+    ],
+)
+def test_run_once_exit_code_tracks_session_terminal_status(
+    make_config,
+    monkeypatch,
+    capsys,
+    session_status: str,
+    session_error: str,
+    expected: int,
+) -> None:
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key-not-a-real-secret")
+    config = make_config()
+
+    class Record:
+        state = type("State", (), {"status": session_status, "error": session_error})()
+
+    class Sessions:
+        @staticmethod
+        def load(session_id):
+            assert session_id == "session-1"
+            return Record()
+
+    class Runtime:
+        last_session_id = "session-1"
+        sessions = Sessions()
+
+        @staticmethod
+        def run(prompt, *, initial_plan=None):
+            assert prompt == "finish the task"
+            assert initial_plan is None
+            return "done" if session_status == "completed" else "resume required"
+
+        @staticmethod
+        def close():
+            return None
+
+    monkeypatch.setattr(cli, "prepare_project", lambda _config: (object(), object()))
+    monkeypatch.setattr(cli, "build_runtime", lambda *_args, **_kwargs: Runtime())
+
+    assert cli.run_once(config, "finish the task") == expected
+    assert capsys.readouterr().out.strip()
 
 
 def test_real_pty_enter_help_and_exit(tmp_path: Path) -> None:

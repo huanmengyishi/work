@@ -50,6 +50,23 @@ class PlanManager:
                     completion_criteria=str(value.get("completion_criteria") or "")[:2000]
                     if isinstance(value, dict)
                     else "",
+                    parent_id=(str(value.get("parent_id") or "")[:80] or None) if isinstance(value, dict) else None,
+                    step_type=str(value.get("step_type") or value.get("kind") or "generic")[:32]
+                    if isinstance(value, dict)
+                    else "generic",
+                    estimated_tool_rounds=min(
+                        64,
+                        max(0, int(value.get("estimated_tool_rounds") or 1)),
+                    )
+                    if isinstance(value, dict)
+                    else 1,
+                    artifact_ids=[str(item)[:160] for item in value.get("artifact_ids", [])][:32]
+                    if isinstance(value, dict) and isinstance(value.get("artifact_ids", []), list)
+                    else [],
+                    validation_rules=[str(item)[:160] for item in value.get("validation_rules", [])][:32]
+                    if isinstance(value, dict) and isinstance(value.get("validation_rules", []), list)
+                    else [],
+                    progress_weight=float(value.get("progress_weight", 1.0)) if isinstance(value, dict) else 1.0,
                 )
             )
 
@@ -132,7 +149,7 @@ class PlanManager:
 
     @staticmethod
     def _validate_graph(state: AgentState, steps: list[PlanStep]) -> None:
-        ids = [step.id for step in steps]
+        ids = [step.validate().id for step in steps]
         if len(ids) != len(set(ids)):
             raise ValueError("plan step IDs must be unique")
         known = set(ids)
@@ -144,6 +161,8 @@ class PlanManager:
                 raise ValueError(f"unknown dependencies for {step.id}: {', '.join(missing)}")
             if step.id in step.dependencies:
                 raise ValueError(f"plan step cannot depend on itself: {step.id}")
+            if step.parent_id is not None and step.parent_id not in known:
+                raise ValueError(f"unknown parent for {step.id}: {step.parent_id}")
             if step.status == "in_progress" and step.dependencies:
                 completed = {item.id for item in steps if state.plan_step_satisfied(item)}
                 if not all(item in completed for item in step.dependencies):
@@ -165,3 +184,22 @@ class PlanManager:
 
         for step_id in graph:
             visit(step_id)
+
+        visiting.clear()
+        visited.clear()
+        parents = {step.id: step.parent_id for step in steps}
+
+        def visit_parent(step_id: str) -> None:
+            if step_id in visiting:
+                raise ValueError("plan parent relationships contain a cycle")
+            if step_id in visited:
+                return
+            visiting.add(step_id)
+            parent_id = parents[step_id]
+            if parent_id is not None:
+                visit_parent(parent_id)
+            visiting.remove(step_id)
+            visited.add(step_id)
+
+        for step_id in parents:
+            visit_parent(step_id)

@@ -7,11 +7,19 @@ import shlex
 from pathlib import Path
 from typing import Any, Callable
 
+from .artifact import (
+    MANAGED_DOCUMENT_ARTIFACT_ID,
+    MAX_ARTIFACT_BYTES_HARD_LIMIT,
+    ArtifactSpec,
+    ArtifactVerifier,
+)
+from .budget import ExecutionBudgetController, ExecutionBudgetExceeded
 from .config import AppConfig
 from .convergence import (
     ContextWindowController,
     TaskConvergenceController,
     ToolHistoryCompactor,
+    estimate_request_tokens,
     repair_tool_message_pairs,
 )
 from .context import ContextBuildRequest, ContextBuilder, ContextPackage, ContextSnapshot
@@ -27,6 +35,8 @@ from .events import EventBus, EventDispatchError
 from .memory import MemoryItem, MemoryStore
 from .model_router import ModelRoute, ModelRouter, more_capable_model_route
 from .project import Project
+from .progress import ProgressTracker
+from .resilience import ResiliencePolicy
 from .prompt import PromptBuilder
 from .session import SessionManager
 from .state import AgentState
@@ -194,6 +204,8 @@ class AgentRuntime:
         self.task_router = TaskRouter(config)
         self.model_router = ModelRouter(config)
         self.task_plan_factory = TaskPlanFactory()
+        self.execution_budget = ExecutionBudgetController(config)
+        self.resilience = ResiliencePolicy.from_config(config)
         self.last_session_id: str | None = None
         self.tools.set_event_bus(self.events)
         self.event_pipelines = RuntimeEventPipelines(
@@ -344,6 +356,7 @@ class AgentRuntime:
     ) -> str:
         self.tools.bind_state(state)
         state.start()
+        self.execution_budget.bind(state)
         try:
             self._checkpoint_session(state, messages)
         except EventDispatchError as exc:
@@ -368,9 +381,9 @@ class AgentRuntime:
         tool_turn = 0
         model_round = 0
         corrective_rounds = 0
-        max_corrective_rounds = 2
+        max_corrective_rounds = self.resilience.max_corrective_rounds
         abnormal_finish_recoveries = 0
-        max_abnormal_finish_recoveries = 1
+        max_abnormal_finish_recoveries = self.resilience.max_abnormal_finish_recoveries
         loop_exit_reason = "hard_limit"
         recovery_injected: set[int] = set()
         recovery_chars_used = 0
@@ -541,7 +554,13 @@ class AgentRuntime:
                     phase="tool_loop",
                     checkpoint=True,
                 )
-                state.record_model_request("main_loop")
+                self._reserve_model_request(
+                    state,
+                    messages,
+                    phase="main_loop",
+                    tools=active_tools,
+                    max_tokens=context_window.effective_output_tokens(model_route.max_tokens),
+                )
                 self.events.publish(
                     "model.requested",
                     {
@@ -909,6 +928,7 @@ class AgentRuntime:
 
                 tool_interruption: BaseException | None = None
                 try:
+                    self.execution_budget.before_tool_batch(state)
                     executions = execute_model_tool_calls(
                         self.tools,
                         prepared_calls,
@@ -1060,7 +1080,18 @@ class AgentRuntime:
             self._finalize_session(state, messages)
             self._publish_terminal("task.failed", state, final=final, error=state.error)
             return final
+        except ExecutionBudgetExceeded as exc:
+            repair = repair_tool_message_pairs(messages)
+            if repair.changed:
+                messages[:] = repair.messages
+            final = self._incomplete_answer(state, f"execution budget exhausted: {exc.reason}")
+            state.fail(f"execution budget exhausted: {exc.reason}", final)
+            messages.append({"role": "assistant", "content": final})
+            self._finalize_session(state, messages)
+            self._publish_terminal("task.failed", state, final=final, error=state.error)
+            return final
         except Exception as exc:
+            state.convergence["last_error_category"] = self.resilience.classify(exc).value
             if isinstance(exc, EventDispatchError) and exc.event_name == SESSION_FINALIZE_REQUESTED:
                 raise
             if isinstance(exc, EventDispatchError) and exc.event_name == SESSION_CHECKPOINT_REQUESTED:
@@ -1097,6 +1128,7 @@ class AgentRuntime:
         final: str = "",
         error: str = "",
     ) -> None:
+        self.execution_budget.snapshot(state)
         state_payload = state.to_dict()
         state_payload["run_id"] = state.run_id
         self.events.publish(
@@ -1116,6 +1148,11 @@ class AgentRuntime:
     def _progress(self, event: str, state: AgentState, **payload: Any) -> None:
         if self.event_pipelines.progress is None:
             return
+        progress = ProgressTracker.snapshot(
+            state,
+            model_request_budget=self.execution_budget.max_model_requests,
+            token_budget=self.execution_budget.max_total_tokens,
+        )
         self.events.publish(
             PROGRESS_UPDATED,
             {
@@ -1125,6 +1162,7 @@ class AgentRuntime:
                     "mode": (state.task_strategy or {}).get("mode", "standard"),
                     "task_type": (state.task_route or {}).get("task_type", "question"),
                     "model_tier": (state.model_route or {}).get("tier", "standard"),
+                    "progress": progress.to_dict(),
                     **payload,
                 }
             },
@@ -1231,6 +1269,30 @@ class AgentRuntime:
             run_id=state.run_id,
         )
         state.loaded_memories.extend(new_ids)
+
+    def _reserve_model_request(
+        self,
+        state: AgentState,
+        messages: list[dict[str, Any]],
+        *,
+        phase: str,
+        tools: list[dict[str, Any]] | None,
+        max_tokens: int | None,
+        checkpoint: bool = True,
+    ) -> None:
+        """Reserve and persist one model request before network I/O begins."""
+
+        requested_output = max(1, int(max_tokens or 1))
+        self.execution_budget.before_model_request(
+            state,
+            phase=phase,
+            estimated_input_tokens=estimate_request_tokens(messages, tools),
+            requested_output_tokens=requested_output,
+        )
+        state.record_model_request(phase)
+        self.execution_budget.snapshot(state)
+        if checkpoint:
+            self._checkpoint_session(state, messages)
 
     def _checkpoint_session(self, state: AgentState, messages: list[dict[str, Any]]) -> None:
         self.events.dispatch_required(
@@ -1721,20 +1783,41 @@ class AgentRuntime:
         ):
             return "the latest generated document preview has not been applied"
 
-        verified = any(
-            index > artifact_index
-            and str((item.get("request") or {}).get("tool") or "") == "document"
-            and str((item.get("request") or {}).get("action") or "") == "parse"
-            and bool((item.get("result") or {}).get("success"))
-            and cls._same_recorded_path(
-                state,
-                str(((item.get("request") or {}).get("args") or {}).get("path") or ""),
-                artifact_path,
-            )
-            for index, item in enumerate(state.tool_calls)
-        )
-        if not verified:
+        parse_results: list[dict[str, Any]] = []
+        for index, item in enumerate(state.tool_calls):
+            request = item.get("request") if isinstance(item.get("request"), dict) else {}
+            result = item.get("result") if isinstance(item.get("result"), dict) else {}
+            request_args = request.get("args") if isinstance(request.get("args"), dict) else {}
+            if (
+                index > artifact_index
+                and (str(request.get("tool") or ""), str(request.get("action") or "")) == ("document", "parse")
+                and bool(result.get("success"))
+                and cls._same_recorded_path(
+                    state,
+                    str(request_args.get("path") or ""),
+                    artifact_path,
+                )
+            ):
+                parse_results.append(result)
+        if not parse_results:
             return "the generated document has not been re-opened with document_parse"
+        try:
+            artifact_spec = ArtifactSpec(
+                MANAGED_DOCUMENT_ARTIFACT_ID,
+                artifact_path,
+                format="docx",
+                max_bytes=MAX_ARTIFACT_BYTES_HARD_LIMIT,
+            )
+        except ValueError:
+            return "the applied Word artifact path cannot be validated as managed project-relative evidence"
+        receipt_results = [ArtifactVerifier.verify_receipt(artifact_spec, result) for result in parse_results]
+        if not any(result.passed for result in receipt_results):
+            evidence_errors = next((result.errors for result in reversed(receipt_results) if result.errors), ())
+            detail = f": {evidence_errors[0]}" if evidence_errors else ""
+            return (
+                "the re-opened Word artifact has no managed metadata proving complete, non-empty, "
+                f"structurally valid DOCX content{detail}"
+            )
 
         latest_render_record = max(matching_previews, key=lambda item: (item["round"], item["index"]))["record"]
         render_result = (
@@ -1863,6 +1946,23 @@ class AgentRuntime:
         executed = cls._executed_non_plan_calls(state)
         if not executed:
             return "the completed Task Graph has no executed non-plan tool evidence"
+        required_rules = {
+            rule
+            for step in state.plan
+            if state.plan_step_satisfied(step) and step.step_type in {"verify", "review"}
+            for rule in step.validation_rules
+        }
+        if "managed_validation" in required_rules and not any(
+            cls._recorded_call_is_validation(item) for item in executed
+        ):
+            return "the completed verification step has no executed managed validation attempt"
+        if "document_parse" in required_rules and not any(
+            str((item.get("request") or {}).get("tool") or "") == "document"
+            and str((item.get("request") or {}).get("action") or "") == "parse"
+            and bool((item.get("result") or {}).get("success"))
+            for item in executed
+        ):
+            return "the completed document verification step has no successful document_parse evidence"
         return ""
 
     @staticmethod
@@ -2136,6 +2236,15 @@ class AgentRuntime:
                     estimated_tokens=current_tokens,
                     phase=request_phase,
                 )
+                chat_kwargs["messages"] = messages
+                self._reserve_model_request(
+                    state,
+                    messages,
+                    phase=request_phase,
+                    tools=active_tools,
+                    max_tokens=chat_kwargs.get("max_tokens"),
+                    checkpoint=False,
+                )
                 self._checkpoint_convergence_transition(
                     state,
                     messages,
@@ -2143,8 +2252,6 @@ class AgentRuntime:
                     phase=request_phase,
                     counter="overflow_recovery_count",
                 )
-                chat_kwargs["messages"] = messages
-                state.record_model_request(request_phase)
 
     def _overflow_cheap_collapse(
         self,
@@ -2249,7 +2356,14 @@ class AgentRuntime:
         )
         last = response
         for attempt in range(1, max_continuations + 1):
-            state.record_model_request(request_phase)
+            self._reserve_model_request(
+                state,
+                continuation_messages,
+                phase=request_phase,
+                tools=None,
+                max_tokens=chat_kwargs.get("max_tokens"),
+                checkpoint=False,
+            )
             self._checkpoint_convergence_transition(
                 state,
                 continuation_messages,
@@ -2401,7 +2515,14 @@ class AgentRuntime:
             return False
 
         synthesis_round = state.round
-        state.record_model_request("context_compaction")
+        self._reserve_model_request(
+            state,
+            compact_messages,
+            phase="context_compaction",
+            tools=None,
+            max_tokens=auto_max_tokens,
+            checkpoint=False,
+        )
         self._checkpoint_convergence_transition(
             state,
             messages,
@@ -2479,7 +2600,7 @@ class AgentRuntime:
             summary = str(response.message.get("content") or "").strip()
             if not summary:
                 raise RuntimeError("context compaction returned an empty summary")
-        except EventDispatchError:
+        except (EventDispatchError, ExecutionBudgetExceeded):
             raise
         except Exception as exc:
             http_attempt_count = getattr(exc, "http_attempt_count", 0)
@@ -2806,7 +2927,18 @@ class AgentRuntime:
                 checkpoint=False,
             )
         synthesis_round = state.round + 1
-        state.record_model_request("final_synthesis")
+        final_output_tokens = (
+            context_window.effective_output_tokens(model_route.max_tokens)
+            if context_window is not None
+            else model_route.max_tokens
+        )
+        self._reserve_model_request(
+            state,
+            messages,
+            phase="final_synthesis",
+            tools=None,
+            max_tokens=final_output_tokens,
+        )
         self.events.publish(
             "model.requested",
             {
@@ -2835,11 +2967,7 @@ class AgentRuntime:
             "tool_choice": None,
             "thinking": strategy.thinking_enabled,
             "reasoning_effort": strategy.reasoning_effort,
-            "max_tokens": (
-                context_window.effective_output_tokens(model_route.max_tokens)
-                if context_window is not None
-                else model_route.max_tokens
-            ),
+            "max_tokens": final_output_tokens,
             "model": model_route.model,
         }
         if context_window is None:

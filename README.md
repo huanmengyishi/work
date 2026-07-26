@@ -3,7 +3,7 @@
 Project-centric DeepSeek CLI agent for WSL. The Agent is installed as a tool;
 the directory where `agent` is started is the workspace.
 
-Current version: `0.11.0`. The core interface chain is covered by executable
+Current version: `0.12.0`. The core interface chain is covered by executable
 contract tests. ContextBuilder is the only model-context entry, PromptBuilder
 only renders a `ContextPackage`, AgentState validates its frozen schema, and the
 versioned Event Bus now owns Runtime automatic side-effect pipelines.
@@ -58,6 +58,20 @@ checkpoints a resumable Session. Large results use private, bounded Session
 attachments. Terminal progress is grapheme-width aware, and Word artifacts must
 be rendered, applied, re-opened, and free of unsupported generated dates.
 
+Version `0.12.0` closes the highest-risk state and startup gaps found by the
+four-part V3 review. Missing API credentials fail before project, Memory, or
+Vector initialization; Vector is disabled by default and stays lazy when
+explicitly enabled. Runtime checkpoints and bounds each turn by model requests,
+tokens, and elapsed time, exposes conservative plan progress, and returns CLI
+status `0` for completed work, `2` for resumable incomplete work, and `1` for
+runtime errors. AgentState schema 7 adds typed plan and validation metadata.
+Managed receipts validate artifacts without Runtime reading files directly,
+and Word completion replays apply/delete/undo lineage. Memory adds strict write
+kinds, dry-run capacity control, protected durable kinds, and explicit
+idempotent confidence feedback. Scalar-only performance history observes but
+never tunes execution. Portable locks, shell quoting, and dependency alignment
+complete the platform reliability work.
+
 ## Quick Start
 
 Store one valid key, or a comma-separated Key pool, in the private secrets file:
@@ -80,7 +94,7 @@ agent "summarize this project"
 ```
 
 `pip install -e .` installs all three required runtime dependencies from
-`pyproject.toml`: PyYAML plus the v0.11.0 `regex` and `wcwidth` additions used for
+`pyproject.toml`: PyYAML plus the `regex` and `wcwidth` additions used for
 grapheme-safe terminal width. Browser, vector, semantic-index, and document
 packages remain optional dependency groups.
 
@@ -415,12 +429,13 @@ were derived and tested locally. See `docs/releases/v0.11.0.md` for the exact
 reference boundary and rollback constraints, and
 `docs/v0.11.0-end-to-end-gap-analysis.md` for the evidence-by-evidence matrix.
 
-AgentState schema 6 persists phase-specific model counters, convergence state,
-model metrics, plan state, and bounded tool evidence. Resume preserves the
+AgentState schema 7 persists phase-specific model counters, convergence state,
+model metrics, typed plan/validation metadata, bounded tool evidence, and the
+safe execution-budget snapshot. Resume preserves the
 objective and frozen Session identity, but it is not a durable transaction log
 or an exactly-once replay system; an external side effect interrupted mid-call
-may still require user verification. v0.11.0 can migrate supported older state
-when it is resumed. v0.10.0 rejects a schema 6 Session as a future schema, so
+may still require user verification. v0.12.0 can migrate supported older state
+when it is resumed. v0.11.0 rejects a schema 7 Session as a future schema, so
 finish or export needed evidence before rolling code back.
 
 ## Frozen Interfaces And Event Pipelines
@@ -609,6 +624,12 @@ The repository includes `.github/workflows/test.yml` for Python 3.11, 3.12,
 and 3.13. It uses `actions/checkout@v5` and `actions/setup-python@v6` (current
 Node.js runtime, no Node.js 20 deprecation), then runs Ruff, the complete pytest
 suite, and compileall for pushes to `main`, pull requests, and manual dispatch.
+The v0.12.0 release worktree collected and passed 502 tests on 2026-07-26.
+Ruff check, source/test/script format check, compileall, pip check, diff check,
+and isolated version/help/init/keyless/launcher smoke checks passed. The user
+explicitly deferred online DeepSeek authentication because the API balance is
+exhausted; no v0.12.0 online success is claimed.
+
 The frozen v0.11.0 candidate collected and passed 454 tests locally, including
 18 CLI/Console tests, a real 25-column complex-grapheme progress PTY, a real
 40-column Readline PTY, and the exact clause pattern from the failed large
@@ -652,12 +673,13 @@ OCR, memory, and maintenance details.
 
 ```bash
 cd ~/AI-Agent
-git switch --detach v0.10.0
+git switch --detach v0.11.0
 .venv/bin/pip install -e .
 ```
 
-Return with `git switch main`. v0.11.0 configuration migration only adds
+Return with `git switch main`. v0.12.0 configuration migration only adds
 defaults; do not delete Memory, `.project-agent`, or private tool-result data.
-However, v0.10.0 cannot directly Resume an AgentState schema 6 Session and will
-reject it as a future schema. Finish the Session under v0.11.0, or preserve it
-and start a separate v0.10.0 Session after rollback.
+However, v0.11.0 cannot directly Resume an AgentState schema 7 Session and will
+reject it as a future schema. Finish the Session under v0.12.0, or preserve it
+and start a separate v0.11.0 Session after rollback. Word parse records without
+a v0.12.0 managed receipt must be parsed once again after Resume.

@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shlex
 import signal
 import subprocess
 import threading
@@ -310,7 +311,7 @@ def run_command(
         )
     try:
         process = subprocess.Popen(
-            args if not shell else " ".join(args),
+            args if not shell else shlex.join(args),
             cwd=str(cwd),
             stdin=subprocess.PIPE if input_text is not None else subprocess.DEVNULL,
             stdout=subprocess.PIPE,
@@ -321,6 +322,8 @@ def run_command(
         )
     except FileNotFoundError as exc:
         return ToolResult(False, "", f"command not found: {exc}", duration_ms=elapsed_ms(started))
+    except OSError as exc:
+        return ToolResult(False, "", f"command could not start: {exc}", duration_ms=elapsed_ms(started))
 
     stdout_capture = BoundedByteCapture(output_limit)
     stderr_capture = BoundedByteCapture(output_limit)

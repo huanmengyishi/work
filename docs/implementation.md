@@ -6,13 +6,19 @@ Deep Agent V3 is a local, project-centric coding Agent powered only by DeepSeek.
 It runs under WSL Ubuntu and can be started from any directory. Program files,
 user configuration, long-term data, and project-local context remain separate.
 
-Version `0.11.0` keeps the interfaces stabilized in v0.9.1. ContextBuilder
+Version `0.12.0` keeps the interfaces stabilized in v0.9.1. ContextBuilder
 is the only context-selection entry, PromptBuilder only consumes a
 `ContextPackage`, AgentState has a validated/frozen schema, and the versioned
 Event Bus owns automatic Runtime side effects. The runtime remains DeepSeek-only
 and preserves streamed Thinking from v0.8.0. Request preflight now bounds tool
 evidence, reserves output space, compacts complete old API rounds, and forces
 large/deep work from exploration into synthesis and verification.
+
+The core interface contract is version 3 and AgentState schema is version 7.
+v0.12.0 adds bounded turn budgets, typed plan metadata and trusted progress,
+managed artifact verification receipts, Memory capacity/feedback controls,
+scalar-only performance history, lazy optional Vector loading, and portable
+file locking. It adds no second provider, Runtime, or Permission bypass.
 
 ## 2. Runtime Architecture
 
@@ -302,8 +308,8 @@ request counters, and a compact Context Package manifest.
 `AgentState.validate()` checks the published serialized field order, frozen
 Session identity, supported schema version, timestamps, plan graph, derived
 step fields, DeepSeek route, cost class, counters, convergence metadata, and
-Context manifest bounds. The current AgentState schema is 6. Supported older
-state is normalized and upgraded to schema 6 on Resume; an unknown future
+Context manifest bounds. The current AgentState schema is 7. Supported older
+state is normalized and upgraded to schema 7 on Resume; an unknown future
 schema fails closed.
 
 The model can call:
@@ -386,10 +392,10 @@ while reopening per-turn read/stall allowances and resetting turn metrics.
 This is checkpoint continuation, not full transaction replay. There is no
 Durable Intent Journal or exactly-once guarantee for an external side effect
 interrupted between the operating-system action and its ToolResult checkpoint;
-the user must verify such state before retrying. v0.10.0 also cannot directly
-load or Resume a schema 6 Session because that version correctly rejects future
-AgentState schemas. Complete needed work under v0.11.0 before a code rollback,
-or start a separate v0.10.0 Session.
+the user must verify such state before retrying. v0.11.0 also cannot directly
+load or Resume a schema 7 Session because that version correctly rejects future
+AgentState schemas. Complete needed work under v0.12.0 before a code rollback,
+or start a separate v0.11.0 Session.
 
 ## 6. Context and Source Index
 
@@ -752,7 +758,7 @@ Run the release checks locally without exposing credentials:
 `.github/workflows/test.yml` uses `actions/checkout@v5` and
 `actions/setup-python@v6`, installs browser/semantic integration dependencies,
 and runs Ruff, the complete pytest suite, and compileall for Python 3.11, 3.12,
-and 3.13. The frozen v0.11.0 candidate collected and passed 454 tests locally,
+and 3.13. The v0.12.0 candidate collected and passed 502 tests locally,
 including real PTY interaction, grapheme width, tool interruption/pairing,
 attachments, convergence, finish reasons, Resume, and real local validation
 command selection. The CLI/Console subset has 18 tests; real PTYs cover a
@@ -785,7 +791,7 @@ multi-provider abstractions, full-screen TUI, plugin ecosystem, and permission
 model were not added. Deep Agent's soft/hard tool-turn split, independent
 tool-free final synthesis, unknown-finish-reason zero-execution rule,
 conditional-plan completion gate, manifest-first validation selection, and
-schema-6 Resume state are local designs backed by this repository's tests. In
+schema-7 Resume state are local designs backed by this repository's tests. In
 particular, final synthesis must not be described as copied or natively provided
 by that reference snapshot.
 
@@ -801,19 +807,20 @@ would add disproportionate complexity to this single-model local CLI.
 
 ## 20. Rollback Compatibility
 
-The previous code tag is `v0.10.0`:
+The previous code tag is `v0.11.0`:
 
 ```bash
-git switch --detach v0.10.0
+git switch --detach v0.11.0
 .venv/bin/pip install -e .
 ```
 
 Configuration migration is add-only, so no configuration or private data needs
 to be deleted. Do not delete Memory, `.project-agent`, Session files, or
 tool-result attachments while testing rollback. AgentState compatibility is
-one-way at this boundary: v0.11.0 can normalize supported older state, but
-v0.10.0 cannot directly load or Resume a schema 6 Session. Finish it with
-v0.11.0 or start a separate v0.10.0 Session. Return with `git switch main`.
+one-way at this boundary: v0.12.0 can normalize supported older state, but
+v0.11.0 cannot directly load or Resume a schema 7 Session. Finish it with
+v0.12.0 or start a separate v0.11.0 Session. Old Word parse records without a
+managed receipt must be re-parsed once after Resume. Return with `git switch main`.
 
 ## 21. Deferred Work
 

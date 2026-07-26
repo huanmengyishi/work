@@ -49,6 +49,14 @@ class DeepSeekStreamInterrupted(RuntimeError):
         self.http_attempt_count = max(0, int(http_attempt_count))
 
 
+def missing_api_key_message(config: AppConfig) -> str:
+    env_name = str(config.get("model.api_key_env", "DEEPSEEK_API_KEY"))
+    return (
+        f"DeepSeek API key is missing. Set {env_name} in "
+        f"{config.config_dir / 'secrets.env'} and keep that file private (mode 0600)."
+    )
+
+
 class DeepSeekClient:
     def __init__(self, config: AppConfig) -> None:
         self.config = config
@@ -73,11 +81,7 @@ class DeepSeekClient:
         model: str | None = None,
     ) -> ChatResponse:
         if not self.api_keys:
-            env_name = self.config.get("model.api_key_env", "DEEPSEEK_API_KEY")
-            raise RuntimeError(
-                f"DeepSeek API key is missing. Set environment variable {env_name}, "
-                f"or configure model.api_key in {self.config.config_dir / 'model.yaml'}."
-            )
+            raise RuntimeError(missing_api_key_message(self.config))
         payload = self._chat_payload(
             messages=messages,
             tools=tools,

@@ -13,6 +13,7 @@ from .config import AppConfig
 from .events import AuditEventSubscriber, Event, EventBus
 from .memory import MemoryStore
 from .memory_pipeline import MemoryPipeline
+from .optimizer import PerformanceAnalysisPipeline, PerformanceHistory
 from .paths import storage_key
 from .project import Project
 from .session import SessionManager
@@ -276,9 +277,20 @@ class RuntimeEventPipelines:
             self.audit = AuditEventSubscriber(config.data_dir / "logs")
             events.subscribe("*", self.audit, name="audit.jsonl")
         self.metrics = None
+        self.performance = None
         if bool(config.get("events.metrics_enabled", True)):
-            self.metrics = EventMetricsCollector(config.data_dir / "metrics" / f"{storage_key(project.id)}.json")
+            project_storage_key = storage_key(project.id)
+            self.metrics = EventMetricsCollector(config.data_dir / "metrics" / f"{project_storage_key}.json")
             events.subscribe("*", self.metrics, name="metrics.project")
+        if bool(config.get("events.performance_history_enabled", True)):
+            project_storage_key = storage_key(project.id)
+            self.performance = PerformanceAnalysisPipeline(
+                PerformanceHistory(
+                    config.data_dir / "performance" / f"{project_storage_key}.db",
+                    max_records=config.get("events.performance_history_max_records", 200),
+                ),
+                events,
+            )
 
 
 def _state_and_messages(event: Event) -> tuple[AgentState, list[dict[str, Any]]]:

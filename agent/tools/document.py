@@ -7,6 +7,14 @@ import tempfile
 from io import BytesIO
 from pathlib import Path
 
+from ..artifact import (
+    ARTIFACT_VERIFICATION_METADATA_KEY,
+    MANAGED_DOCUMENT_ARTIFACT_ID,
+    MAX_ARTIFACT_BYTES_HARD_LIMIT,
+    ArtifactSpec,
+    artifact_verification_metadata,
+    verify_artifact,
+)
 from .base import (
     DEFAULT_MAX_RESULT_SOURCE_BYTES,
     BoundedByteCapture,
@@ -67,13 +75,53 @@ class DocumentTool:
         file_path = self._resolve(path)
         if not file_path.exists():
             return ToolResult(False, "", f"file not found: {file_path}")
-        if file_path.stat().st_size > self.max_input_bytes:
+        file_size = file_path.stat().st_size
+        if file_size > self.max_input_bytes:
             return ToolResult(False, "", f"document exceeds {self.max_input_bytes} bytes")
         suffix = file_path.suffix.lower()
+        verification_metadata: dict[str, object] | None = None
+        if suffix == ".docx":
+            if file_size > MAX_ARTIFACT_BYTES_HARD_LIMIT:
+                return ToolResult(
+                    False,
+                    "",
+                    f"DOCX verification exceeds {MAX_ARTIFACT_BYTES_HARD_LIMIT} bytes",
+                )
+            try:
+                content = file_path.read_bytes()
+            except OSError as exc:
+                return ToolResult(False, "", f"DOCX verification could not read the managed artifact: {exc}")
+            relative = file_path.relative_to(self.cwd.resolve()).as_posix()
+            spec = ArtifactSpec(
+                MANAGED_DOCUMENT_ARTIFACT_ID,
+                relative,
+                format="docx",
+                max_bytes=min(self.max_input_bytes, MAX_ARTIFACT_BYTES_HARD_LIMIT),
+            )
+            verification = verify_artifact(
+                spec,
+                ToolResult(
+                    True,
+                    "",
+                    data={"exists": True, "size_bytes": len(content), "content_complete": True},
+                ),
+                content=content,
+            )
+            verification_metadata = artifact_verification_metadata(spec, verification, content=content)
+            if not verification.passed:
+                return ToolResult(
+                    False,
+                    "",
+                    f"DOCX artifact verification failed: {verification.message}",
+                    data={
+                        "path": str(file_path),
+                        ARTIFACT_VERIFICATION_METADATA_KEY: verification_metadata,
+                    },
+                )
         if suffix in {".pdf", *IMAGE_SUFFIXES, *WORD_SUFFIXES}:
             ai_tools_result = self._parse_with_ai_tools(file_path)
             if ai_tools_result.ok:
-                return ai_tools_result
+                return self._with_artifact_verification(ai_tools_result, verification_metadata)
         if suffix in TEXT_SUFFIXES:
             return self._parse_text(file_path)
         if suffix == ".pdf":
@@ -81,8 +129,26 @@ class DocumentTool:
         if suffix in IMAGE_SUFFIXES:
             return self._parse_image(file_path)
         if suffix in WORD_SUFFIXES:
-            return self._parse_word(file_path)
+            return self._with_artifact_verification(self._parse_word(file_path), verification_metadata)
         return ToolResult(False, "", f"unsupported document type: {suffix or '<none>'}")
+
+    @staticmethod
+    def _with_artifact_verification(
+        result: ToolResult,
+        verification_metadata: dict[str, object] | None,
+    ) -> ToolResult:
+        if verification_metadata is None:
+            return result
+        data = dict(result.data or {})
+        data[ARTIFACT_VERIFICATION_METADATA_KEY] = verification_metadata
+        return ToolResult(
+            result.success,
+            result.stdout,
+            result.stderr,
+            data=data,
+            duration_ms=result.duration_ms,
+            request_id=result.request_id,
+        )
 
     def render_docx(self, *, title: str, markdown: str) -> tuple[bytes, dict[str, object]]:
         try:

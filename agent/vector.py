@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from threading import Lock
 from typing import Any
 
 
@@ -21,9 +22,16 @@ class OptionalChromaStore:
 
     def __init__(self, path: Path, *, enabled: bool = True) -> None:
         self.path = path
+        self._configured_enabled = bool(enabled)
+        self._load_attempted = False
+        self._load_lock = Lock()
         self._client = None
         self._collection = None
-        self.status = self._load() if enabled else VectorStatus(False, "disabled by config")
+        self.status = (
+            VectorStatus(True, "enabled by config; loads on first vector operation")
+            if self._configured_enabled
+            else VectorStatus(False, "disabled by config")
+        )
 
     def _load(self) -> VectorStatus:
         try:
@@ -38,8 +46,22 @@ class OptionalChromaStore:
             return VectorStatus(False, f"chromadb init failed: {exc}")
         return VectorStatus(True, "enabled")
 
+    def _ensure_loaded(self) -> bool:
+        if not self._configured_enabled:
+            return False
+        if self._collection is not None:
+            return True
+        with self._load_lock:
+            if self._collection is not None:
+                return True
+            if self._load_attempted:
+                return False
+            self._load_attempted = True
+            self.status = self._load()
+            return self.status.enabled
+
     def is_enabled(self) -> bool:
-        return self.status.enabled
+        return self._configured_enabled and (not self._load_attempted or self.status.enabled)
 
     def upsert_memory(
         self,
@@ -51,7 +73,7 @@ class OptionalChromaStore:
         content: str,
         tags: list[str],
     ) -> bool:
-        if not self._collection:
+        if not self._ensure_loaded() or self._collection is None:
             return False
         document = f"{title}\n\n{content}".strip()
         metadata: dict[str, Any] = {
@@ -73,7 +95,9 @@ class OptionalChromaStore:
             return False
 
     def query_memory_ids(self, *, query: str, project_id: str | None, limit: int) -> list[int]:
-        if not self._collection or not query.strip():
+        if not query.strip():
+            return []
+        if not self._ensure_loaded() or self._collection is None:
             return []
         try:
             count = self._collection.count()
@@ -105,7 +129,7 @@ class OptionalChromaStore:
         return ids
 
     def delete_memory(self, memory_id: int) -> bool:
-        if not self._collection:
+        if not self._ensure_loaded() or self._collection is None:
             return False
         try:
             self._collection.delete(ids=[f"memory:{memory_id}"])

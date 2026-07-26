@@ -15,7 +15,7 @@ from . import __version__, paths
 from .config import AppConfig, load_config
 from .console import ConsoleUI
 from .context import ContextBuilder
-from .deepseek import DeepSeekClient
+from .deepseek import DeepSeekClient, missing_api_key_message
 from .daemon import ProjectDaemon
 from .memory import MemoryStore
 from .network import proxy_url_from_env, redacted_proxy_url
@@ -254,7 +254,7 @@ def cmd_doctor(
 ) -> int:
     vector = OptionalChromaStore(
         Path(str(config.get("memory.vector_path", paths.vector_dir()))).expanduser(),
-        enabled=bool(config.get("memory.vector_enabled", True)),
+        enabled=bool(config.get("memory.vector_enabled", False)),
     )
     env_name = str(config.get("model.api_key_env", "DEEPSEEK_API_KEY"))
     key_source = (
@@ -535,6 +535,9 @@ def cmd_resume(
     yolo: bool = False,
     super_yolo: bool = False,
 ) -> int:
+    if not config.api_keys:
+        print(f"error: {missing_api_key_message(config)}", file=sys.stderr)
+        return 1
     project, memory = prepare_project(config)
     runtime = build_runtime(
         config,
@@ -546,12 +549,12 @@ def cmd_resume(
     )
     try:
         print(runtime.resume(prompt, session_id))
+        return _runtime_session_exit_code(runtime)
     except Exception as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
     finally:
         runtime.close()
-    return 0
 
 
 def cmd_context(config: AppConfig, action: str) -> int:
@@ -839,7 +842,7 @@ def repl(
             if value not in {"on", "off"}:
                 ui.error("usage: /yolo on|off")
                 continue
-            runtime.tools.yolo = value == "on"
+            runtime.tools.configure_permissions(yolo=value == "on")
             ui.set_yolo(runtime.tools.yolo)
             continue
         if prompt.startswith("/super-yolo"):
@@ -851,7 +854,7 @@ def repl(
             if value not in {"on", "off"}:
                 ui.error("usage: /super-yolo on|off")
                 continue
-            runtime.tools.super_yolo = value == "on"
+            runtime.tools.configure_permissions(super_yolo=value == "on")
             ui.set_super_yolo(runtime.tools.super_yolo)
             continue
         if prompt.startswith("/undo"):
@@ -883,6 +886,9 @@ def repl(
                 ui.error(str(exc))
             continue
         try:
+            if isinstance(runtime.client, DeepSeekClient) and not runtime.client.api_keys:
+                ui.error(missing_api_key_message(config))
+                continue
             ui.working()
             if active_session:
                 answer = runtime.resume(prompt, active_session)
@@ -911,6 +917,9 @@ def run_once(
     yolo: bool = False,
     super_yolo: bool = False,
 ) -> int:
+    if not config.api_keys:
+        print(f"error: {missing_api_key_message(config)}", file=sys.stderr)
+        return 1
     project, memory = prepare_project(config)
     runtime = build_runtime(
         config,
@@ -930,12 +939,29 @@ def run_once(
             except json.JSONDecodeError:
                 initial_plan = None
         print(runtime.run(prompt, initial_plan=initial_plan))
+        return _runtime_session_exit_code(runtime)
     except Exception as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
     finally:
         runtime.close()
-    return 0
+
+
+def _runtime_session_exit_code(runtime: AgentRuntime) -> int:
+    session_id = runtime.last_session_id
+    if not session_id:
+        return 1
+    try:
+        state = runtime.sessions.load(session_id).state
+        status = str(state.status)
+        error = str(getattr(state, "error", "") or "")
+    except Exception:
+        return 1
+    if status == "completed":
+        return 0
+    if error.startswith("runtime error:"):
+        return 1
+    return 2
 
 
 def prepare_project(config: AppConfig) -> tuple[Project, MemoryStore]:

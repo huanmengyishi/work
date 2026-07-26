@@ -10,6 +10,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from agent.artifact import ARTIFACT_VERIFICATION_METADATA_KEY
 from agent.context import ContextBuildRequest, ContextBuilder, ContextPackage
 from agent.deepseek import ChatResponse
 from agent.events import EventBus
@@ -19,6 +20,34 @@ from agent.prompt import PromptBuilder
 from agent.runtime import AgentRuntime
 from agent.state import AgentState, PlanStep
 from agent.tools import ToolManager
+
+
+def _managed_docx_receipt(path: str) -> dict[str, object]:
+    return {
+        ARTIFACT_VERIFICATION_METADATA_KEY: {
+            "schema_version": 1,
+            "artifact_id": "document-parse",
+            "path": path,
+            "format": "docx",
+            "passed": True,
+            "content_complete": True,
+            "size_bytes": 1024,
+            "content_sha256": "a" * 64,
+            "checks_run": [
+                "tool_result",
+                "exists",
+                "nonempty",
+                "max_size",
+                "content",
+                "docx_zip_container",
+                "docx_package_structure",
+                "docx_zip_integrity",
+                "docx_package_xml",
+                "docx_nonempty_text",
+            ],
+            "errors": [],
+        }
+    }
 
 
 class RecordingContextBuilder(ContextBuilder):
@@ -176,7 +205,7 @@ def test_runtime_checkpoint_resume_events_and_memory_pipeline(tmp_path: Path, ma
     payload = json.loads(session_path.read_text(encoding="utf-8"))
     state = payload["state"]
     assert state["status"] == "completed"
-    assert state["schema_version"] == 6
+    assert state["schema_version"] == 7
     assert state["task_route"]["mode"] == "standard"
     assert state["model_route"]["provider"] == "deepseek"
     assert state["context_manifest"]["used_chars"] <= state["context_manifest"]["max_chars"]
@@ -242,6 +271,7 @@ def test_runtime_adapts_deep_task_and_reports_reasoning_progress(tmp_path: Path,
                 {"step_id": "inspect-chunks", "status": "completed"},
             ),
             tool_message("step-3", "agent_update_step", {"step_id": "implement", "status": "completed"}),
+            tool_message("validate", "run_tests", {"framework": "auto", "path": "."}),
             tool_message("step-4", "agent_update_step", {"step_id": "verify", "status": "completed"}),
             {
                 "role": "assistant",
@@ -378,6 +408,8 @@ def test_document_completion_requires_applied_and_reparsed_docx(tmp_path: Path, 
     state.tool_calls[-1]["request"]["args"]["path"] = str(root.parent / "other" / root.name / "汇总.docx")
     assert "re-opened" in AgentRuntime._completion_issue(state, "已生成。")
     state.tool_calls[-1]["request"]["args"]["path"] = str(root / "汇总.docx")
+    assert "managed metadata" in AgentRuntime._completion_issue(state, "已生成。")
+    state.tool_calls[-1]["result"]["data"] = _managed_docx_receipt("汇总.docx")
     assert AgentRuntime._completion_issue(state, "已生成并重新打开验证。") == ""
     state.tool_calls.append(
         {
@@ -906,6 +938,7 @@ def test_short_resume_keeps_deep_strategy_and_plan(tmp_path: Path, make_config) 
                 "agent_update_step",
                 {"step_id": "implement", "status": "completed"},
             ),
+            tool_message("validate", "run_tests", {"framework": "auto", "path": "."}),
             tool_message("verify-complete", "agent_update_step", {"step_id": "verify", "status": "completed"}),
             {"role": "assistant", "content": "checkpoint"},
             {"role": "assistant", "content": "continued"},
@@ -928,7 +961,7 @@ def test_short_resume_keeps_deep_strategy_and_plan(tmp_path: Path, make_config) 
     assert resumed.context_manifest["phase"] == "resume"
     assert [step.id for step in resumed.plan] == original_plan
     assert client.options[-1] == {"thinking": True, "reasoning_effort": "max"}
-    assert client.models == [original_model] * 7
+    assert client.models == [original_model] * 8
 
 
 def test_concurrent_resume_rejects_second_session_turn(tmp_path: Path, make_config) -> None:

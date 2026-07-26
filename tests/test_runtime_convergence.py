@@ -3428,8 +3428,8 @@ def test_final_synthesis_recovers_typed_overflow_without_advancing_tool_turn(
     state = runtime.sessions.load(runtime.last_session_id).state
     assert stages == ["cheap", "semantic"]
     assert recovery_checkpoints == [
-        ("overflow_cheap_collapse", 1, 1),
-        ("overflow_semantic_compact", 2, 1),
+        ("overflow_cheap_collapse", 2, 1),
+        ("overflow_semantic_compact", 3, 1),
     ]
     assert state.main_loop_model_request_count == 1
     assert state.final_synthesis_model_request_count == 3
