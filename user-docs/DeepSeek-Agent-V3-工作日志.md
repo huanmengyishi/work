@@ -2,7 +2,7 @@
 
 日期：2026-07-26
 
-状态：v0.12.0 代码与离线发布门已完成；Git commit、tag、push 和远端核验将在最终发布步骤补记。用户 API 余额已耗尽，本轮明确不调用 DeepSeek API，在线认证延期。
+状态：v0.12.0 代码与离线发布门已完成；实现提交 `c1fd3fa00a2457f65165dabb279e0df423868d0b` 已推送并核对远端 `main`。最终文档提交、`v0.12.0` tag 和 Actions 核验正在收口。用户 API 余额已耗尽，本轮明确不调用 DeepSeek API，在线认证延期。
 
 ## 1. 本轮目标
 
@@ -132,10 +132,11 @@ launcher/agent --version -> deep-agent 0.12.0
 - 版本：`0.12.0`
 - AgentState schema：`7`
 - 核心接口契约：`3`
-- 源码提交：待最终 Git 步骤补记
-- `v0.12.0` tag：待最终 Git 步骤补记
-- GitHub `main`/tag：待最终 Git 步骤核验
-- GitHub Actions：待推送后核验
+- 实现与离线验证提交：`c1fd3fa00a2457f65165dabb279e0df423868d0b`
+- GitHub 初次推送：成功；`origin/main` 已核对指向上述提交
+- 最终发布元数据提交：由本日志所在的 `v0.12.0` tag 标识；提交无法在自身内容中递归写入自己的哈希
+- `v0.12.0` tag 与最终 `main`：本日志提交后创建、推送并由外部命令核验
+- GitHub Actions：最终推送后核验；在线 DeepSeek 认证不属于 Actions 发布门
 
 ## 8. 文档归档
 
