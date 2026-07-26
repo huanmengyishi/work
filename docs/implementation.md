@@ -765,6 +765,8 @@ including real PTY interaction, grapheme width, tool interruption/pairing,
 attachments, convergence, finish reasons, Resume, and real local validation
 command selection. The CLI/Console subset has 18 tests; real PTYs cover a
 25-column complex-grapheme progress line and 40-column Readline input. A clean
+v0.12.1 GitHub Actions run then passed Ruff 0.15.21, format, all 503 tests, and
+compileall on Python 3.11, 3.12, and 3.13. A clean
 Python 3.14 environment installed `.[dev,browser,semantic]`, passed `pip check`,
 and passed the same 454 tests. The online Word and plain-text cases passed. The last large
 TypeScript run generated a complete report but the pre-fix router falsely

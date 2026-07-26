@@ -1,10 +1,10 @@
-# DeepSeek Agent V3 使用说明（0.12.0）
+# DeepSeek Agent V3 使用说明（0.12.1）
 
 更新时间：2026-07-26
 
 ## 1. 版本与目录边界
 
-当前版本为 `0.12.0`，AgentState schema 为 `7`，核心接口契约为 `3`。架构保持：
+当前版本为 `0.12.1`，AgentState schema 为 `7`，核心接口契约为 `3`。0.12.1 只修复发布工具链可复现性，不改变 Runtime 行为、状态 schema 或用户配置。架构保持：
 
 ```text
 CLI -> Runtime -> AgentState -> Prompt -> Capability -> Permission
@@ -12,7 +12,7 @@ ContextBuilder -> ContextPackage -> PromptBuilder
 ToolRequest -> PermissionManager -> ToolResult
 ```
 
-DeepSeek 是唯一推理 Provider。0.12.0 没有加入备用模型、第二套 Runtime、自动 A/B 或绕过 Tool Manager 的命令入口。
+DeepSeek 是唯一推理 Provider。0.12.0/0.12.1 没有加入备用模型、第二套 Runtime、自动 A/B 或绕过 Tool Manager 的命令入口。
 
 目录职责：
 
@@ -108,7 +108,9 @@ agent health
 
 普通任务按一次 `Enter` 提交。提交后立即显示处理中状态。空输入有明确反馈；`Ctrl+C` 返回可恢复状态。ANSI Prompt 的不可见控制字符由 Readline 正确包裹，CJK 和组合 emoji 按终端显示宽度裁剪。
 
-## 5. 0.12.0 可靠性改进
+## 5. 0.12.0 可靠性改进与 0.12.1 发布修复
+
+0.12.1 修复的是 CI 工具版本漂移：0.12.0 的 `ruff>=0.6.0` 在 GitHub Actions 中自动解析为 Ruff 0.16.0；该版本将默认规则扩大，因而在 pytest 前产生 210 个历史策略告警。现已精确固定 Ruff 0.15.21，并显式声明原有 `E4/E7/E9/F` 契约。这不是 210 个 Runtime 缺陷，未对代码做盲目自动改写。
 
 每个 turn 默认有三个跨阶段预算：
 
@@ -181,9 +183,13 @@ Ruff format check passed（agent/tests/scripts）
 compileall passed
 pip check passed
 git diff --check passed
+v0.12.1 发布配置/Word 聚焦回归：9 passed
+GitHub Actions run 30210431120：Python 3.11/3.12/3.13 各 503 passed
 ```
 
-隔离 XDG 实例冒烟通过：`deep-agent 0.12.0`、`--help`、`agent init`、缺 Key 退出 `1` 且不创建 `.project-agent`、launcher 版本一致。全量测试包含真实 PTY 回归。
+Actions 三个矩阵任务的 Ruff check、format、pytest 和 compileall 均成功，使用的确认版本为 Ruff 0.15.21。
+
+隔离 XDG 实例冒烟在 0.12.0 通过：`deep-agent 0.12.0`、`--help`、`agent init`、缺 Key 退出 `1` 且不创建 `.project-agent`、launcher 版本一致。0.12.1 已聚焦确认 `deep-agent 0.12.1`；Runtime 未改动。全量测试包含真实 PTY 回归。
 
 未运行新的在线 DeepSeek 请求。历史 v0.11.0 六 Word 和短文本在线案例仍有成功记录，但大型 TypeScript 候选失败，不能把 0.12.0 离线回归写成大型在线成功。
 
@@ -191,7 +197,15 @@ git diff --check passed
 
 仍未实现：跨 Resume 生命周期预算、Durable Intent Journal、外部副作用 exactly-once、章节级事务式文档流水线、动态 replan、并行写步骤/子 Agent、自动 A/B/自动调参、Memory import/export 和备用 Provider。
 
-回滚前先完成或导出 v0.12.0 Session。v0.11.0 不能加载 schema 7 Session：
+如只回滚本次发布工具修复，0.12.1 与 0.12.0 的 Runtime/schema 相同：
+
+```bash
+cd ~/AI-Agent
+git switch --detach v0.12.0
+.venv/bin/python -m pip install -e .
+```
+
+如继续回滚到 v0.11.0，先完成或导出 v0.12.x Session。v0.11.0 不能加载 schema 7 Session：
 
 ```bash
 cd ~/AI-Agent
@@ -203,10 +217,11 @@ git switch --detach v0.11.0
 
 ## 10. 审计与参考
 
-本轮整合报告位于：
+本轮整合报告和发布补丁闭环位于：
 
 ```text
 /mnt/d/detail/deepseek/项目运行审计与改进建议/20260726-v0.12.0/
+/mnt/d/detail/deepseek/项目运行审计与改进建议/20260726-v0.12.1/
 ```
 
 四份原始需求已无损归档到：
@@ -215,4 +230,4 @@ git switch --detach v0.11.0
 /mnt/d/detail/deepseek/历史资料/改进建议/20260726-v0.12.0/
 ```
 
-参考项目固定为 `https://gitee.com/free/claude-code/tree/claude/` commit `b17913e26fd4278ad5cd4b32ed3bde86bf1444e9`。其 README 自述为泄露的 Anthropic 专有源码快照且没有可复制许可证，因此本项目只核对运行时持有任务状态、工具结果配对、有界输出和有限恢复等行为边界，不复制源码。
+参考项目固定为 `https://gitee.com/free/claude-code/tree/claude/` commit `b17913e26fd4278ad5cd4b32ed3bde86bf1444e9`。其中没有 Python、Ruff 或 GitHub Actions 配置，因此不存在可照搬的 Ruff 修复；本次只采用了与其 `bun.lock` 相同的发布原则：自动化必须消费精确、可重现的工具版本。其 README 自述为泄露的 Anthropic 专有源码快照且没有可复制许可证，本项目不复制源码。

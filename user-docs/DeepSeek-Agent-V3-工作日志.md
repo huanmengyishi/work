@@ -1,8 +1,8 @@
-# DeepSeek Agent V3 工作日志（0.12.0）
+# DeepSeek Agent V3 工作日志（0.12.1）
 
 日期：2026-07-26
 
-状态：v0.12.0 代码与离线发布门已完成；实现提交 `c1fd3fa00a2457f65165dabb279e0df423868d0b` 已推送并核对远端 `main`。最终文档提交、`v0.12.0` tag 和 Actions 核验正在收口。用户 API 余额已耗尽，本轮明确不调用 DeepSeek API，在线认证延期。
+状态：v0.12.0 的 502 项全量离线验证已完成。首次 GitHub Actions 因 Ruff 0.16.0 默认规则破坏性扩大而在 lint 阶段失败；v0.12.1 已做最小可复现修复，实现提交 `cac5fd7b885420d783df1ce625387dc40f8939fe` 已推送。Actions run `30210431120` 已成功，Python 3.11/3.12/3.13 均通过 Ruff、format、503 项测试和 compileall。用户 API 余额已耗尽，本轮明确不调用 DeepSeek API，在线认证延期。
 
 ## 1. 本轮目标
 
@@ -20,13 +20,14 @@
 - 开始版本：v0.11.0
 - 开始 HEAD：`7b575fa21da772379122b904b77ce25a79192267`
 - 开始基线：454 tests passed
-- 目标版本：v0.12.0
+- 功能版本：v0.12.0
+- 发布闭环补丁：v0.12.1
 - 最终 AgentState schema：7
 - 最终核心接口契约：3
 
 参考项目：`https://gitee.com/free/claude-code/tree/claude/`，固定 commit `b17913e26fd4278ad5cd4b32ed3bde86bf1444e9`。
 
-参考仓库自述为泄露的 Anthropic 专有源码快照且无可复制许可证。本轮只参考可观察行为：Runtime 持有任务状态、完成前执行校验钩子、会话级有界输出、工具调用/结果配对、显式并发安全和有限恢复。没有复制其源码，也没有引入其 Claude、多 Provider、插件或全屏 TUI 架构。
+参考仓库自述为泄露的 Anthropic 专有源码快照且无可复制许可证。本轮只参考可观察行为：Runtime 持有任务状态、完成前执行校验钩子、会话级有界输出、工具调用/结果配对、显式并发安全和有限恢复。该快照没有 Python、Ruff 或 CI workflow，v0.12.1 只借鉴其 `bun.lock` 的精确依赖原则，没有声称照搬不存在的 Ruff 配置，也没有复制其源码。
 
 ## 3. 主要根因
 
@@ -38,6 +39,7 @@
 6. Memory 类型、容量和置信度反馈缺少严格边界；Vector 默认和加载时机过重。
 7. 性能改进没有安全历史，而自动调参方案又会造成隐私、成本和不可复现风险。
 8. `fcntl`、shell 参数拼接、Health 构造和依赖下限存在工程一致性问题。
+9. 发布开发依赖只有 `ruff>=0.6.0` 下限，而 lint 选择依赖工具默认值；Ruff 0.16.0 将默认规则从 59 扩大到 413 后，CI 立即报出 210 个历史策略告警。
 
 ## 4. 实现
 
@@ -83,6 +85,13 @@
 - Chroma/Playwright 依赖下限统一；launcher 默认只建议核心 editable 安装。
 - Memory、反馈和性能历史默认值进入 add-only 配置迁移。
 
+### 4.6 v0.12.1 CI 根因修复
+
+- `pyproject.toml` 精确固定 `ruff==0.15.21`，并用 `required-version` 拒绝静默漂移。
+- 显式选择原有 `E4/E7/E9/F` lint 契约，不依赖 Ruff 版本默认值。
+- Actions 在检查前显示 `ruff --version`；新增回归测试防止版本约束和规则契约被意外放宽。
+- 不对 210 个新告警执行盲目 `--fix`；规则扩展留作后续独立、可评审任务。
+
 ## 5. 测试与实例审计
 
 最终离线结果：
@@ -94,6 +103,8 @@ Ruff format --check agent tests scripts passed
 compileall agent scripts passed
 pip check: no broken requirements
 git diff --check passed
+v0.12.1 聚焦回归：9 passed
+GitHub Actions Python 3.11/3.12/3.13：各 503 passed
 ```
 
 聚焦验证包含：
@@ -117,7 +128,7 @@ agent init -> 成功创建隔离项目
 launcher/agent --version -> deep-agent 0.12.0
 ```
 
-本轮没有读取真实 Key，没有运行 `doctor --online`，也没有发起付费 DeepSeek 请求。原因是用户 API 余额耗尽；余额恢复后只补一次有请求、Token 和时间上限的代表性在线验收。
+v0.12.0 的隔离实例记录保持有效；v0.12.1 未修改 Runtime，并已聚焦确认 `deep-agent 0.12.1`。本轮没有读取真实 Key，没有运行 `doctor --online`，也没有发起付费 DeepSeek 请求。原因是用户 API 余额耗尽；余额恢复后只补一次有请求、Token 和时间上限的代表性在线验收。
 
 ## 6. 审查结论与未实现项
 
@@ -129,14 +140,15 @@ launcher/agent --version -> deep-agent 0.12.0
 
 ## 7. 版本、提交与发布
 
-- 版本：`0.12.0`
+- 版本：`0.12.1`
 - AgentState schema：`7`
 - 核心接口契约：`3`
-- 实现与离线验证提交：`c1fd3fa00a2457f65165dabb279e0df423868d0b`
-- GitHub 初次推送：成功；`origin/main` 已核对指向上述提交
-- 最终发布元数据提交：由本日志所在的 `v0.12.0` tag 标识；提交无法在自身内容中递归写入自己的哈希
-- `v0.12.0` tag 与最终 `main`：本日志提交后创建、推送并由外部命令核验
-- GitHub Actions：最终推送后核验；在线 DeepSeek 认证不属于 Actions 发布门
+- v0.12.0 实现与离线验证：`c1fd3fa00a2457f65165dabb279e0df423868d0b`
+- v0.12.0 文档与旧 tag：`146c59efdfe6eed2c6d1f6f9cf7019fb0fc5018c`；不强制移动已公开标签
+- v0.12.1 实现提交：`cac5fd7b885420d783df1ce625387dc40f8939fe`
+- GitHub 推送：成功；Actions run `30210431120` 成功，Python 3.11/3.12/3.13 的 Ruff、format、503 项测试和 compileall 全部通过
+- 最终发布元数据提交：由本日志所在的 `v0.12.1` tag 标识；提交无法在自身内容中递归写入自己的哈希
+- `v0.12.1` tag 与最终 `main`：本日志提交后创建、推送并由外部命令核验
 
 ## 8. 文档归档
 
@@ -150,6 +162,7 @@ launcher/agent --version -> deep-agent 0.12.0
 
 ```text
 /mnt/d/detail/deepseek/项目运行审计与改进建议/20260726-v0.12.0/
+/mnt/d/detail/deepseek/项目运行审计与改进建议/20260726-v0.12.1/
 ```
 
 旧版 Word 在新版 Word 生成并复验后移入 `老版使用说明/` 和 `老版工作日志/`。

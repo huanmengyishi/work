@@ -639,6 +639,10 @@ exhausted; no v0.12.0 or v0.12.1 online success is claimed. v0.12.1 pins Ruff
 0.15.21 and makes the established lint selection explicit so CI cannot silently
 adopt a new default ruleset.
 
+GitHub Actions run `30210431120` verified the fix on Python 3.11, 3.12, and
+3.13. Every job reported Ruff 0.15.21, passed check and format, passed all 503
+tests, and completed compileall.
+
 The frozen v0.11.0 candidate collected and passed 454 tests locally, including
 18 CLI/Console tests, a real 25-column complex-grapheme progress PTY, a real
 40-column Readline PTY, and the exact clause pattern from the failed large
