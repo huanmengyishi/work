@@ -6,7 +6,7 @@ Deep Agent V3 is a local, project-centric coding Agent powered only by DeepSeek.
 It runs under WSL Ubuntu and can be started from any directory. Program files,
 user configuration, long-term data, and project-local context remain separate.
 
-Version `0.12.1` keeps the interfaces stabilized in v0.9.1. ContextBuilder
+Version `0.12.2` keeps the interfaces stabilized in v0.9.1. ContextBuilder
 is the only context-selection entry, PromptBuilder only consumes a
 `ContextPackage`, AgentState has a validated/frozen schema, and the versioned
 Event Bus owns automatic Runtime side effects. The runtime remains DeepSeek-only
@@ -21,6 +21,8 @@ scalar-only performance history, lazy optional Vector loading, and portable
 file locking. It adds no second provider, Runtime, or Permission bypass.
 The patch release also pins Ruff 0.15.21 and explicitly selects the established
 `E4/E7/E9/F` lint contract after Ruff 0.16.0 expanded its defaults in CI.
+v0.12.2 additionally keeps the repository-root Word entry points synchronized
+with the current `user-docs/` release and rejects stale root versions in tests.
 
 ## 2. Runtime Architecture
 

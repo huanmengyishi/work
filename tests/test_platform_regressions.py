@@ -137,3 +137,18 @@ def test_ruff_version_and_lint_contract_are_release_pinned() -> None:
     assert "ruff==0.15.21" in configuration["project"]["optional-dependencies"]["dev"]
     assert configuration["tool"]["ruff"]["required-version"] == "==0.15.21"
     assert configuration["tool"]["ruff"]["lint"]["select"] == ["E4", "E7", "E9", "F"]
+
+
+def test_repository_root_exposes_only_current_release_word_documents() -> None:
+    root = Path(__file__).resolve().parents[1]
+    configuration = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
+    version = configuration["project"]["version"]
+    expected = {
+        f"DeepSeek-Agent-V3-使用说明-{version}.docx",
+        f"DeepSeek-Agent-V3-工作日志-{version}.docx",
+    }
+    actual = {path.name for path in root.glob("DeepSeek-Agent-V3-*.docx")}
+
+    assert actual == expected
+    for name in expected:
+        assert (root / "user-docs" / name).is_file()

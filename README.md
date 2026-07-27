@@ -3,7 +3,7 @@
 Project-centric DeepSeek CLI agent for WSL. The Agent is installed as a tool;
 the directory where `agent` is started is the workspace.
 
-Current version: `0.12.1`. The core interface chain is covered by executable
+Current version: `0.12.2`. The core interface chain is covered by executable
 contract tests. ContextBuilder is the only model-context entry, PromptBuilder
 only renders a `ContextPackage`, AgentState validates its frozen schema, and the
 versioned Event Bus now owns Runtime automatic side-effect pipelines.
@@ -78,6 +78,18 @@ behavior or the schema. GitHub Actions had resolved the open-ended
 reported 210 historical policy findings before tests could run. The verified
 Ruff 0.15.21 toolchain is now pinned, the intended `E4/E7/E9/F` lint contract
 is explicit, and CI prints the installed Ruff version before checking sources.
+
+Version `0.12.2` fixes the GitHub document layout without changing Runtime,
+AgentState schema, or user configuration. Stale v0.10.0 Word files are removed
+from the repository root, the current versioned guide and work log are exposed
+there and under `user-docs/`, and a regression test keeps both locations aligned.
+
+Latest Chinese release documents:
+
+- [Usage guide (Markdown)](user-docs/DeepSeek-Agent-V3-使用说明.md)
+- [Work log (Markdown)](user-docs/DeepSeek-Agent-V3-工作日志.md)
+- [Usage guide (Word)](DeepSeek-Agent-V3-使用说明-0.12.2.docx)
+- [Work log (Word)](DeepSeek-Agent-V3-工作日志-0.12.2.docx)
 
 ## Quick Start
 

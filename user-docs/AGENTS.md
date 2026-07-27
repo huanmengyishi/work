@@ -46,3 +46,11 @@
 - Prompt 使用 ANSI 颜色时，Readline 模式必须将不可见控制字符用 `\001`/`\002` 包裹。
 - 提交后 UI 必须显示正在处理状态；空输入必须有明确反馈；`Ctrl+C` 应返回可恢复的交互状态。
 - 任何交互 UI 修改必须通过真实 PTY 或等效终端测试，不能只依赖普通单元测试。
+
+## 6. GitHub 发布文档布局
+
+- GitHub 仓库根目录只能保留当前版本的两份版本化 Word：`DeepSeek-Agent-V3-使用说明-<version>.docx` 和 `DeepSeek-Agent-V3-工作日志-<version>.docx`。不得在根目录残留旧版 Word，否则 GitHub 首页会误导用户。
+- `user-docs/` 必须同时保留当前版本的 Markdown 与 Word，且其内容必须与 `/mnt/d/detail/deepseek` 当前文档一致。
+- 旧版 Word 只能位于 `老版使用说明/` 或 `老版工作日志/`。删除根目录重复副本前，先用 SHA-256 确认归档副本存在且字节一致。
+- 发布测试必须检查：根目录仅有当前版本的两份 Word，`user-docs/` 存在同版文件，两份 Word 能重新打开且版本元数据正确。
+- 推送后除了核对远端 `main`、tag 和 Actions，还必须读取远端 `main` 文件树，确认 GitHub 根目录显示的是当前版本文档，并在最终回复中列出直接链接。
