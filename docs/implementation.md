@@ -23,6 +23,8 @@ The patch release also pins Ruff 0.15.21 and explicitly selects the established
 `E4/E7/E9/F` lint contract after Ruff 0.16.0 expanded its defaults in CI.
 v0.12.2 additionally keeps the repository-root Word entry points synchronized
 with the current `user-docs/` release and rejects stale root versions in tests.
+GitHub Actions run `30241601163` passed all 504 tests on Python 3.11, 3.12,
+and 3.13 together with Ruff, format, and compileall.
 
 ## 2. Runtime Architecture
 

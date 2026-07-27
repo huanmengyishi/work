@@ -2,7 +2,7 @@
 
 日期：2026-07-27
 
-状态：v0.12.1 已完整推送且 Actions 全绿，但 GitHub 根目录仍残留两份 0.10.0 Word，导致用户在仓库首页看到旧工作日志。v0.12.2 正在统一根目录与 `user-docs/` 的当前文档入口，并加入防回归测试。本补丁不改 Runtime/schema，不读取 Key，不调用 DeepSeek API。
+状态：v0.12.1 已完整推送且 Actions 全绿，但 GitHub 根目录仍残留两份 0.10.0 Word，导致用户在仓库首页看到旧工作日志。v0.12.2 已统一根目录与 `user-docs/` 的当前文档入口，并加入防回归测试。实现提交 `c8d73790331776c98ce9cdb8d2141bb8dc0a6eee` 已推送，Actions run `30241601163` 在 Python 3.11/3.12/3.13 上均 504 passed。本补丁不改 Runtime/schema，不读取 Key，不调用 DeepSeek API。
 
 ## 1. 本轮目标
 
@@ -114,6 +114,7 @@ git diff --check passed
 v0.12.1 聚焦回归：9 passed
 GitHub Actions Python 3.11/3.12/3.13：各 503 passed
 v0.12.2 发布布局/Word 聚焦回归：10 passed
+GitHub Actions v0.12.2 Python 3.11/3.12/3.13：各 504 passed
 ```
 
 聚焦验证包含：
@@ -157,6 +158,8 @@ v0.12.0 的隔离实例记录保持有效；v0.12.1/0.12.2 未修改 Runtime，�
 - v0.12.1 实现提交：`cac5fd7b885420d783df1ce625387dc40f8939fe`
 - GitHub 推送：成功；Actions run `30210431120` 成功，Python 3.11/3.12/3.13 的 Ruff、format、503 项测试和 compileall 全部通过
 - v0.12.1 最终提交/tag：`eb111ad13357a45622c19d38d75efda8c5cfb0dc`，Actions run `30211093526` 成功
+- v0.12.2 实现与文档布局提交：`c8d73790331776c98ce9cdb8d2141bb8dc0a6eee`
+- v0.12.2 初次 GitHub 推送：成功；Actions run `30241601163` 成功，Python 3.11/3.12/3.13 的 Ruff、format、504 项测试和 compileall 全部通过
 - v0.12.2 最终发布元数据提交：由本日志所在的 `v0.12.2` tag 标识；提交无法在自身内容中递归写入自己的哈希
 - `v0.12.2` tag 与最终 `main`：本日志提交后创建、推送并由外部命令核验
 

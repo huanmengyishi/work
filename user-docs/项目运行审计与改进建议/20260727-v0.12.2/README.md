@@ -18,6 +18,12 @@ v0.12.1 的源码、最新 Markdown、Word、审计材料、tag 和 Actions 确�
 
 本补丁不改 Runtime、AgentState schema 7、核心契约 3、配置或用户数据。用户 API 余额尚未恢复，不读取 Key，不执行在线 DeepSeek 认证。
 
+## 验证
+
+- 本地：Ruff check/format、10 项发布与 Word 聚焦回归、compileall、pip check、`deep-agent 0.12.2` 和 Word 重新打开校验通过。
+- GitHub Actions run `30241601163`：Python 3.11/3.12/3.13 均使用 Ruff 0.15.21，通过 check、format、504 项测试和 compileall。
+- 远端文件树：`main` 根目录只有两份 0.12.2 Word，`user-docs/` 存在同版 Word 和当前 Markdown。
+
 ## 后续建议
 
 1. 版本发布测试继续检查根目录和 `user-docs/` 一致性。

@@ -655,6 +655,9 @@ GitHub Actions run `30210431120` verified the fix on Python 3.11, 3.12, and
 3.13. Every job reported Ruff 0.15.21, passed check and format, passed all 503
 tests, and completed compileall.
 
+GitHub Actions run `30241601163` verified v0.12.2 on the same Python matrix.
+Every job passed Ruff, format, all 504 tests, and compileall.
+
 The frozen v0.11.0 candidate collected and passed 454 tests locally, including
 18 CLI/Console tests, a real 25-column complex-grapheme progress PTY, a real
 40-column Readline PTY, and the exact clause pattern from the failed large

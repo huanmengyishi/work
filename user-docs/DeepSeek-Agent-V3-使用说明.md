@@ -187,6 +187,7 @@ pip check passed
 git diff --check passed
 v0.12.2 发布布局/Word 聚焦回归：10 passed
 GitHub Actions run 30210431120：Python 3.11/3.12/3.13 各 503 passed
+GitHub Actions run 30241601163：Python 3.11/3.12/3.13 各 504 passed
 ```
 
 Actions 三个矩阵任务的 Ruff check、format、pytest 和 compileall 均成功，使用的确认版本为 Ruff 0.15.21。
