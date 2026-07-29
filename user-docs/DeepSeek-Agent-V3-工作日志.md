@@ -2,8 +2,8 @@
 
 日期：2026-07-29
 
-状态：0.13.0 候选代码、完整离线门、隔离安装和唯一在线代表案例均已通过，正在
-完成提交、tag、GitHub Actions 和远端文件树核验。
+状态：0.13.0 实现提交已推送，完整离线门、隔离安装、唯一在线代表案例和 GitHub
+Actions Python 3.11/3.12/3.13 均通过；正在生成最终文档提交、tag 和远端树核验。
 
 ## 1. 目标
 
@@ -94,6 +94,7 @@ Ruff 0.15.21、format（142 files）、compileall、pip check、git diff --check
 隔离无 Key 普通任务：退出 1，未创建 .project-agent
 实际两份 Word：三处字节一致，CRC/OPC、正文、core.version、版本和日期元数据通过
 python -m agent --version：deep-agent 0.13.0
+GitHub Actions run 30439942343：Python 3.11/3.12/3.13 各 679 passed
 ```
 
 真实实例严格遵循：全部离线门全绿后，每轮发布最多选择一个与本次改动直接相关、
@@ -122,10 +123,11 @@ python -m agent --version：deep-agent 0.13.0
 - AgentState schema：`8`
 - 核心接口契约：`5`
 - 起始提交：`9b90f98d75552f09330e94904c8abce929e19856`
-- 实现提交：待最终提交后记录
+- 实现提交：`4a70ceb0ab62e0209e08541759d915f21d98010a`
 - 最终 tag：`v0.13.0`（待创建）
-- GitHub 推送：待完成
-- GitHub Actions：待完成
+- GitHub main 首次推送：成功
+- GitHub Actions：run `30439942343` 成功；三个 Python 版本的 Ruff 0.15.21、
+  format、679 项测试和 compileall 全部通过
 - 远端 main/tag 与文件树核验：待完成
 
 提交哈希不能递归写入包含其自身的提交；最终发布提交由 `v0.13.0` tag 标识，最终
