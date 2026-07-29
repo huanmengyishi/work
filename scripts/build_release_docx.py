@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 from datetime import datetime, timezone
 import re
 from pathlib import Path
@@ -12,9 +13,30 @@ from docx.oxml.ns import qn
 from docx.shared import Inches, Pt
 
 
-RELEASE_TIMESTAMP = datetime(2026, 7, 27, tzinfo=timezone.utc)
-RELEASE_AUTHOR = "Deep Agent"
-RELEASE_VERSION = "0.12.2"
+_VERSION_RE = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+(?:[A-Za-z0-9.-]+)?$")
+
+
+@dataclass(frozen=True)
+class ReleaseMetadata:
+    version: str
+    release_date: str
+    author: str = "Deep Agent"
+
+    def __post_init__(self) -> None:
+        if not _VERSION_RE.fullmatch(self.version):
+            raise ValueError("release version must be a bounded semantic version")
+        try:
+            parsed = datetime.strptime(self.release_date, "%Y-%m-%d")
+        except ValueError as exc:
+            raise ValueError("release date must use YYYY-MM-DD") from exc
+        if parsed.strftime("%Y-%m-%d") != self.release_date:
+            raise ValueError("release date must use YYYY-MM-DD")
+        if not self.author.strip() or len(self.author) > 100:
+            raise ValueError("release author must contain 1 to 100 characters")
+
+    @property
+    def timestamp(self) -> datetime:
+        return datetime.strptime(self.release_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
 
 
 def add_run(paragraph, text: str, *, code: bool = False) -> None:
@@ -32,7 +54,7 @@ def shade(paragraph) -> None:
     properties.append(value)
 
 
-def markdown_to_docx(source: Path, destination: Path) -> None:
+def markdown_to_docx(source: Path, destination: Path, *, metadata: ReleaseMetadata) -> None:
     lines = source.read_text(encoding="utf-8").splitlines()
     document = Document()
     title = next(
@@ -41,12 +63,13 @@ def markdown_to_docx(source: Path, destination: Path) -> None:
     )
     properties = document.core_properties
     properties.title = title
-    properties.author = RELEASE_AUTHOR
-    properties.last_modified_by = RELEASE_AUTHOR
-    properties.created = RELEASE_TIMESTAMP
-    properties.modified = RELEASE_TIMESTAMP
+    properties.author = metadata.author
+    properties.last_modified_by = metadata.author
+    properties.created = metadata.timestamp
+    properties.modified = metadata.timestamp
     properties.revision = 1
-    properties.keywords = f"DeepSeek Agent V3, v{RELEASE_VERSION}, 2026-07-27"
+    properties.version = metadata.version
+    properties.keywords = f"DeepSeek Agent V3, v{metadata.version}, {metadata.release_date}"
     section = document.sections[0]
     section.top_margin = Inches(0.65)
     section.bottom_margin = Inches(0.65)
@@ -119,8 +142,12 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("source", type=Path)
     parser.add_argument("destination", type=Path)
+    parser.add_argument("--version", required=True)
+    parser.add_argument("--release-date", required=True)
+    parser.add_argument("--author", default="Deep Agent")
     args = parser.parse_args()
-    markdown_to_docx(args.source, args.destination)
+    metadata = ReleaseMetadata(args.version, args.release_date, args.author)
+    markdown_to_docx(args.source, args.destination, metadata=metadata)
 
 
 if __name__ == "__main__":

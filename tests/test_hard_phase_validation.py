@@ -155,7 +155,7 @@ def test_runtime_hard_phase_runs_validation_but_never_executes_file_exploration(
             {"role": "assistant", "content": "验证命令已通过，文件探索命令均被 hard phase 拒绝。"},
         ]
     )
-    runtime = AgentRuntime(
+    runtime = AgentRuntime.with_default_services(
         config=config,
         project=project,
         memory=memory,
@@ -244,7 +244,9 @@ def test_runtime_hard_phase_can_read_bounded_attachment_from_current_validation(
             {"role": "assistant", "content": "验证附件已按受限范围读取。"},
         ]
     )
-    runtime = AgentRuntime(config=config, project=project, memory=memory, tools=tools, client=client)
+    runtime = AgentRuntime.with_default_services(
+        config=config, project=project, memory=memory, tools=tools, client=client
+    )
 
     answer = runtime.run("全面审计整个项目；若找到真实缺陷则修复并验证，否则不要修改")
 

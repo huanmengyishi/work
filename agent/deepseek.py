@@ -6,6 +6,7 @@ import json
 import re
 import socket
 import ssl
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -68,6 +69,8 @@ class DeepSeekClient:
         self.model = str(config.get("model.model", "deepseek-v4-pro"))
         self.api_keys = config.api_keys
         self._next_key_index = 0
+        self._key_pool_generation = 0
+        self._key_pool_lock = threading.Lock()
 
     def chat(
         self,
@@ -310,14 +313,38 @@ class DeepSeekClient:
             payload.pop("temperature", None)
         return payload
 
+    def _claim_key_pool_start(self, key_count: int) -> tuple[int, int]:
+        """Reserve one round-robin start without holding a lock during network I/O."""
+        if key_count <= 0:
+            return 0, -1
+        with self._key_pool_lock:
+            start_index = self._next_key_index % key_count
+            self._next_key_index = (start_index + 1) % key_count
+            self._key_pool_generation += 1
+            return start_index, self._key_pool_generation
+
+    def _advance_key_pool_after_success(
+        self,
+        *,
+        key_index: int,
+        key_count: int,
+        claim_generation: int,
+    ) -> None:
+        with self._key_pool_lock:
+            # A newer request has already reserved the next start; a slow older
+            # response must not overwrite that reservation when it finishes.
+            if claim_generation == self._key_pool_generation:
+                self._next_key_index = (key_index + 1) % key_count
+
     def _request_with_key_pool(self, payload: dict[str, Any]) -> tuple[dict[str, Any], int]:
         failures: list[int] = []
         http_attempt_count = 0
         key_count = len(self.api_keys)
+        start_index, claim_generation = self._claim_key_pool_start(key_count)
         retries = max(0, min(int(self.config.get("model.network_retries", 2)), 5))
         base_delay = max(0.0, min(float(self.config.get("model.retry_base_seconds", 1.0)), 10.0))
         for offset in range(key_count):
-            key_index = (self._next_key_index + offset) % key_count
+            key_index = (start_index + offset) % key_count
             key = self.api_keys[key_index]
             for attempt in range(retries + 1):
                 try:
@@ -353,7 +380,11 @@ class DeepSeekClient:
                         f"DeepSeek API request failed after {attempt + 1} attempt(s): {exc}",
                         http_attempt_count=http_attempt_count,
                     ) from exc
-                self._next_key_index = (key_index + 1) % key_count
+                self._advance_key_pool_after_success(
+                    key_index=key_index,
+                    key_count=key_count,
+                    claim_generation=claim_generation,
+                )
                 return data, http_attempt_count
         status_text = ", ".join(str(code) for code in failures) or "unknown"
         raise _DeepSeekRequestError(
@@ -373,10 +404,11 @@ class DeepSeekClient:
         failures: list[int] = []
         http_attempt_count = 0
         key_count = len(self.api_keys)
+        start_index, claim_generation = self._claim_key_pool_start(key_count)
         retries = max(0, min(int(self.config.get("model.network_retries", 2)), 5))
         base_delay = max(0.0, min(float(self.config.get("model.retry_base_seconds", 1.0)), 10.0))
         for offset in range(key_count):
-            key_index = (self._next_key_index + offset) % key_count
+            key_index = (start_index + offset) % key_count
             key = self.api_keys[key_index]
             switch_key = False
             for attempt in range(retries + 1):
@@ -448,7 +480,11 @@ class DeepSeekClient:
                         f"after {attempt + 1} attempt(s): {exc}",
                         http_attempt_count=http_attempt_count,
                     ) from exc
-                self._next_key_index = (key_index + 1) % key_count
+                self._advance_key_pool_after_success(
+                    key_index=key_index,
+                    key_count=key_count,
+                    claim_generation=claim_generation,
+                )
                 return message, raw, finish_reason, usage, http_attempt_count
             if switch_key:
                 continue

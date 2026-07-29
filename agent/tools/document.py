@@ -54,6 +54,7 @@ TEXT_SUFFIXES = {
 
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp"}
 WORD_SUFFIXES = {".docx", ".doc", ".odt", ".rtf"}
+MANAGED_TEXT_ARTIFACT_SUFFIXES = {".txt", ".md", ".markdown", ".rst", ".py", ".pyw", ".json", ".yaml", ".yml"}
 AI_TOOLS_PARSER = Path.home() / ".local" / "share" / "ai-tools" / "app" / "parser.py"
 AI_TOOLS_LAUNCHER = Path.home() / ".local" / "bin" / "ai-parser"
 
@@ -80,22 +81,22 @@ class DocumentTool:
             return ToolResult(False, "", f"document exceeds {self.max_input_bytes} bytes")
         suffix = file_path.suffix.lower()
         verification_metadata: dict[str, object] | None = None
-        if suffix == ".docx":
+        if suffix == ".docx" or suffix in MANAGED_TEXT_ARTIFACT_SUFFIXES:
             if file_size > MAX_ARTIFACT_BYTES_HARD_LIMIT:
                 return ToolResult(
                     False,
                     "",
-                    f"DOCX verification exceeds {MAX_ARTIFACT_BYTES_HARD_LIMIT} bytes",
+                    f"artifact verification exceeds {MAX_ARTIFACT_BYTES_HARD_LIMIT} bytes",
                 )
             try:
                 content = file_path.read_bytes()
             except OSError as exc:
-                return ToolResult(False, "", f"DOCX verification could not read the managed artifact: {exc}")
+                return ToolResult(False, "", f"verification could not read the managed artifact: {exc}")
             relative = file_path.relative_to(self.cwd.resolve()).as_posix()
             spec = ArtifactSpec(
                 MANAGED_DOCUMENT_ARTIFACT_ID,
                 relative,
-                format="docx",
+                format="docx" if suffix == ".docx" else "auto",
                 max_bytes=min(self.max_input_bytes, MAX_ARTIFACT_BYTES_HARD_LIMIT),
             )
             verification = verify_artifact(
@@ -112,7 +113,7 @@ class DocumentTool:
                 return ToolResult(
                     False,
                     "",
-                    f"DOCX artifact verification failed: {verification.message}",
+                    f"artifact verification failed: {verification.message}",
                     data={
                         "path": str(file_path),
                         ARTIFACT_VERIFICATION_METADATA_KEY: verification_metadata,
@@ -123,7 +124,7 @@ class DocumentTool:
             if ai_tools_result.ok:
                 return self._with_artifact_verification(ai_tools_result, verification_metadata)
         if suffix in TEXT_SUFFIXES:
-            return self._parse_text(file_path)
+            return self._with_artifact_verification(self._parse_text(file_path), verification_metadata)
         if suffix == ".pdf":
             return self._parse_pdf(file_path, ocr=ocr)
         if suffix in IMAGE_SUFFIXES:

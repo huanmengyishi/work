@@ -1,10 +1,5 @@
+# Core runtime dependencies. Optional features are installed from pyproject extras:
+# pip install -e '.[browser,vector,semantic,document]'
 PyYAML>=6.0.2
 regex>=2024.11.6
 wcwidth>=0.2.13
-PyMuPDF>=1.28.0
-Pillow>=12.0.0
-python-docx>=1.2.0
-chromadb>=0.5.0
-playwright>=1.45.0
-docling>=2.112.0
-tree-sitter-language-pack>=1.12.0

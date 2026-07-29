@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import http.client
 import io
 import json
 import ssl
+import threading
 import urllib.error
 
 import pytest
@@ -74,6 +76,68 @@ def test_key_pool_rotates_on_auth_and_rate_limit(monkeypatch, make_config) -> No
 
     assert response.message["content"] == "OK"
     assert seen_keys == ["Bearer first", "Bearer second", "Bearer third"]
+    assert client._next_key_index == 0
+
+
+def test_key_pool_concurrent_calls_claim_unique_starts_without_serializing(monkeypatch, make_config) -> None:
+    keys = ("pool-key-0", "pool-key-1", "pool-key-2", "pool-key-3")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", ",".join(keys))
+    client = DeepSeekClient(make_config({"model": {"api_key": ",".join(keys), "network_retries": 0}}))
+    barrier = threading.Barrier(len(keys))
+    seen_keys: list[str] = []
+    seen_keys_lock = threading.Lock()
+
+    def fake_request(_payload, key):
+        with seen_keys_lock:
+            seen_keys.append(key)
+        barrier.wait(timeout=5)
+        return {"choices": [{"message": {"role": "assistant", "content": "OK"}}]}
+
+    monkeypatch.setattr(client, "_request", fake_request)
+
+    with ThreadPoolExecutor(max_workers=len(keys)) as executor:
+        futures = [executor.submit(client.chat, messages=[{"role": "user", "content": "test"}]) for _ in keys]
+        responses = [future.result(timeout=10) for future in futures]
+
+    assert sorted(seen_keys) == sorted(keys)
+    assert [response.message["content"] for response in responses] == ["OK"] * len(keys)
+    assert client._next_key_index == 0
+
+
+def test_stream_key_pool_concurrent_calls_claim_unique_starts_without_serializing(monkeypatch, make_config) -> None:
+    keys = ("stream-key-0", "stream-key-1", "stream-key-2", "stream-key-3")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", ",".join(keys))
+    client = DeepSeekClient(make_config({"model": {"api_key": ",".join(keys), "network_retries": 0}}))
+    barrier = threading.Barrier(len(keys))
+    seen_keys: list[str] = []
+    seen_keys_lock = threading.Lock()
+
+    def fake_request_stream(
+        _payload,
+        key,
+        *,
+        on_reasoning,
+        on_content,
+        on_valid_data=None,
+    ):
+        del on_reasoning, on_content
+        with seen_keys_lock:
+            seen_keys.append(key)
+        barrier.wait(timeout=5)
+        if on_valid_data:
+            on_valid_data()
+        message = {"role": "assistant", "content": "OK"}
+        return message, {"choices": [{"message": message}]}, "stop", None
+
+    monkeypatch.setattr(client, "_request_stream", fake_request_stream)
+
+    with ThreadPoolExecutor(max_workers=len(keys)) as executor:
+        futures = [executor.submit(client.chat_stream, messages=[{"role": "user", "content": "test"}]) for _ in keys]
+        responses = [future.result(timeout=10) for future in futures]
+
+    assert sorted(seen_keys) == sorted(keys)
+    assert [response.message["content"] for response in responses] == ["OK"] * len(keys)
+    assert client._next_key_index == 0
 
 
 def test_request_repairs_surrogate_pair_before_utf8_encoding(monkeypatch, make_config) -> None:
@@ -107,6 +171,23 @@ def test_key_pool_error_does_not_expose_keys(monkeypatch, make_config) -> None:
     assert error.value.http_attempt_count == 2
     assert "secret-one" not in str(error.value)
     assert "secret-two" not in str(error.value)
+
+
+def test_stream_key_pool_error_does_not_expose_keys(monkeypatch, make_config) -> None:
+    keys = ("stream-secret-one", "stream-secret-two")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", ",".join(keys))
+    client = DeepSeekClient(make_config({"model": {"api_key": ",".join(keys), "network_retries": 0}}))
+
+    def fail_stream(_payload, _key, **_callbacks):
+        raise http_error("https://api.deepseek.com", 403)
+
+    monkeypatch.setattr(client, "_request_stream", fail_stream)
+
+    with pytest.raises(RuntimeError, match="Key pool failed after trying 2 key") as error:
+        client._request_stream_with_key_pool({}, on_reasoning=None, on_content=None)
+
+    assert error.value.http_attempt_count == 2
+    assert all(key not in str(error.value) for key in keys)
 
 
 def test_key_pool_check_reports_partial_failure(monkeypatch, make_config) -> None:

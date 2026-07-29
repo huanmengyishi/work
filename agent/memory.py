@@ -1,15 +1,18 @@
 from __future__ import annotations
 
-import json
+from collections import OrderedDict
 import difflib
 import hashlib
+import json
 import math
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, Iterable
+from threading import RLock
+from time import monotonic
+from typing import Any, Iterable, Sequence
 
 from . import paths
 from .config import AppConfig
@@ -60,6 +63,16 @@ class MemoryKind(StrEnum):
         raise ValueError(f"unknown memory kind {rendered}; expected one of: {expected}")
 
 
+GLOBAL_KNOWLEDGE_KINDS = frozenset(
+    {
+        MemoryKind.KNOWLEDGE,
+        MemoryKind.LESSON,
+        MemoryKind.DECISION,
+    }
+)
+GLOBAL_KNOWLEDGE_KIND_VALUES = tuple(sorted(item.value for item in GLOBAL_KNOWLEDGE_KINDS))
+
+
 @dataclass(frozen=True)
 class MemoryItem:
     id: int
@@ -84,10 +97,36 @@ class MemoryStats:
     by_tag: dict[str, int]
 
 
+@dataclass(frozen=True)
+class _QueryCacheEntry:
+    expires_at: float
+    items: tuple[MemoryItem, ...]
+
+
+_QueryCacheKey = tuple[bytes, str | None, int, bool, tuple[str, ...] | None]
+
+
 class MemoryStore:
     def __init__(self, config: AppConfig, db_path: Path | None = None) -> None:
         self.config = config
         self.data_dir = config.data_dir
+        self._cache_lock = RLock()
+        self._query_cache: OrderedDict[_QueryCacheKey, _QueryCacheEntry] = OrderedDict()
+        self._query_cache_generation = 0
+        self._query_cache_hits = 0
+        self._query_cache_misses = 0
+        self._query_cache_max_entries = self._bounded_int(
+            config.get("memory.query_cache_max_entries", 128),
+            default=128,
+            minimum=0,
+            maximum=128,
+        )
+        self._query_cache_ttl_seconds = self._bounded_float(
+            config.get("memory.query_cache_ttl_seconds", 60),
+            default=60.0,
+            minimum=0.0,
+            maximum=3_600.0,
+        )
         configured_db = Path(str(config.get("memory.sqlite_path", paths.memory_db_path()))).expanduser()
         configured_vector = Path(str(config.get("memory.vector_path", paths.vector_dir()))).expanduser()
         self.db_path = db_path or configured_db
@@ -103,6 +142,96 @@ class MemoryStore:
         con.row_factory = sqlite3.Row
         con.execute("pragma busy_timeout = 30000")
         return con
+
+    @staticmethod
+    def _clone_memory_items(items: Iterable[MemoryItem]) -> list[MemoryItem]:
+        # MemoryItem is frozen, but its tags list is intentionally kept
+        # compatible with older callers.  Copy it at the cache boundary so a
+        # caller cannot mutate another caller's cached result.
+        return [replace(item, tags=list(item.tags)) for item in items]
+
+    def _query_cache_lookup(self, key: _QueryCacheKey) -> tuple[list[MemoryItem] | None, int]:
+        with self._cache_lock:
+            generation = self._query_cache_generation
+            if self._query_cache_max_entries <= 0 or self._query_cache_ttl_seconds <= 0:
+                self._query_cache_misses += 1
+                return None, generation
+            entry = self._query_cache.get(key)
+            if entry is None:
+                self._query_cache_misses += 1
+                return None, generation
+            if entry.expires_at <= monotonic():
+                self._query_cache.pop(key, None)
+                self._query_cache_misses += 1
+                return None, generation
+            self._query_cache.move_to_end(key)
+            self._query_cache_hits += 1
+            return self._clone_memory_items(entry.items), generation
+
+    def _query_cache_store(
+        self,
+        key: _QueryCacheKey,
+        items: Iterable[MemoryItem],
+        *,
+        generation: int,
+    ) -> None:
+        with self._cache_lock:
+            if (
+                generation != self._query_cache_generation
+                or self._query_cache_max_entries <= 0
+                or self._query_cache_ttl_seconds <= 0
+            ):
+                return
+            cached = tuple(self._clone_memory_items(items))
+            self._query_cache[key] = _QueryCacheEntry(
+                expires_at=monotonic() + self._query_cache_ttl_seconds,
+                items=cached,
+            )
+            self._query_cache.move_to_end(key)
+            while len(self._query_cache) > self._query_cache_max_entries:
+                self._query_cache.popitem(last=False)
+
+    def _invalidate_query_cache_locked(self) -> None:
+        self._query_cache_generation += 1
+        self._query_cache.clear()
+
+    def clear_query_cache(self) -> None:
+        """Invalidate all hot queries without touching persistent Memory."""
+
+        with self._cache_lock:
+            self._invalidate_query_cache_locked()
+
+    def _update_cached_usage_locked(self, memory_ids: Iterable[int], used_at: str) -> None:
+        ids = set(memory_ids)
+        self._query_cache_generation += 1
+        if not ids or not self._query_cache:
+            return
+        for key, entry in list(self._query_cache.items()):
+            updated_items = tuple(
+                replace(
+                    item,
+                    tags=list(item.tags),
+                    use_count=item.use_count + 1,
+                    last_used_at=used_at,
+                )
+                if item.id in ids
+                else item
+                for item in entry.items
+            )
+            self._query_cache[key] = replace(entry, items=updated_items)
+
+    def query_cache_info(self) -> dict[str, int | float]:
+        """Return scalar cache diagnostics for tests and local troubleshooting."""
+
+        with self._cache_lock:
+            return {
+                "entries": len(self._query_cache),
+                "max_entries": self._query_cache_max_entries,
+                "ttl_seconds": self._query_cache_ttl_seconds,
+                "generation": self._query_cache_generation,
+                "hits": self._query_cache_hits,
+                "misses": self._query_cache_misses,
+            }
 
     def _init_db(self) -> None:
         with self._connect() as con:
@@ -284,16 +413,18 @@ class MemoryStore:
             expiry_days = max(0, int(self.config.get("memory.expiry_days", 365)))
             if expiry_days:
                 expires_at = (datetime.now(UTC) + timedelta(days=expiry_days)).replace(microsecond=0).isoformat()
-        with self._connect() as con:
-            cur = con.execute(
-                """
-                insert into memories(
-                    project_id, kind, title, content, tags, created_at, updated_at, confidence, expires_at
-                ) values (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (project_id, kind_value, title, content, tags_json, now, now, confidence_value, expires_at),
-            )
-            memory_id = int(cur.lastrowid)
+        with self._cache_lock:
+            with self._connect() as con:
+                cur = con.execute(
+                    """
+                    insert into memories(
+                        project_id, kind, title, content, tags, created_at, updated_at, confidence, expires_at
+                    ) values (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (project_id, kind_value, title, content, tags_json, now, now, confidence_value, expires_at),
+                )
+                memory_id = int(cur.lastrowid)
+            self._invalidate_query_cache_locked()
         if self.vector.is_enabled():
             self.vector.upsert_memory(
                 memory_id=memory_id,
@@ -318,14 +449,22 @@ class MemoryStore:
         kind: str | None = None,
         tag: str | None = None,
         global_only: bool = False,
+        include_global: bool = True,
     ) -> list[MemoryItem]:
         clauses: list[str] = ["merged_into is null"]
         params: list[object] = []
         if global_only:
-            clauses.append("project_id is null")
+            placeholders = ",".join("?" for _ in GLOBAL_KNOWLEDGE_KIND_VALUES)
+            clauses.append(f"project_id is null and kind in ({placeholders})")
+            params.extend(GLOBAL_KNOWLEDGE_KIND_VALUES)
         elif project_id is not None:
-            clauses.append("(project_id = ? or project_id is null)")
-            params.append(project_id)
+            if include_global:
+                placeholders = ",".join("?" for _ in GLOBAL_KNOWLEDGE_KIND_VALUES)
+                clauses.append(f"(project_id = ? or (project_id is null and kind in ({placeholders})))")
+                params.extend([project_id, *GLOBAL_KNOWLEDGE_KIND_VALUES])
+            else:
+                clauses.append("project_id = ?")
+                params.append(project_id)
         if kind:
             clauses.append("lower(kind) = lower(?)")
             params.append(kind)
@@ -363,23 +502,25 @@ class MemoryStore:
         next_expires = current.expires_at if expires_at is None else expires_at
         if not next_title or not next_content:
             raise ValueError("memory title and content must not be empty")
-        with self._connect() as con:
-            con.execute(
-                """
-                update memories
-                set title = ?, content = ?, tags = ?, confidence = ?, expires_at = ?, updated_at = ?
-                where id = ?
-                """,
-                (
-                    next_title,
-                    next_content,
-                    json.dumps(next_tags, ensure_ascii=False),
-                    next_confidence,
-                    next_expires,
-                    utc_now_iso(),
-                    memory_id,
-                ),
-            )
+        with self._cache_lock:
+            with self._connect() as con:
+                con.execute(
+                    """
+                    update memories
+                    set title = ?, content = ?, tags = ?, confidence = ?, expires_at = ?, updated_at = ?
+                    where id = ?
+                    """,
+                    (
+                        next_title,
+                        next_content,
+                        json.dumps(next_tags, ensure_ascii=False),
+                        next_confidence,
+                        next_expires,
+                        utc_now_iso(),
+                        memory_id,
+                    ),
+                )
+            self._invalidate_query_cache_locked()
         updated = self.get_memory(memory_id)
         if updated is None:
             raise RuntimeError(f"memory disappeared during update: {memory_id}")
@@ -395,7 +536,7 @@ class MemoryStore:
         return updated
 
     def maintain(self, *, project_id: str | None, apply: bool = False) -> dict[str, Any]:
-        items = self.list_memories(project_id=project_id, limit=1000)
+        items = self.list_memories(project_id=project_id, limit=1000, include_global=project_id is None)
         candidates = [item for item in items if item.kind in {"Correction", "Lesson", "Reflection"}]
         threshold = float(self.config.get("memory.dedupe_similarity", 0.94))
         merges: list[dict[str, Any]] = []
@@ -477,7 +618,7 @@ class MemoryStore:
             maximum=1000,
         )
         protected = self._protected_kinds()
-        scope_clause = "" if project_id is None else " where (project_id = ? or project_id is null)"
+        scope_clause = "" if project_id is None else " where project_id = ?"
         scope_params: list[object] = [] if project_id is None else [project_id]
 
         with self._connect() as con:
@@ -499,7 +640,7 @@ class MemoryStore:
                     clauses = [f"m.kind in ({','.join('?' for _ in evictable_kinds)})"]
                     params = [*scope_params, *evictable_kinds, scan_limit]
                     if project_id is not None:
-                        clauses.insert(0, "(m.project_id = ? or m.project_id is null)")
+                        clauses.insert(0, "m.project_id = ?")
                     where = " where " + " and ".join(clauses)
                     rows = con.execute(
                         f"""
@@ -541,22 +682,25 @@ class MemoryStore:
             # Revalidate immutable plan evidence inside one transaction.  A row
             # edited since planning, newly protected, or used as a merge keeper
             # is skipped rather than force-deleted.
-            with self._connect() as con:
-                for candidate in planned:
-                    kind = str(candidate["kind"])
-                    parsed_kind = MemoryKind.parse(kind, allow_unknown=True)
-                    if not isinstance(parsed_kind, MemoryKind) or parsed_kind.value in protected:
-                        continue
-                    deleted = con.execute(
-                        """
-                        delete from memories
-                        where id = ? and kind = ? and updated_at = ?
-                          and not exists (select 1 from memories child where child.merged_into = memories.id)
-                        """,
-                        (candidate["id"], kind, candidate["updated_at"]),
-                    )
-                    if deleted.rowcount == 1:
-                        deleted_ids.append(int(candidate["id"]))
+            with self._cache_lock:
+                with self._connect() as con:
+                    for candidate in planned:
+                        kind = str(candidate["kind"])
+                        parsed_kind = MemoryKind.parse(kind, allow_unknown=True)
+                        if not isinstance(parsed_kind, MemoryKind) or parsed_kind.value in protected:
+                            continue
+                        deleted = con.execute(
+                            """
+                            delete from memories
+                            where id = ? and kind = ? and updated_at = ?
+                              and not exists (select 1 from memories child where child.merged_into = memories.id)
+                            """,
+                            (candidate["id"], kind, candidate["updated_at"]),
+                        )
+                        if deleted.rowcount == 1:
+                            deleted_ids.append(int(candidate["id"]))
+                if deleted_ids:
+                    self._invalidate_query_cache_locked()
             if self.vector.is_enabled():
                 for memory_id in deleted_ids:
                     self.vector.delete_memory(memory_id)
@@ -594,7 +738,7 @@ class MemoryStore:
         }
 
     def _capacity_totals(self, project_id: str | None) -> tuple[int, int]:
-        scope_clause = "" if project_id is None else " where (project_id = ? or project_id is null)"
+        scope_clause = "" if project_id is None else " where project_id = ?"
         params: tuple[object, ...] = () if project_id is None else (project_id,)
         with self._connect() as con:
             row = con.execute(
@@ -611,27 +755,29 @@ class MemoryStore:
         tags = self._normalize_tags([*keeper.tags, *duplicate.tags])
         content = keeper.content if len(keeper.content) >= len(duplicate.content) else duplicate.content
         confidence = max(keeper.confidence, duplicate.confidence)
-        with self._connect() as con:
-            con.execute(
-                """
-                update memories
-                set content = ?, tags = ?, confidence = ?, use_count = ?, last_used_at = ?, updated_at = ?
-                where id = ?
-                """,
-                (
-                    content,
-                    json.dumps(tags, ensure_ascii=False),
-                    confidence,
-                    keeper.use_count + duplicate.use_count,
-                    max(keeper.last_used_at or "", duplicate.last_used_at or "") or None,
-                    utc_now_iso(),
-                    keeper.id,
-                ),
-            )
-            con.execute(
-                "update memories set merged_into = ?, updated_at = ? where id = ?",
-                (keeper.id, utc_now_iso(), duplicate.id),
-            )
+        with self._cache_lock:
+            with self._connect() as con:
+                con.execute(
+                    """
+                    update memories
+                    set content = ?, tags = ?, confidence = ?, use_count = ?, last_used_at = ?, updated_at = ?
+                    where id = ?
+                    """,
+                    (
+                        content,
+                        json.dumps(tags, ensure_ascii=False),
+                        confidence,
+                        keeper.use_count + duplicate.use_count,
+                        max(keeper.last_used_at or "", duplicate.last_used_at or "") or None,
+                        utc_now_iso(),
+                        keeper.id,
+                    ),
+                )
+                con.execute(
+                    "update memories set merged_into = ?, updated_at = ? where id = ?",
+                    (keeper.id, utc_now_iso(), duplicate.id),
+                )
+            self._invalidate_query_cache_locked()
         updated = self.get_memory(keeper.id)
         if updated and self.vector.is_enabled():
             self.vector.upsert_memory(
@@ -770,29 +916,282 @@ class MemoryStore:
             return 1.0
         return difflib.SequenceMatcher(None, left, right, autojunk=False).ratio()
 
-    def delete_memory(self, memory_id: int) -> bool:
-        with self._connect() as con:
-            ids = [
-                int(row[0])
-                for row in con.execute(
-                    "select id from memories where id = ? or merged_into = ?", (memory_id, memory_id)
+    def delete_memory(
+        self,
+        memory_id: int,
+        *,
+        project_id: str | None | object = ...,
+        kinds: Iterable[str | MemoryKind] | None = None,
+    ) -> bool:
+        """Delete one active Memory and its same-boundary merged records.
+
+        The optional boundary arguments are used by restricted facades such as
+        ``GlobalKnowledgeBase``.  When supplied, both the requested record and
+        every dependent merged record must remain inside that exact scope and
+        kind allowlist; otherwise the deletion fails closed without changes.
+        """
+
+        kind_values = self._strict_kind_values(kinds)
+        with self._cache_lock:
+            with self._connect() as con:
+                rows = con.execute(
+                    "select id, project_id, kind, merged_into from memories where id = ? or merged_into = ?",
+                    (memory_id, memory_id),
                 ).fetchall()
-            ]
-            deleted = (
-                con.execute("delete from memories where id = ? or merged_into = ?", (memory_id, memory_id)).rowcount > 0
-            )
+                if project_id is not ... or kind_values is not None:
+                    active_target_exists = any(
+                        int(row["id"]) == memory_id and row["merged_into"] is None for row in rows
+                    )
+                    if not active_target_exists or any(
+                        (project_id is not ... and row["project_id"] != project_id)
+                        or (kind_values is not None and str(row["kind"]) not in kind_values)
+                        for row in rows
+                    ):
+                        return False
+                ids = [int(row["id"]) for row in rows]
+                deleted = (
+                    con.execute(
+                        "delete from memories where id = ? or merged_into = ?",
+                        (memory_id, memory_id),
+                    ).rowcount
+                    > 0
+                )
+            if deleted:
+                self._invalidate_query_cache_locked()
         if deleted and self.vector.is_enabled():
             for item_id in ids:
                 self.vector.delete_memory(item_id)
         return deleted
 
-    def stats(self, *, project_id: str | None = None) -> MemoryStats:
-        clauses = (
-            " where merged_into is null and (project_id = ? or project_id is null)"
-            if project_id is not None
-            else " where merged_into is null"
+    def select_transfer_memories(
+        self,
+        *,
+        project_id: str,
+        scope: str,
+        limit: int,
+        max_payload_bytes: int | None = None,
+    ) -> list[MemoryItem]:
+        """Read one bounded portable scope without leaking other projects."""
+
+        if scope not in {"project", "global", "both"}:
+            raise ValueError("memory export scope must be project, global, or both")
+        normalized_project_id = str(project_id).strip()
+        if scope in {"project", "both"} and not normalized_project_id:
+            raise ValueError("project-scoped memory export requires a project ID")
+        effective_limit = self._bounded_int(limit, default=5001, minimum=1, maximum=100_001)
+        if scope == "project":
+            clause, params = "project_id = ?", [normalized_project_id]
+        elif scope == "global":
+            placeholders = ",".join("?" for _ in GLOBAL_KNOWLEDGE_KIND_VALUES)
+            clause, params = f"project_id is null and kind in ({placeholders})", list(GLOBAL_KNOWLEDGE_KIND_VALUES)
+        else:
+            placeholders = ",".join("?" for _ in GLOBAL_KNOWLEDGE_KIND_VALUES)
+            clause = f"(project_id = ? or (project_id is null and kind in ({placeholders})))"
+            params = [normalized_project_id, *GLOBAL_KNOWLEDGE_KIND_VALUES]
+        with self._cache_lock:
+            with self._connect() as con:
+                con.execute("begin")
+                totals = con.execute(
+                    f"""
+                    select count(*) as record_count,
+                           coalesce(sum({_MEMORY_PAYLOAD_BYTES_SQL}), 0) as payload_bytes
+                    from memories
+                    where merged_into is null and {clause}
+                    """,
+                    params,
+                ).fetchone()
+                record_count = int(totals["record_count"] if totals else 0)
+                payload_bytes = int(totals["payload_bytes"] if totals else 0)
+                if record_count > effective_limit:
+                    raise ValueError(f"memory export contains more than the configured {effective_limit} record limit")
+                if max_payload_bytes is not None and payload_bytes > max_payload_bytes:
+                    raise ValueError(
+                        f"memory export payload is {payload_bytes} bytes; configured file limit is "
+                        f"{max_payload_bytes} bytes"
+                    )
+                rows = con.execute(
+                    f"""
+                    select * from memories
+                    where merged_into is null and {clause}
+                    order by id asc
+                    limit ?
+                    """,
+                    [*params, effective_limit],
+                ).fetchall()
+        return [self._row_to_memory(row) for row in rows]
+
+    def apply_transfer_records(
+        self,
+        records: Sequence[dict[str, Any]],
+        *,
+        project_id: str,
+        target_scope: str,
+        conflict: str,
+    ) -> dict[str, int]:
+        """Atomically apply records already validated by ``memory_transfer``.
+
+        Identity is target scope + canonical kind + trimmed case-insensitive
+        title.  An identical payload is deduplicated.  A different payload with
+        the same identity is either skipped or replaces the oldest active row.
+        """
+
+        if target_scope not in {"preserve", "project", "global"}:
+            raise ValueError("memory import target scope must be preserve, project, or global")
+        if conflict not in {"skip", "replace"}:
+            raise ValueError("memory import conflict strategy must be skip or replace")
+        normalized_project_id = str(project_id).strip()
+        if target_scope != "global" and not normalized_project_id:
+            raise ValueError("project-scoped memory import requires a project ID")
+
+        inserted_ids: list[int] = []
+        replaced_ids: list[int] = []
+        deduplicated_count = 0
+        skipped_conflict_count = 0
+        with self._cache_lock:
+            with self._connect() as con:
+                for record in records:
+                    source_scope = str(record["scope"])
+                    if source_scope not in {"project", "global"}:
+                        raise ValueError("memory transfer record scope must be project or global")
+                    destination_scope = source_scope if target_scope == "preserve" else target_scope
+                    target_project_id = None if destination_scope == "global" else normalized_project_id
+                    parsed_kind = MemoryKind.parse(record["kind"])
+                    if not isinstance(parsed_kind, MemoryKind):
+                        raise ValueError(f"invalid memory kind: {record['kind']!r}")
+                    if target_project_id is None and parsed_kind not in GLOBAL_KNOWLEDGE_KINDS:
+                        allowed = ", ".join(GLOBAL_KNOWLEDGE_KIND_VALUES)
+                        raise ValueError(f"global knowledge kind must be one of: {allowed}")
+                    title = str(record["title"]).strip()
+                    content = str(record["content"])
+                    tags = self._normalize_tags(record["tags"])
+                    confidence = float(record["confidence"])
+                    expires_at = record["expires_at"]
+                    candidates = con.execute(
+                        """
+                        select * from memories
+                        where project_id is ? and kind = ? and trim(title) = ? collate nocase
+                          and merged_into is null
+                        order by id asc
+                        """,
+                        (target_project_id, parsed_kind.value, title),
+                    ).fetchall()
+                    exact = next(
+                        (
+                            row
+                            for row in candidates
+                            if self._transfer_payload_matches(
+                                row,
+                                content=content,
+                                tags=tags,
+                                confidence=confidence,
+                                expires_at=expires_at,
+                            )
+                        ),
+                        None,
+                    )
+                    if exact is not None:
+                        deduplicated_count += 1
+                        continue
+                    if candidates:
+                        if conflict == "skip":
+                            skipped_conflict_count += 1
+                            continue
+                        memory_id = int(candidates[0]["id"])
+                        con.execute(
+                            """
+                            update memories
+                            set content = ?, tags = ?, confidence = ?, expires_at = ?, updated_at = ?
+                            where id = ? and merged_into is null
+                            """,
+                            (
+                                content,
+                                json.dumps(tags, ensure_ascii=False),
+                                confidence,
+                                expires_at,
+                                utc_now_iso(),
+                                memory_id,
+                            ),
+                        )
+                        replaced_ids.append(memory_id)
+                        continue
+                    now = utc_now_iso()
+                    inserted = con.execute(
+                        """
+                        insert into memories(
+                            project_id, kind, title, content, tags, created_at, updated_at,
+                            confidence, expires_at
+                        ) values (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            target_project_id,
+                            parsed_kind.value,
+                            title,
+                            content,
+                            json.dumps(tags, ensure_ascii=False),
+                            now,
+                            now,
+                            confidence,
+                            expires_at,
+                        ),
+                    )
+                    inserted_ids.append(int(inserted.lastrowid))
+            # Clearing even for an all-deduplicated import also invalidates a
+            # hot query populated before this transaction acquired the lock.
+            self._invalidate_query_cache_locked()
+
+        affected_ids = sorted(set([*inserted_ids, *replaced_ids]))
+        if affected_ids and self.vector.is_enabled():
+            for memory_id in affected_ids:
+                item = self.get_memory(memory_id)
+                if item is None:
+                    continue
+                self.vector.upsert_memory(
+                    memory_id=item.id,
+                    project_id=item.project_id,
+                    kind=item.kind,
+                    title=item.title,
+                    content=item.content,
+                    tags=item.tags,
+                )
+        return {
+            "record_count": len(records),
+            "inserted_count": len(inserted_ids),
+            "replaced_count": len(replaced_ids),
+            "deduplicated_count": deduplicated_count,
+            "skipped_conflict_count": skipped_conflict_count,
+        }
+
+    @staticmethod
+    def _transfer_payload_matches(
+        row: sqlite3.Row,
+        *,
+        content: str,
+        tags: list[str],
+        confidence: float,
+        expires_at: str | None,
+    ) -> bool:
+        try:
+            existing_tags = json.loads(row["tags"] or "[]")
+        except json.JSONDecodeError:
+            existing_tags = []
+        normalized_existing_tags = sorted(str(tag).strip() for tag in existing_tags if str(tag).strip())
+        return (
+            str(row["content"]) == content
+            and normalized_existing_tags == sorted(tags)
+            and float(row["confidence"] if row["confidence"] is not None else 0.7) == confidence
+            and row["expires_at"] == expires_at
         )
-        params = (project_id,) if project_id is not None else ()
+
+    def stats(self, *, project_id: str | None = None) -> MemoryStats:
+        if project_id is not None:
+            placeholders = ",".join("?" for _ in GLOBAL_KNOWLEDGE_KIND_VALUES)
+            clauses = (
+                f" where merged_into is null and (project_id = ? or (project_id is null and kind in ({placeholders})))"
+            )
+            params = (project_id, *GLOBAL_KNOWLEDGE_KIND_VALUES)
+        else:
+            clauses = " where merged_into is null"
+            params = ()
         with self._connect() as con:
             rows = con.execute(f"select project_id, kind, tags from memories{clauses}", params).fetchall()
         by_scope: dict[str, int] = {}
@@ -822,8 +1221,8 @@ class MemoryStore:
             rows = con.execute(
                 f"""
                 select * from memories
-                where (project_id = ? or project_id is null)
-                  and kind in ('Correction', 'Lesson')
+                where ((project_id = ? and kind in ('Correction', 'Lesson'))
+                       or (project_id is null and kind = 'Lesson'))
                   and merged_into is null
                   and ({clauses})
                 order by case kind when 'Correction' then 0 else 1 end, updated_at desc
@@ -905,86 +1304,140 @@ class MemoryStore:
         *,
         global_only: bool = False,
         record_usage: bool = True,
+        kinds: Iterable[str | MemoryKind] | None = None,
+        truncate_query: bool = False,
     ) -> list[MemoryItem]:
-        limit = limit or int(self.config.get("memory.retrieval_limit", 8))
+        normalized_query = self._bounded_search_query(query, truncate=truncate_query)
+        effective_limit = self._bounded_int(
+            limit if limit is not None else self.config.get("memory.retrieval_limit", 8),
+            default=8,
+            minimum=1,
+            maximum=1000,
+        )
+        kind_values = self._strict_kind_values(kinds)
+        if kind_values == ():
+            return []
+        query_digest = hashlib.sha256(normalized_query.encode("utf-8")).digest()
+        key: _QueryCacheKey = (query_digest, project_id, effective_limit, global_only, kind_values)
+        cached, generation = self._query_cache_lookup(key)
+        if cached is None:
+            selected = self._search_uncached(
+                normalized_query,
+                project_id=project_id,
+                limit=effective_limit,
+                global_only=global_only,
+                kind_values=kind_values,
+            )
+            self._query_cache_store(key, selected, generation=generation)
+        else:
+            selected = cached
+        result = self._clone_memory_items(selected)
+        if record_usage:
+            self._record_usage([item.id for item in result])
+        return result
+
+    def _search_uncached(
+        self,
+        query: str,
+        *,
+        project_id: str | None,
+        limit: int,
+        global_only: bool,
+        kind_values: tuple[str, ...] | None,
+    ) -> list[MemoryItem]:
+        filters = ["m.merged_into is null"]
+        filter_params: list[object] = []
+        if global_only:
+            placeholders = ",".join("?" for _ in GLOBAL_KNOWLEDGE_KIND_VALUES)
+            filters.append(f"m.project_id is null and m.kind in ({placeholders})")
+            filter_params.extend(GLOBAL_KNOWLEDGE_KIND_VALUES)
+        elif project_id is not None:
+            placeholders = ",".join("?" for _ in GLOBAL_KNOWLEDGE_KIND_VALUES)
+            filters.append(f"(m.project_id = ? or (m.project_id is null and m.kind in ({placeholders})))")
+            filter_params.extend([project_id, *GLOBAL_KNOWLEDGE_KIND_VALUES])
+        if kind_values is not None:
+            filters.append(f"m.kind in ({','.join('?' for _ in kind_values)})")
+            filter_params.extend(kind_values)
+        where = " and ".join(filters)
         with self._connect() as con:
             if self._table_exists(con, "memory_fts") and query.strip():
-                if global_only:
-                    rows = con.execute(
-                        """
-                        select m.*
-                        from memory_fts f
-                        join memories m on m.id = f.rowid
-                        where memory_fts match ? and m.project_id is null and m.merged_into is null
-                        order by bm25(memory_fts)
-                        limit ?
-                        """,
-                        (self._safe_fts_query(query), limit),
-                    ).fetchall()
-                else:
-                    rows = con.execute(
-                        """
-                        select m.*
-                        from memory_fts f
-                        join memories m on m.id = f.rowid
-                        where memory_fts match ?
-                          and (? is null or m.project_id = ? or m.project_id is null)
-                          and m.merged_into is null
-                        order by bm25(memory_fts)
-                        limit ?
-                        """,
-                        (self._safe_fts_query(query), project_id, project_id, limit),
-                    ).fetchall()
+                rows = con.execute(
+                    f"""
+                    select m.*
+                    from memory_fts f
+                    join memories m on m.id = f.rowid
+                    where memory_fts match ? and {where}
+                    order by bm25(memory_fts)
+                    limit ?
+                    """,
+                    [self._safe_fts_query(query), *filter_params, limit],
+                ).fetchall()
             else:
                 like = f"%{query}%"
-                if global_only:
-                    rows = con.execute(
-                        """
-                        select *
-                        from memories
-                        where (? = '' or title like ? or content like ? or tags like ?)
-                          and project_id is null
-                          and merged_into is null
-                        order by updated_at desc
-                        limit ?
-                        """,
-                        (query, like, like, like, limit),
-                    ).fetchall()
-                else:
-                    rows = con.execute(
-                        """
-                        select *
-                        from memories
-                        where (? = '' or title like ? or content like ? or tags like ?)
-                          and (? is null or project_id = ? or project_id is null)
-                          and merged_into is null
-                        order by updated_at desc
-                        limit ?
-                        """,
-                        (query, like, like, like, project_id, project_id, limit),
-                    ).fetchall()
+                rows = con.execute(
+                    f"""
+                    select m.*
+                    from memories m
+                    where (? = '' or m.title like ? or m.content like ? or m.tags like ?)
+                      and {where}
+                    order by m.updated_at desc, m.id desc
+                    limit ?
+                    """,
+                    [query, like, like, like, *filter_params, limit],
+                ).fetchall()
             items = [self._row_to_memory(row) for row in rows]
             seen = {item.id for item in items}
             if len(items) < limit and self.vector.is_enabled() and query.strip() and not global_only:
                 vector_ids = self.vector.query_memory_ids(query=query, project_id=project_id, limit=limit)
                 missing_ids = [memory_id for memory_id in vector_ids if memory_id not in seen]
                 if missing_ids:
-                    placeholders = ",".join("?" for _ in missing_ids)
+                    id_placeholders = ",".join("?" for _ in missing_ids)
+                    scope_filter = ""
+                    kind_filter = ""
+                    extra_params: list[object] = list(missing_ids)
+                    if project_id is not None:
+                        global_placeholders = ",".join("?" for _ in GLOBAL_KNOWLEDGE_KIND_VALUES)
+                        scope_filter = (
+                            f" and (project_id = ? or (project_id is null and kind in ({global_placeholders})))"
+                        )
+                        extra_params.extend([project_id, *GLOBAL_KNOWLEDGE_KIND_VALUES])
+                    if kind_values is not None:
+                        kind_filter = f" and kind in ({','.join('?' for _ in kind_values)})"
+                        extra_params.extend(kind_values)
                     extra_rows = con.execute(
-                        f"select * from memories where merged_into is null and id in ({placeholders})",
-                        missing_ids,
+                        f"""
+                        select * from memories
+                        where merged_into is null and id in ({id_placeholders})
+                          {scope_filter}{kind_filter}
+                        """,
+                        extra_params,
                     ).fetchall()
-                    for row in extra_rows:
-                        item = self._row_to_memory(row)
+                    extra_by_id = {int(row["id"]): self._row_to_memory(row) for row in extra_rows}
+                    for memory_id in missing_ids:
+                        item = extra_by_id.get(memory_id)
+                        if item is None:
+                            continue
                         if item.id not in seen:
                             items.append(item)
                             seen.add(item.id)
                         if len(items) >= limit:
                             break
-        selected = items[:limit]
-        if record_usage:
-            self._record_usage([item.id for item in selected])
-        return selected
+        return items[:limit]
+
+    @staticmethod
+    def _strict_kind_values(kinds: Iterable[str | MemoryKind] | None) -> tuple[str, ...] | None:
+        if kinds is None:
+            return None
+        values: list[str] = []
+        seen: set[str] = set()
+        for kind in kinds:
+            parsed = MemoryKind.parse(kind)
+            if not isinstance(parsed, MemoryKind):
+                raise ValueError(f"invalid memory kind: {kind!r}")
+            if parsed.value not in seen:
+                values.append(parsed.value)
+                seen.add(parsed.value)
+        return tuple(sorted(values))
 
     def record_usage(self, memory_ids: Iterable[int]) -> None:
         """Reinforce only Memory entries that were actually included in model context."""
@@ -1011,40 +1464,42 @@ class MemoryStore:
             raise ValueError("memory usage requires 1 to 1000 positive IDs")
         serialized_ids = json.dumps(normalized_ids, separators=(",", ":"))
         now = utc_now_iso()
-        with self._connect() as con:
-            inserted = con.execute(
-                """
-                insert into memory_usage_events(usage_id, run_id, project_id, memory_ids, recorded_at)
-                values (?, ?, ?, ?, ?)
-                on conflict(usage_id) do nothing
-                """,
-                (normalized_usage_id, normalized_run_id, project_id, serialized_ids, now),
-            )
-            if inserted.rowcount == 0:
-                existing = con.execute(
-                    "select run_id, project_id, memory_ids from memory_usage_events where usage_id = ?",
-                    (normalized_usage_id,),
-                ).fetchone()
-                if existing is None:
-                    raise RuntimeError("memory usage journal conflict could not be resolved")
-                if (
-                    str(existing["run_id"]) != normalized_run_id
-                    or existing["project_id"] != project_id
-                    or str(existing["memory_ids"]) != serialized_ids
-                ):
-                    raise ValueError("memory usage_id was replayed with different evidence")
-                return False
-            placeholders = ",".join("?" for _ in normalized_ids)
-            updated = con.execute(
-                f"""
-                update memories
-                set use_count = use_count + 1, last_used_at = ?
-                where id in ({placeholders}) and merged_into is null
-                """,
-                [now, *normalized_ids],
-            )
-            if updated.rowcount != len(normalized_ids):
-                raise ValueError("memory usage evidence contains missing or merged IDs")
+        with self._cache_lock:
+            with self._connect() as con:
+                inserted = con.execute(
+                    """
+                    insert into memory_usage_events(usage_id, run_id, project_id, memory_ids, recorded_at)
+                    values (?, ?, ?, ?, ?)
+                    on conflict(usage_id) do nothing
+                    """,
+                    (normalized_usage_id, normalized_run_id, project_id, serialized_ids, now),
+                )
+                if inserted.rowcount == 0:
+                    existing = con.execute(
+                        "select run_id, project_id, memory_ids from memory_usage_events where usage_id = ?",
+                        (normalized_usage_id,),
+                    ).fetchone()
+                    if existing is None:
+                        raise RuntimeError("memory usage journal conflict could not be resolved")
+                    if (
+                        str(existing["run_id"]) != normalized_run_id
+                        or existing["project_id"] != project_id
+                        or str(existing["memory_ids"]) != serialized_ids
+                    ):
+                        raise ValueError("memory usage_id was replayed with different evidence")
+                    return False
+                placeholders = ",".join("?" for _ in normalized_ids)
+                updated = con.execute(
+                    f"""
+                    update memories
+                    set use_count = use_count + 1, last_used_at = ?
+                    where id in ({placeholders}) and merged_into is null
+                    """,
+                    [now, *normalized_ids],
+                )
+                if updated.rowcount != len(normalized_ids):
+                    raise ValueError("memory usage evidence contains missing or merged IDs")
+            self._update_cached_usage_locked(normalized_ids, now)
         return True
 
     def record_feedback(self, feedback_id: str, memory_id: int, *, helpful: bool) -> bool:
@@ -1095,73 +1550,79 @@ class MemoryStore:
         if lower_bound > upper_bound:
             lower_bound, upper_bound = 0.1, 0.95
         now = utc_now_iso()
-        with self._connect() as con:
-            existing = con.execute(
-                "select memory_id, helpful from memory_feedback_events where feedback_id = ?",
-                (normalized_feedback_id,),
-            ).fetchone()
-            if existing is not None:
-                if int(existing["memory_id"]) != normalized_memory_id or bool(existing["helpful"]) != helpful:
-                    raise ValueError("memory feedback_id was replayed with different evidence")
-                return False
-            row = con.execute(
-                "select confidence, merged_into from memories where id = ?",
-                (normalized_memory_id,),
-            ).fetchone()
-            if row is None:
-                raise ValueError("memory feedback contains a missing memory ID")
-            if row["merged_into"] is not None:
-                raise ValueError("memory feedback contains a merged memory ID")
-
-            before = min(1.0, max(0.0, float(row["confidence"] if row["confidence"] is not None else 0.7)))
-            if helpful:
-                after = max(before, min(upper_bound, before + bonus))
-            else:
-                after = min(before, max(lower_bound, before - penalty))
-            inserted = con.execute(
-                """
-                insert into memory_feedback_events(
-                    feedback_id, memory_id, helpful, confidence_before, confidence_after, recorded_at
-                ) values (?, ?, ?, ?, ?, ?)
-                on conflict(feedback_id) do nothing
-                """,
-                (normalized_feedback_id, normalized_memory_id, int(helpful), before, after, now),
-            )
-            if inserted.rowcount == 0:
+        with self._cache_lock:
+            with self._connect() as con:
                 existing = con.execute(
-                    """
-                    select memory_id, helpful
-                    from memory_feedback_events
-                    where feedback_id = ?
-                    """,
+                    "select memory_id, helpful from memory_feedback_events where feedback_id = ?",
                     (normalized_feedback_id,),
                 ).fetchone()
-                if existing is None:
-                    raise RuntimeError("memory feedback journal conflict could not be resolved")
-                if int(existing["memory_id"]) != normalized_memory_id or bool(existing["helpful"]) != helpful:
-                    raise ValueError("memory feedback_id was replayed with different evidence")
-                return False
-            updated = con.execute(
-                """
-                update memories
-                set confidence = ?, updated_at = ?
-                where id = ? and merged_into is null and confidence = ?
-                """,
-                (after, now, normalized_memory_id, row["confidence"]),
-            )
-            if updated.rowcount != 1:
-                raise RuntimeError("memory changed while confidence feedback was being recorded")
+                if existing is not None:
+                    if int(existing["memory_id"]) != normalized_memory_id or bool(existing["helpful"]) != helpful:
+                        raise ValueError("memory feedback_id was replayed with different evidence")
+                    return False
+                row = con.execute(
+                    "select confidence, merged_into from memories where id = ?",
+                    (normalized_memory_id,),
+                ).fetchone()
+                if row is None:
+                    raise ValueError("memory feedback contains a missing memory ID")
+                if row["merged_into"] is not None:
+                    raise ValueError("memory feedback contains a merged memory ID")
+
+                before = min(1.0, max(0.0, float(row["confidence"] if row["confidence"] is not None else 0.7)))
+                if helpful:
+                    after = max(before, min(upper_bound, before + bonus))
+                else:
+                    after = min(before, max(lower_bound, before - penalty))
+                inserted = con.execute(
+                    """
+                    insert into memory_feedback_events(
+                        feedback_id, memory_id, helpful, confidence_before, confidence_after, recorded_at
+                    ) values (?, ?, ?, ?, ?, ?)
+                    on conflict(feedback_id) do nothing
+                    """,
+                    (normalized_feedback_id, normalized_memory_id, int(helpful), before, after, now),
+                )
+                if inserted.rowcount == 0:
+                    existing = con.execute(
+                        """
+                        select memory_id, helpful
+                        from memory_feedback_events
+                        where feedback_id = ?
+                        """,
+                        (normalized_feedback_id,),
+                    ).fetchone()
+                    if existing is None:
+                        raise RuntimeError("memory feedback journal conflict could not be resolved")
+                    if int(existing["memory_id"]) != normalized_memory_id or bool(existing["helpful"]) != helpful:
+                        raise ValueError("memory feedback_id was replayed with different evidence")
+                    return False
+                updated = con.execute(
+                    """
+                    update memories
+                    set confidence = ?, updated_at = ?
+                    where id = ? and merged_into is null and confidence = ?
+                    """,
+                    (after, now, normalized_memory_id, row["confidence"]),
+                )
+                if updated.rowcount != 1:
+                    raise RuntimeError("memory changed while confidence feedback was being recorded")
+            self._invalidate_query_cache_locked()
         return True
 
     def _record_usage(self, memory_ids: list[int]) -> None:
         if not memory_ids:
             return
-        placeholders = ",".join("?" for _ in memory_ids)
-        with self._connect() as con:
-            con.execute(
-                f"update memories set use_count = use_count + 1, last_used_at = ? where id in ({placeholders})",
-                [utc_now_iso(), *memory_ids],
-            )
+        normalized_ids = sorted(set(memory_ids))
+        placeholders = ",".join("?" for _ in normalized_ids)
+        now = utc_now_iso()
+        with self._cache_lock:
+            with self._connect() as con:
+                con.execute(
+                    f"update memories set use_count = use_count + 1, last_used_at = ? where id in ({placeholders})",
+                    [now, *normalized_ids],
+                )
+            self._update_cached_usage_locked(normalized_ids, now)
 
     def recent(self, project_id: str | None = None, limit: int = 10) -> list[MemoryItem]:
         with self._connect() as con:
@@ -1246,8 +1707,42 @@ class MemoryStore:
 
     @staticmethod
     def _safe_fts_query(query: str) -> str:
-        tokens = [token.strip('"*:()') for token in query.split() if token.strip('"*:()')]
+        normalized = "".join(
+            character if character.isalnum() or character in {"_", "-"} else " " for character in query
+        )
+        tokens = normalized.split()[:32]
         return " OR ".join(f'"{token}"' for token in tokens) if tokens else '""'
+
+    def _bounded_search_query(self, query: object, *, truncate: bool = False) -> str:
+        if not isinstance(query, str):
+            raise ValueError("memory search query must be text")
+        max_chars = self._bounded_int(
+            self.config.get("memory.search_max_query_chars", 4_096),
+            default=4_096,
+            minimum=1,
+            maximum=100_000,
+        )
+        max_bytes = self._bounded_int(
+            self.config.get("memory.search_max_query_bytes", 16_384),
+            default=16_384,
+            minimum=4,
+            maximum=400_000,
+        )
+        try:
+            encoded = query.encode("utf-8", errors="strict")
+        except UnicodeEncodeError as exc:
+            raise ValueError("memory search query must be valid Unicode text") from exc
+        if len(query) > max_chars or len(encoded) > max_bytes:
+            if truncate:
+                projected = query[:max_chars]
+                projected_bytes = projected.encode("utf-8")
+                if len(projected_bytes) > max_bytes:
+                    projected = projected_bytes[:max_bytes].decode("utf-8", errors="ignore")
+                return projected
+            raise ValueError(
+                f"memory search query exceeds the configured {max_chars} character or {max_bytes} UTF-8 byte limit"
+            )
+        return query
 
     @staticmethod
     def _normalize_tags(tags: Iterable[str]) -> list[str]:

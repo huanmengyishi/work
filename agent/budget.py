@@ -23,6 +23,16 @@ class BudgetRemaining:
     seconds: float
 
 
+@dataclass(frozen=True)
+class BudgetAdmission:
+    """Non-fatal admission result for optional best-effort model work."""
+
+    allowed: bool
+    reason: str
+    remaining: BudgetRemaining
+    reserved_tokens: int = 0
+
+
 class ExecutionBudgetController:
     """Bound one explicit Session turn without adding a second retry layer.
 
@@ -101,6 +111,49 @@ class ExecutionBudgetController:
         self._sync(state, stop_reason="", reserved_tokens=0, phase="tool_batch")
         return remaining
 
+    def try_before_model_request(
+        self,
+        state: AgentState,
+        *,
+        phase: str,
+        estimated_input_tokens: int,
+        requested_output_tokens: int,
+    ) -> BudgetAdmission:
+        """Admit optional model work without failing an already completed task.
+
+        Main-loop, compaction, and synthesis calls use ``before_model_request``
+        and fail closed. Completion-time Memory refinement is best effort: an
+        exhausted budget must skip that single optional request while leaving
+        the verified task outcome unchanged.
+        """
+
+        self._ensure_bound(state)
+        remaining = self.remaining(state)
+        reservation = max(0, int(estimated_input_tokens)) + max(0, int(requested_output_tokens))
+        reason = ""
+        if self.enabled:
+            if remaining.seconds <= 0:
+                reason = "elapsed_time"
+            elif remaining.model_requests <= 0:
+                reason = "model_requests"
+            elif reservation > remaining.tokens:
+                reason = "tokens"
+        if reason:
+            self._sync(
+                state,
+                reserved_tokens=0,
+                phase=phase,
+                optional_skip_reason=reason,
+            )
+            return BudgetAdmission(False, reason, remaining, 0)
+        self._sync(
+            state,
+            reserved_tokens=reservation,
+            phase=phase,
+            optional_skip_reason="",
+        )
+        return BudgetAdmission(True, "", remaining, reservation)
+
     def remaining(self, state: AgentState) -> BudgetRemaining:
         self._ensure_bound(state)
         requests_used = max(0, int(state.model_request_count))
@@ -133,6 +186,7 @@ class ExecutionBudgetController:
         stop_reason: str | None = None,
         reserved_tokens: int | None = None,
         phase: str | None = None,
+        optional_skip_reason: str | None = None,
     ) -> None:
         existing = state.convergence.get("execution_budget")
         previous = dict(existing) if isinstance(existing, dict) else {}
@@ -168,6 +222,8 @@ class ExecutionBudgetController:
             previous["reserved_tokens"] = max(0, int(reserved_tokens))
         if phase is not None:
             previous["phase"] = str(phase)[:64]
+        if optional_skip_reason is not None:
+            previous["optional_skip_reason"] = str(optional_skip_reason)[:64]
         state.convergence["execution_budget"] = previous
         state.touch()
 
@@ -187,4 +243,9 @@ class ExecutionBudgetController:
         return max(minimum, min(maximum, parsed))
 
 
-__all__ = ["BudgetRemaining", "ExecutionBudgetController", "ExecutionBudgetExceeded"]
+__all__ = [
+    "BudgetAdmission",
+    "BudgetRemaining",
+    "ExecutionBudgetController",
+    "ExecutionBudgetExceeded",
+]

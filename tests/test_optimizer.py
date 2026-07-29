@@ -84,6 +84,7 @@ def test_analyzer_projects_only_bounded_terminal_scalars() -> None:
         "model_requests_main_loop": 3,
         "model_requests_context_compaction": 1,
         "model_requests_final_synthesis": 2,
+        "model_requests_memory_refinement": 0,
         "prompt_tokens": 120,
         "completion_tokens": 30,
         "total_tokens": 150,
@@ -93,7 +94,8 @@ def test_analyzer_projects_only_bounded_terminal_scalars() -> None:
         "plan_steps_completed": 1,
         "elapsed_seconds": 12.5,
         "recorded_at": "2026-07-26T12:00:00+00:00",
-        "schema_version": 1,
+        "exploration_rounds": 0,
+        "schema_version": 3,
     }
     assert secret not in json.dumps(performance.to_dict(), ensure_ascii=False)
 

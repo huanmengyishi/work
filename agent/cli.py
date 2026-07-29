@@ -17,7 +17,9 @@ from .console import ConsoleUI
 from .context import ContextBuilder
 from .deepseek import DeepSeekClient, missing_api_key_message
 from .daemon import ProjectDaemon
+from .global_knowledge import GlobalKnowledgeBase
 from .memory import MemoryStore
+from .memory_transfer import MemoryTransferError, export_memory, import_memory
 from .network import proxy_url_from_env, redacted_proxy_url
 from .parallel import ParallelWorktreeRunner
 from .project import Project, ProjectManager, ProjectRegistry
@@ -214,6 +216,34 @@ def build_command_parser() -> argparse.ArgumentParser:
     memory_sub.add_parser("stats", help="Show memory totals by scope, kind, and tag.")
     memory_maintain = memory_sub.add_parser("maintain", help="Preview or apply deduplication and expiry cleanup.")
     memory_maintain.add_argument("--apply", action="store_true", help="Apply the reported maintenance operations.")
+    memory_cleanup = memory_sub.add_parser(
+        "cleanup",
+        help="Clear alias for memory maintain; dry-run unless --apply is given.",
+    )
+    memory_cleanup.add_argument("--apply", action="store_true", help="Apply deduplication and expiry cleanup.")
+    memory_export = memory_sub.add_parser("export", help="Export bounded versioned JSON memory.")
+    memory_export.add_argument("path", help="Destination JSON path; the parent directory must already exist.")
+    memory_export.add_argument(
+        "--scope",
+        choices=["project", "global", "both"],
+        default="project",
+        help="Export only this project, only global memory, or both (never other projects).",
+    )
+    memory_export.add_argument("--force", action="store_true", help="Atomically replace an existing regular file.")
+    memory_import = memory_sub.add_parser("import", help="Validate and import versioned JSON memory.")
+    memory_import.add_argument("path", help="Existing regular JSON file; symbolic links are refused.")
+    memory_import.add_argument(
+        "--target-scope",
+        choices=["preserve", "project", "global"],
+        default="preserve",
+        help="Preserve record scope, or explicitly remap every record to project/global scope.",
+    )
+    memory_import.add_argument(
+        "--conflict",
+        choices=["skip", "replace"],
+        default="skip",
+        help="For same-scope/kind/title conflicts, skip safely or replace the existing payload.",
+    )
 
     sessions_parser = subparsers.add_parser("sessions", help="List resumable sessions for this project.")
     sessions_parser.add_argument("--limit", type=int, default=20)
@@ -348,14 +378,17 @@ def cmd_config(config: AppConfig) -> int:
 
 def cmd_memory(config: AppConfig, args: argparse.Namespace) -> int:
     project, memory = prepare_project(config)
+    global_knowledge = GlobalKnowledgeBase(memory)
     if args.memory_command == "search":
-        project_id = None if args.global_only else project.id
-        items = memory.search(
-            args.query,
-            project_id=project_id,
-            limit=args.limit,
-            global_only=args.global_only,
-        )
+        try:
+            items = (
+                global_knowledge.search(args.query, limit=args.limit)
+                if args.global_only
+                else memory.search(args.query, project_id=project.id, limit=args.limit)
+            )
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
         if not items:
             print("No memory found.")
             return 0
@@ -366,21 +399,32 @@ def cmd_memory(config: AppConfig, args: argparse.Namespace) -> int:
             print()
         return 0
     if args.memory_command == "add":
-        project_id = None if args.global_memory else project.id
         tags = list(args.tag)
-        if args.kind == "Correction":
-            if not any(str(tag).startswith("correction:") for tag in tags):
-                print("error: Correction memory requires a correction:<topic> tag", file=sys.stderr)
+        if args.global_memory:
+            try:
+                memory_id = global_knowledge.add(
+                    kind=args.kind,
+                    title=args.title,
+                    content=args.content,
+                    tags=tags,
+                )
+            except ValueError as exc:
+                print(f"error: {exc}", file=sys.stderr)
                 return 2
-            if project.name not in tags:
-                tags.append(project.name)
-        memory_id = memory.add_memory(
-            kind=args.kind,
-            title=args.title,
-            content=args.content,
-            tags=tags,
-            project_id=project_id,
-        )
+        else:
+            if args.kind == "Correction":
+                if not any(str(tag).startswith("correction:") for tag in tags):
+                    print("error: Correction memory requires a correction:<topic> tag", file=sys.stderr)
+                    return 2
+                if project.name not in tags:
+                    tags.append(project.name)
+            memory_id = memory.add_memory(
+                kind=args.kind,
+                title=args.title,
+                content=args.content,
+                tags=tags,
+                project_id=project.id,
+            )
         memory.persist_lesson_file(
             kind=args.kind,
             title=args.title,
@@ -391,13 +435,24 @@ def cmd_memory(config: AppConfig, args: argparse.Namespace) -> int:
         print(f"Added memory {memory_id}")
         return 0
     if args.memory_command == "list":
-        items = memory.list_memories(
-            project_id=project.id,
-            limit=args.limit,
-            kind=args.kind,
-            tag=args.tag,
-            global_only=args.global_only,
-        )
+        try:
+            items = (
+                global_knowledge.list(
+                    limit=args.limit,
+                    kinds=[args.kind] if args.kind else None,
+                    tag=args.tag,
+                )
+                if args.global_only
+                else memory.list_memories(
+                    project_id=project.id,
+                    limit=args.limit,
+                    kind=args.kind,
+                    tag=args.tag,
+                )
+            )
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
         if not items:
             print("No memory found.")
             return 0
@@ -416,7 +471,13 @@ def cmd_memory(config: AppConfig, args: argparse.Namespace) -> int:
         if item is None:
             print(f"error: memory not found: {args.id}", file=sys.stderr)
             return 1
-        if not memory.delete_memory(args.id):
+        if item.project_id != project.id:
+            print(
+                "error: memory is outside the current project; global knowledge is add-only by default",
+                file=sys.stderr,
+            )
+            return 2
+        if not memory.delete_memory(args.id, project_id=project.id):
             print(f"error: could not delete memory: {args.id}", file=sys.stderr)
             return 1
         print(f"Deleted memory {args.id}: {item.title}")
@@ -426,6 +487,12 @@ def cmd_memory(config: AppConfig, args: argparse.Namespace) -> int:
         if item is None:
             print(f"error: memory not found: {args.id}", file=sys.stderr)
             return 1
+        if item.project_id != project.id:
+            print(
+                "error: memory is outside the current project; global knowledge is add-only by default",
+                file=sys.stderr,
+            )
+            return 2
         title, content, tags = args.title, args.content, args.tag
         if title is None and content is None and tags is None:
             try:
@@ -449,11 +516,39 @@ def cmd_memory(config: AppConfig, args: argparse.Namespace) -> int:
             for name, count in sorted(values.items(), key=lambda pair: (-pair[1], pair[0].lower())):
                 print(f"  {name}: {count}")
         return 0
-    if args.memory_command == "maintain":
+    if args.memory_command in {"maintain", "cleanup"}:
         report = memory.maintain(project_id=project.id, apply=args.apply)
         print(json.dumps(report, ensure_ascii=False, indent=2))
         if not args.apply and (report["merge_count"] or report["expired_count"]):
             print("Dry run only. Re-run with --apply to modify memory.")
+        return 0
+    if args.memory_command == "export":
+        try:
+            report = export_memory(
+                memory,
+                args.path,
+                project_id=project.id,
+                scope=args.scope,
+                overwrite=args.force,
+            )
+        except (MemoryTransferError, OSError) as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        return 0
+    if args.memory_command == "import":
+        try:
+            report = import_memory(
+                memory,
+                args.path,
+                project_id=project.id,
+                target_scope=args.target_scope,
+                conflict=args.conflict,
+            )
+        except (MemoryTransferError, OSError) as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+        print(json.dumps(report, ensure_ascii=False, indent=2))
         return 0
     return 2
 
@@ -991,11 +1086,12 @@ def build_runtime(
         yolo=yolo,
         super_yolo=super_yolo,
     )
-    return AgentRuntime(
+    return AgentRuntime.with_default_services(
         config=config,
         project=project,
         memory=memory,
         tools=tools,
+        client=DeepSeekClient(config),
         progress_handler=progress_handler,
     )
 

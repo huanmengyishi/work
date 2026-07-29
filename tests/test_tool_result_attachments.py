@@ -181,7 +181,7 @@ def test_runtime_session_and_model_receive_preview_while_attachment_keeps_full_r
             {"role": "assistant", "content": "The bounded evidence was inspected."},
         ]
     )
-    runtime = AgentRuntime(
+    runtime = AgentRuntime.with_default_services(
         config=config,
         project=project,
         memory=memory,

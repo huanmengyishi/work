@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import zipfile
 from io import BytesIO
+from pathlib import Path
 
 import pytest
 
@@ -14,7 +15,9 @@ from agent.artifact import (
     artifact_verification_metadata,
     verify_artifact,
 )
+from agent.artifact_registry import ArtifactRegistry
 from agent.progress import ProgressTracker, derive_progress
+from agent.runtime_validation import RuntimeValidationMixin
 from agent.state import AgentState, PlanStep
 from agent.tools.base import ToolResult
 
@@ -64,6 +67,228 @@ def _docx_bytes(text: str, *, extra: bytes = b"") -> bytes:
         if extra:
             archive.writestr("word/extra.bin", extra)
     return target.getvalue()
+
+
+def test_artifact_registry_preserves_generated_verified_and_undo_lineage_beyond_hot_window() -> None:
+    state = _state()
+    state.task_route = {
+        "artifact_hints": ["report.docx"],
+        "directory_hints": [],
+        "reasons": ["artifact-required", "word-artifact-required"],
+    }
+    ArtifactRegistry.sync_planned(state)
+    state.record_tool_call(
+        {"tool": "document", "action": "render_docx", "args": {"path": "report.docx"}},
+        {"success": True, "data": {"path": "report.docx", "preview_id": "preview-1"}},
+    )
+    state.record_tool_call(
+        {"tool": "file", "action": "apply", "args": {"preview_id": "preview-1"}},
+        {
+            "success": True,
+            "data": {
+                "path": "report.docx",
+                "preview_id": "preview-1",
+                "snapshot_id": "snapshot-1",
+                "after_exists": True,
+            },
+        },
+    )
+    payload = _docx_bytes("verified registry")
+    spec = ArtifactSpec(MANAGED_DOCUMENT_ARTIFACT_ID, "report.docx", format="docx")
+    verification = verify_artifact(
+        spec,
+        ToolResult(True, "", data={"exists": True, "size_bytes": len(payload), "content_complete": True}),
+        content=payload,
+    )
+    receipt = artifact_verification_metadata(spec, verification, content=payload)
+    state.record_tool_call(
+        {"tool": "document", "action": "parse", "args": {"path": "report.docx"}},
+        {
+            "success": True,
+            "data": {"path": "report.docx", ARTIFACT_VERIFICATION_METADATA_KEY: receipt},
+        },
+    )
+
+    for index in range(205):
+        state.record_tool_call(
+            {"tool": "template", "action": "read_file", "args": {"path": f"src/{index}.py"}},
+            {"success": True, "data": {}},
+        )
+
+    entry = state.artifact_registry["artifacts"]["report.docx"]
+    assert entry["state"] == "verified"
+    assert ArtifactRegistry.completion_issue(state, {"artifact-required", "word-artifact-required"}) == (True, "")
+    assert state.tool_history_summary["count"] > 0
+
+    state.record_tool_call(
+        {"tool": "file", "action": "undo", "args": {"snapshot_id": "snapshot-1"}},
+        {
+            "success": True,
+            "data": {"path": "report.docx", "snapshot_id": "snapshot-1", "restored_exists": False},
+        },
+    )
+
+    assert entry["state"] == "planned"
+    handled, issue = ArtifactRegistry.completion_issue(
+        state,
+        {"artifact-required", "word-artifact-required"},
+    )
+    assert handled is True
+    assert "not generated" in issue
+
+
+def test_artifact_registry_records_cross_step_parent_lineage() -> None:
+    state = _state(
+        plan=[
+            PlanStep(
+                "bundle",
+                "Prepare output bundle",
+                status="in_progress",
+                step_type="generate",
+                artifact_ids=["out"],
+            ),
+            PlanStep(
+                "report",
+                "Generate report",
+                parent_id="bundle",
+                step_type="render",
+                artifact_ids=["out/report.docx"],
+            ),
+        ]
+    )
+
+    ArtifactRegistry.sync_planned(state)
+
+    parent = state.artifact_registry["artifacts"]["out"]
+    child = state.artifact_registry["artifacts"]["out/report.docx"]
+    assert parent["step_ids"] == ["bundle"]
+    assert child["step_ids"] == ["report"]
+    assert child["parent_step_ids"] == ["bundle"]
+    assert child["parent_artifacts"] == ["out"]
+
+
+def test_artifact_registry_requires_schema2_exists_evidence_and_tracks_undo_restore() -> None:
+    state = _state()
+    state.task_route = {
+        "schema_version": 2,
+        "artifact_hints": ["report.txt"],
+        "directory_hints": [],
+        "reasons": ["artifact-required"],
+    }
+    ArtifactRegistry.sync_planned(state)
+
+    state.record_tool_call(
+        {"tool": "file", "action": "apply", "args": {"preview_id": "missing-exists"}},
+        {
+            "success": True,
+            "data": {
+                "path": "report.txt",
+                "preview_id": "missing-exists",
+                "snapshot_id": "missing-exists-snapshot",
+            },
+        },
+    )
+    entry = state.artifact_registry["artifacts"]["report.txt"]
+    assert entry["state"] == "planned"
+
+    state.record_tool_call(
+        {"tool": "file", "action": "apply", "args": {"preview_id": "delete-preview"}},
+        {
+            "success": True,
+            "data": {
+                "path": "report.txt",
+                "preview_id": "delete-preview",
+                "snapshot_id": "delete-snapshot",
+                "after_exists": False,
+            },
+        },
+    )
+    assert entry["state"] == "planned"
+
+    state.record_tool_call(
+        {"tool": "file", "action": "undo", "args": {"snapshot_id": "delete-snapshot"}},
+        {
+            "success": True,
+            "data": {
+                "path": "report.txt",
+                "snapshot_id": "delete-snapshot",
+                "restored_exists": True,
+            },
+        },
+    )
+    assert entry["state"] == "generated"
+    assert entry["generated"] is True
+    assert entry["verified"] is False
+    assert RuntimeValidationMixin._artifact_evidence_issue(state, {"artifact-required"}) == ""
+
+
+def test_artifact_registry_ignores_failed_reads_and_gate_is_stable_after_hot_window_pruning() -> None:
+    state = _state()
+    state.task_route = {
+        "schema_version": 2,
+        "artifact_hints": ["report.txt"],
+        "directory_hints": [],
+        "reasons": ["artifact-required"],
+    }
+    ArtifactRegistry.sync_planned(state)
+    state.record_tool_call(
+        {"tool": "file", "action": "apply", "args": {"preview_id": "preview-1"}},
+        {
+            "success": True,
+            "data": {
+                "path": "report.txt",
+                "preview_id": "preview-1",
+                "snapshot_id": "snapshot-1",
+                "after_exists": True,
+            },
+        },
+    )
+    state.record_tool_call(
+        {"tool": "template", "action": "read_file", "args": {"path": "report.txt"}},
+        {
+            "success": False,
+            "stderr": "transient read failure",
+            "data": {"date_literals": ["2099-01-01"]},
+        },
+    )
+
+    entry = state.artifact_registry["artifacts"]["report.txt"]
+    assert entry["state"] == "generated"
+    assert set(state.artifact_registry["artifacts"]) == {"report.txt"}
+    assert state.artifact_registry["source_date_literals"] == []
+    issue_before_pruning = RuntimeValidationMixin._artifact_evidence_issue(state, {"artifact-required"})
+    assert issue_before_pruning == ""
+
+    state.record_tool_call(
+        {"tool": "template", "action": "read_file", "args": {"path": "unknown.txt"}},
+        {"success": True, "data": {"path": "unknown.txt"}},
+    )
+    state.record_tool_call(
+        {"tool": "file", "action": "apply", "args": {"preview_id": "outside-preview"}},
+        {
+            "success": True,
+            "data": {
+                "path": str(Path(state.working_directory).parent / "outside.txt"),
+                "preview_id": "outside-preview",
+                "snapshot_id": "outside-snapshot",
+                "after_exists": True,
+            },
+        },
+    )
+
+    assert entry["state"] == "generated"
+    assert set(state.artifact_registry["artifacts"]) == {"report.txt"}
+
+    for index in range(205):
+        state.record_tool_call(
+            {"tool": "template", "action": "read_file", "args": {"path": f"src/{index}.py"}},
+            {"success": True, "data": {}},
+        )
+
+    assert state.tool_history_summary["count"] > 0
+    assert entry["state"] == "generated"
+    assert set(state.artifact_registry["artifacts"]) == {"report.txt"}
+    assert RuntimeValidationMixin._artifact_evidence_issue(state, {"artifact-required"}) == issue_before_pruning
 
 
 def test_progress_counts_only_state_accepted_completed_and_skipped_steps() -> None:

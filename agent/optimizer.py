@@ -50,7 +50,9 @@ class TaskPerformance:
     plan_steps_completed: int
     elapsed_seconds: float
     recorded_at: str
-    schema_version: int = 1
+    exploration_rounds: int = 0
+    model_requests_memory_refinement: int = 0
+    schema_version: int = 3
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -87,6 +89,10 @@ class TaskPerformanceAnalyzer:
                 state.get("final_synthesis_model_request_count"),
                 maximum=self.MAX_COUNT,
             ),
+            "memory_refinement": _bounded_int(
+                state.get("memory_refinement_model_request_count"),
+                maximum=self.MAX_COUNT,
+            ),
         }
         phase_request_total = min(self.MAX_COUNT, sum(model_requests.values()))
         request_total = _bounded_int(state.get("model_request_count"), maximum=self.MAX_COUNT)
@@ -95,13 +101,18 @@ class TaskPerformanceAnalyzer:
 
         tool_calls = state.get("tool_calls")
         tool_records = tool_calls[: self.MAX_COLLECTION_ITEMS] if isinstance(tool_calls, list) else []
+        hot_tool_records = [
+            item for item in tool_records if isinstance(item, Mapping) and item.get("type") != "pruned_history"
+        ]
+        marker_count = sum(isinstance(item, Mapping) and item.get("type") == "pruned_history" for item in tool_records)
+        tool_history_summary = _mapping(state.get("tool_history_summary"))
+        pruned_tool_calls = _bounded_int(tool_history_summary.get("count"), maximum=self.MAX_COUNT)
         tool_failures = sum(
             1
-            for item in tool_records
-            if isinstance(item, Mapping)
-            and isinstance(item.get("result"), Mapping)
-            and item["result"].get("success") is False
+            for item in hot_tool_records
+            if isinstance(item.get("result"), Mapping) and item["result"].get("success") is False
         )
+        tool_failures += _bounded_int(tool_history_summary.get("failure_count"), maximum=self.MAX_COUNT)
 
         plan = state.get("plan")
         plan_records = plan[: self.MAX_COLLECTION_ITEMS] if isinstance(plan, list) else []
@@ -110,6 +121,7 @@ class TaskPerformanceAnalyzer:
         )
 
         execution_budget = _mapping(_mapping(state.get("convergence")).get("execution_budget"))
+        convergence = _mapping(state.get("convergence"))
         budget_used = _mapping(execution_budget.get("used"))
         elapsed_seconds = _bounded_float(
             budget_used.get("elapsed_seconds"),
@@ -129,15 +141,20 @@ class TaskPerformanceAnalyzer:
             model_requests_main_loop=model_requests["main_loop"],
             model_requests_context_compaction=model_requests["context_compaction"],
             model_requests_final_synthesis=model_requests["final_synthesis"],
+            model_requests_memory_refinement=model_requests["memory_refinement"],
             prompt_tokens=_bounded_int(model_metrics.get("prompt_tokens"), maximum=self.MAX_TOKENS),
             completion_tokens=_bounded_int(model_metrics.get("completion_tokens"), maximum=self.MAX_TOKENS),
             total_tokens=_bounded_int(model_metrics.get("total_tokens"), maximum=self.MAX_TOKENS),
-            tool_calls=len(tool_records),
+            tool_calls=min(self.MAX_COUNT, len(tool_records) - marker_count + pruned_tool_calls),
             tool_failures=min(self.MAX_COUNT, tool_failures),
             plan_steps_total=len(plan_records),
             plan_steps_completed=min(self.MAX_COUNT, plan_completed),
             elapsed_seconds=elapsed_seconds,
             recorded_at=str(event.timestamp)[:64],
+            exploration_rounds=_bounded_int(
+                convergence.get("exploration_rounds_observed"),
+                maximum=self.MAX_COUNT,
+            ),
         )
 
 
@@ -149,7 +166,7 @@ class PerformanceHistory:
     changes task execution.
     """
 
-    SCHEMA_VERSION = 1
+    SCHEMA_VERSION = 3
     DEFAULT_MAX_RECORDS = 200
     MAX_RECORDS = 10_000
     MAX_DB_BYTES = 16 * 1024 * 1024
@@ -163,6 +180,7 @@ class PerformanceHistory:
         "model_requests_main_loop",
         "model_requests_context_compaction",
         "model_requests_final_synthesis",
+        "model_requests_memory_refinement",
         "prompt_tokens",
         "completion_tokens",
         "total_tokens",
@@ -172,6 +190,7 @@ class PerformanceHistory:
         "plan_steps_completed",
         "elapsed_seconds",
         "recorded_at",
+        "exploration_rounds",
         "schema_version",
     )
 
@@ -278,6 +297,7 @@ class PerformanceHistory:
                 model_requests_main_loop integer not null,
                 model_requests_context_compaction integer not null,
                 model_requests_final_synthesis integer not null,
+                model_requests_memory_refinement integer not null default 0,
                 prompt_tokens integer not null,
                 completion_tokens integer not null,
                 total_tokens integer not null,
@@ -287,10 +307,18 @@ class PerformanceHistory:
                 plan_steps_completed integer not null,
                 elapsed_seconds real not null,
                 recorded_at text not null,
+                exploration_rounds integer not null default 0,
                 schema_version integer not null
             )
             """
         )
+        columns = {str(row[1]) for row in connection.execute("pragma table_info(task_performance)").fetchall()}
+        if "model_requests_memory_refinement" not in columns:
+            connection.execute(
+                "alter table task_performance add column model_requests_memory_refinement integer not null default 0"
+            )
+        if "exploration_rounds" not in columns:
+            connection.execute("alter table task_performance add column exploration_rounds integer not null default 0")
         connection.execute("create index if not exists idx_task_performance_recent on task_performance(sequence desc)")
 
     def _secure_file(self) -> None:

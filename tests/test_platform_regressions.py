@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import errno
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 from types import SimpleNamespace
 import tomllib
+from zipfile import ZipFile
 
+from docx import Document
 import pytest
 
 from agent import file_lock
@@ -117,17 +121,18 @@ def test_tool_manager_uses_injected_capability_health(tmp_path: Path, make_confi
     assert manager.health is injected
 
 
-def test_optional_dependency_minimums_match_requirements_file() -> None:
+def test_core_requirements_match_project_dependencies() -> None:
     root = Path(__file__).resolve().parents[1]
     project = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))["project"]
-    requirements = {
-        line.split(">=", maxsplit=1)[0].lower(): line
-        for raw_line in (root / "requirements.txt").read_text(encoding="utf-8").splitlines()
-        if (line := raw_line.strip()) and not line.startswith("#")
-    }
+    requirements_text = (root / "requirements.txt").read_text(encoding="utf-8")
+    requirements = [
+        line for raw_line in requirements_text.splitlines() if (line := raw_line.strip()) and not line.startswith("#")
+    ]
+    requirement_names = {line.split(">=", maxsplit=1)[0].lower() for line in requirements}
 
-    assert requirements["chromadb"] == project["optional-dependencies"]["vector"][0]
-    assert requirements["playwright"] == project["optional-dependencies"]["browser"][0]
+    assert requirements == project["dependencies"]
+    assert requirement_names.isdisjoint({"chromadb", "playwright"})
+    assert "pip install -e '.[browser,vector,semantic,document]'" in requirements_text
 
 
 def test_ruff_version_and_lint_contract_are_release_pinned() -> None:
@@ -139,16 +144,99 @@ def test_ruff_version_and_lint_contract_are_release_pinned() -> None:
     assert configuration["tool"]["ruff"]["lint"]["select"] == ["E4", "E7", "E9", "F"]
 
 
-def test_repository_root_exposes_only_current_release_word_documents() -> None:
+def test_release_tree_exposes_only_current_user_documents() -> None:
     root = Path(__file__).resolve().parents[1]
     configuration = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
     version = configuration["project"]["version"]
-    expected = {
+    expected_root_words = {
         f"DeepSeek-Agent-V3-使用说明-{version}.docx",
         f"DeepSeek-Agent-V3-工作日志-{version}.docx",
     }
-    actual = {path.name for path in root.glob("DeepSeek-Agent-V3-*.docx")}
+    actual_root_words = {path.name for path in root.glob("*.docx")}
 
-    assert actual == expected
-    for name in expected:
-        assert (root / "user-docs" / name).is_file()
+    user_docs = root / "user-docs"
+    expected_user_docs = {
+        Path("DeepSeek-Agent-V3-使用说明.md"),
+        Path("DeepSeek-Agent-V3-工作日志.md"),
+        *(Path(name) for name in expected_root_words),
+    }
+    actual_user_docs = {path.relative_to(user_docs) for path in user_docs.rglob("*") if path.is_file()}
+    unexpected_directories = {path.relative_to(user_docs) for path in user_docs.rglob("*") if path.is_dir()}
+
+    assert actual_root_words == expected_root_words
+    assert actual_user_docs == expected_user_docs
+    assert not unexpected_directories
+    assert not any(path.name == "AGENTS.md" for path in actual_user_docs)
+
+
+def test_current_release_word_files_reopen_with_matching_sources_and_metadata(tmp_path: Path) -> None:
+    root = Path(__file__).resolve().parents[1]
+    configuration = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
+    version = configuration["project"]["version"]
+    user_docs = root / "user-docs"
+    documents = (
+        ("使用说明", "更新日期"),
+        ("工作日志", "日期"),
+    )
+
+    for label, date_label in documents:
+        markdown_path = user_docs / f"DeepSeek-Agent-V3-{label}.md"
+        word_name = f"DeepSeek-Agent-V3-{label}-{version}.docx"
+        root_word = root / word_name
+        user_word = user_docs / word_name
+        markdown = markdown_path.read_text(encoding="utf-8")
+        title_match = re.search(r"^#\s+(.+)$", markdown, flags=re.MULTILINE)
+        date_match = re.search(rf"^{date_label}：([0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}})$", markdown, flags=re.MULTILINE)
+
+        assert title_match is not None
+        assert date_match is not None
+        release_date = date_match.group(1)
+        expected_timestamp = datetime.strptime(release_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        assert root_word.read_bytes() == user_word.read_bytes()
+
+        regenerated = tmp_path / word_name
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(root / "scripts" / "build_release_docx.py"),
+                str(markdown_path),
+                str(regenerated),
+                "--version",
+                version,
+                "--release-date",
+                release_date,
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert completed.returncode == 0, completed.stderr
+
+        with ZipFile(root_word) as archive:
+            assert archive.testzip() is None
+            assert {
+                "[Content_Types].xml",
+                "_rels/.rels",
+                "docProps/core.xml",
+                "word/document.xml",
+            }.issubset(archive.namelist())
+
+        reopened = Document(root_word)
+        regenerated_document = Document(regenerated)
+        properties = reopened.core_properties
+        assert properties.title == title_match.group(1).strip()
+        assert properties.author == "Deep Agent"
+        assert properties.last_modified_by == "Deep Agent"
+        assert properties.created == expected_timestamp
+        assert properties.modified == expected_timestamp
+        assert properties.version == version
+        assert properties.keywords == f"DeepSeek Agent V3, v{version}, {release_date}"
+        assert any(paragraph.text.strip() for paragraph in reopened.paragraphs)
+        assert [paragraph.text for paragraph in reopened.paragraphs] == [
+            paragraph.text for paragraph in regenerated_document.paragraphs
+        ]
+        assert [paragraph.text for paragraph in reopened.sections[0].footer.paragraphs] == [
+            paragraph.text for paragraph in regenerated_document.sections[0].footer.paragraphs
+        ]
+        assert version in markdown

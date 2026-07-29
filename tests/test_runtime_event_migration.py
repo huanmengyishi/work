@@ -74,7 +74,7 @@ def _runtime(tmp_path: Path, make_config, *, events=None, sessions=None, memory=
     project = ProjectManager(config).resolve_project(root)
     store = memory or MemoryStore(config)
     tools = ToolManager(config, project, store, yolo=True)
-    return AgentRuntime(
+    return AgentRuntime.with_default_services(
         config=config,
         project=project,
         memory=store,
@@ -116,7 +116,7 @@ def test_progress_is_forwarded_by_best_effort_event_and_not_audited(tmp_path: Pa
     memory = MemoryStore(config)
     events = EventBus()
     seen: list[dict] = []
-    runtime = AgentRuntime(
+    runtime = AgentRuntime.with_default_services(
         config=config,
         project=project,
         memory=memory,
@@ -142,7 +142,7 @@ def test_progress_is_forwarded_by_best_effort_event_and_not_audited(tmp_path: Pa
         failed_progress_calls += 1
         raise RuntimeError("terminal unavailable")
 
-    failing_runtime = AgentRuntime(
+    failing_runtime = AgentRuntime.with_default_services(
         config=config,
         project=project,
         memory=memory,
@@ -165,7 +165,7 @@ def test_required_session_events_are_owned_and_persist_before_terminal(tmp_path:
     events = EventBus()
     sessions = _RecordingSessions(project, calls)
     events.subscribe("task.finished", lambda _event: calls.append("task.finished"), name="order-observer")
-    runtime = AgentRuntime(
+    runtime = AgentRuntime.with_default_services(
         config=config,
         project=project,
         memory=memory,
@@ -203,7 +203,7 @@ def test_missing_required_owner_and_session_write_failure_fail_closed(tmp_path: 
     project = ProjectManager(config).resolve_project(root)
     memory = MemoryStore(config)
     sessions = _FailingSessions(project, fail_checkpoint=True)
-    failing_runtime = AgentRuntime(
+    failing_runtime = AgentRuntime.with_default_services(
         config=config,
         project=project,
         memory=memory,
@@ -229,7 +229,7 @@ def test_finalize_failure_does_not_publish_terminal_or_recurse(tmp_path: Path, m
     terminals: list[str] = []
     events.subscribe("task.finished", lambda event: terminals.append(event.name), name="finished-observer")
     events.subscribe("task.failed", lambda event: terminals.append(event.name), name="failed-observer")
-    runtime = AgentRuntime(
+    runtime = AgentRuntime.with_default_services(
         config=config,
         project=project,
         memory=memory,
@@ -289,7 +289,7 @@ def test_tool_checkpoint_failure_finalizes_once_before_failed_terminal(tmp_path:
     terminals: list[str] = []
     events.subscribe("task.finished", lambda event: terminals.append(event.name), name="finished-observer")
     events.subscribe("task.failed", lambda event: terminals.append(event.name), name="failed-observer")
-    runtime = AgentRuntime(
+    runtime = AgentRuntime.with_default_services(
         config=config,
         project=project,
         memory=memory,
@@ -339,7 +339,7 @@ def test_checkpoint_observer_failure_after_commit_preserves_recoverable_terminal
 
     events = EventBus()
     terminal_names: list[str] = []
-    runtime = AgentRuntime(
+    runtime = AgentRuntime.with_default_services(
         config=config,
         project=project,
         memory=memory,
@@ -415,7 +415,7 @@ def test_tool_checkpoint_and_recovery_finalize_failure_do_not_publish_terminal(
     events = EventBus()
     terminals: list[str] = []
     events.subscribe("task.failed", lambda event: terminals.append(event.name), name="failed-observer")
-    runtime = AgentRuntime(
+    runtime = AgentRuntime.with_default_services(
         config=config,
         project=project,
         memory=memory,

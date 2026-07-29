@@ -4,7 +4,7 @@ from collections import Counter
 from typing import Any
 
 from .config import AppConfig
-from .deepseek import DeepSeekClient
+from .memory_refinement import redact_sensitive_text
 
 
 class ReflectionEngine:
@@ -19,33 +19,22 @@ class ReflectionEngine:
         error: str,
         tool_calls: list[dict[str, Any]],
         success: bool,
+        smart_text: str | None = None,
     ) -> str | None:
         rule = self._rule_reflection(prompt, final, error, tool_calls, success)
-        if not rule or not bool(self.config.get("memory.smart_reflection", False)):
+        smart = redact_sensitive_text(str(smart_text or "").strip(), maximum=5_000)
+        if not smart:
             return rule
-        try:
-            response = DeepSeekClient(self.config).chat(
-                messages=[
-                    {
-                        "role": "system",
-                        "content": (
-                            "Summarize the supplied execution evidence as a concise engineering reflection. "
-                            "Explain why it succeeded or failed, the inefficient step, and one durable prevention. "
-                            "Do not invent facts or include credentials."
-                        ),
-                    },
-                    {
-                        "role": "user",
-                        "content": f"Rule reflection:\n{rule}\n\nFinal:\n{final[:3000]}\nError:\n{error[:2000]}",
-                    },
-                ],
-                tools=None,
-                tool_choice=None,
+        if not rule:
+            rule = "\n".join(
+                [
+                    "Reflection",
+                    f"Request: {redact_sensitive_text(prompt, maximum=1200)}",
+                    f"Outcome: {'success' if success else 'failed'}",
+                    f"Tool calls: {len(tool_calls)}",
+                ]
             )
-            smart = str(response.message.get("content") or "").strip()
-            return f"{rule}\n\nAI Reflection\n{smart[:5000]}" if smart else rule
-        except Exception:
-            return rule
+        return f"{rule}\n\nAI Reflection\n{smart}"
 
     @staticmethod
     def _rule_reflection(
@@ -63,7 +52,7 @@ class ReflectionEngine:
             name = f"{request.get('tool', '?')}.{request.get('action', '?')}"
             durations.append(int(result.get("duration_ms") or 0))
             if not result.get("success"):
-                failures.append((name, str(result.get("stderr") or "failed")[:500]))
+                failures.append((name, redact_sensitive_text(str(result.get("stderr") or "failed"), maximum=500)))
         repeated = Counter(name for name, _ in failures)
         timeouts = [detail for _, detail in failures if "timeout" in detail.lower() or "timed out" in detail.lower()]
         high_cost = len(tool_calls) >= 8 or sum(durations) >= 120_000
@@ -93,7 +82,7 @@ class ReflectionEngine:
         return "\n".join(
             [
                 "Reflection",
-                f"Request: {prompt[:1200]}",
+                f"Request: {redact_sensitive_text(prompt, maximum=1200)}",
                 f"Outcome: {'success' if success else 'failed'}",
                 "Observations:",
                 *[f"- {item}" for item in observations],
@@ -101,6 +90,6 @@ class ReflectionEngine:
                 evidence,
                 "Prevention:",
                 "Use Task Graph dependencies, capability health, and execution context before retrying.",
-                f"Result excerpt: {(final or error)[:1200]}",
+                f"Result excerpt: {redact_sensitive_text(final or error, maximum=1200)}",
             ]
         )

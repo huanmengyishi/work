@@ -605,7 +605,9 @@ def test_runtime_uses_parallel_reads_and_records_results_in_model_order(tmp_path
             assert self.responses
             return ChatResponse(message=self.responses.pop(0), raw={})
 
-    runtime = AgentRuntime(config=config, project=project, memory=memory, tools=tools, client=FakeClient())
+    runtime = AgentRuntime.with_default_services(
+        config=config, project=project, memory=memory, tools=tools, client=FakeClient()
+    )
 
     assert runtime.run("what is the probe answer") == "probe answer"
     state = runtime.sessions.load(str(runtime.last_session_id)).state
@@ -659,7 +661,7 @@ def test_runtime_checkpoints_complete_tool_pairs_before_reraising_keyboard_inter
                 finish_reason="tool_calls",
             )
 
-    runtime = AgentRuntime(
+    runtime = AgentRuntime.with_default_services(
         config=config,
         project=project,
         memory=memory,

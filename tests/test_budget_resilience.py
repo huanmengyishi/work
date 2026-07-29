@@ -8,12 +8,13 @@ from agent.budget import ExecutionBudgetController, ExecutionBudgetExceeded
 from agent.deepseek import ChatResponse
 from agent.memory import MemoryStore
 from agent.project import ProjectManager
-from agent.resilience import ErrorCategory, ResiliencePolicy
+from agent.resilience import CapabilityRecoveryController, ErrorCategory, ResiliencePolicy
 from agent.runtime import AgentRuntime
 from agent.state import AgentState, PlanStep
 from agent.task_plan import TaskPlanFactory
-from agent.task_router import TaskRouter
+from agent.task_router import TASK_TYPES, TaskRouter
 from agent.tools import ToolManager
+from agent.tools.base import ToolResult
 
 
 def _state() -> AgentState:
@@ -149,7 +150,7 @@ def test_runtime_budget_exhaustion_is_a_saved_resumable_failure(tmp_path, make_c
             )
 
     client = Client()
-    runtime = AgentRuntime(
+    runtime = AgentRuntime.with_default_services(
         config=config,
         project=project,
         memory=memory,
@@ -190,6 +191,148 @@ def test_resilience_policy_is_bounded_and_classifies_without_runtime_retry(make_
     assert policy.classify(PermissionError("denied")) is ErrorCategory.PERMISSION
 
 
+def test_capability_recovery_applies_round_backoff_and_health_circuit(make_config) -> None:
+    policy = ResiliencePolicy.from_config(
+        make_config(
+            {
+                "runtime": {
+                    "resilience": {
+                        "capability_backoff_enabled": True,
+                        "max_capability_backoff_rounds": 8,
+                        "circuit_recovery_rounds": 4,
+                    }
+                }
+            }
+        )
+    )
+    controller = CapabilityRecoveryController(policy)
+    convergence: dict[str, object] = {}
+
+    first = controller.observe(
+        convergence,
+        "shell.run",
+        current_round=1,
+        success=False,
+        health_failure=True,
+        health_status="Available",
+    )
+    assert first.action == "backoff"
+    assert first.blocked_through_round == 2
+    assert controller.before_call(convergence, "shell.run", current_round=2).allowed is False
+    assert controller.before_call(convergence, "shell.run", current_round=3).allowed is True
+
+    opened = controller.observe(
+        convergence,
+        "shell.run",
+        current_round=3,
+        success=False,
+        health_failure=True,
+        health_status="Broken",
+    )
+    assert opened.action == "skip_broken"
+    assert opened.blocked_through_round == 7
+    assert controller.before_call(convergence, "shell.run", current_round=7).allowed is False
+    assert controller.before_call(convergence, "shell.run", current_round=8).allowed is True
+
+    reset = controller.observe(
+        convergence,
+        "shell.run",
+        current_round=8,
+        success=True,
+        health_failure=False,
+        health_status="Available",
+    )
+    assert reset.action == "reset"
+    assert controller.before_call(convergence, "shell.run", current_round=8).allowed is True
+
+
+def test_runtime_capability_circuit_prevents_immediate_repeat_execution(tmp_path, make_config, monkeypatch) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    config = make_config(
+        {
+            "runtime": {
+                "task_mode": "simple",
+                "max_tool_rounds": 4,
+                "max_tool_rounds_hard_limit": 4,
+                "capability_failure_threshold": 1,
+                "resilience": {
+                    "max_corrective_rounds": 0,
+                    "capability_backoff_enabled": True,
+                    "circuit_recovery_rounds": 4,
+                },
+            }
+        }
+    )
+    project = ProjectManager(config).resolve_project(root)
+    memory = MemoryStore(config)
+
+    class Client:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def chat(self, **_kwargs):
+            self.calls += 1
+            if self.calls <= 2:
+                request_id = f"repeat-{self.calls}"
+                return ChatResponse(
+                    message={
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": request_id,
+                                "type": "function",
+                                "function": {
+                                    "name": "list_dir",
+                                    "arguments": '{"path":".","depth":1}',
+                                },
+                            }
+                        ],
+                    },
+                    raw={},
+                    finish_reason="tool_calls",
+                )
+            return ChatResponse(
+                message={"role": "assistant", "content": "The dependency remained unavailable."},
+                raw={},
+                finish_reason="stop",
+            )
+
+    client = Client()
+    tools = ToolManager(config, project, memory, yolo=True)
+    executions = 0
+
+    def unavailable_list_dir(**_kwargs):
+        nonlocal executions
+        executions += 1
+        return ToolResult(False, "", "dependency unavailable")
+
+    tools.registry._handlers["template.list_dir"] = unavailable_list_dir
+    runtime = AgentRuntime.with_default_services(
+        config=config,
+        project=project,
+        memory=memory,
+        tools=tools,
+        client=client,
+    )
+    prompt = "Inspect the project once and report the bounded result."
+    route = replace(runtime.task_router.route(prompt), require_plan=False, max_tool_rounds=4)
+    monkeypatch.setattr(runtime.task_router, "route", lambda *_args, **_kwargs: route)
+
+    runtime.run(prompt)
+
+    state = runtime.sessions.load(runtime.last_session_id).state
+    assert executions == 1
+    assert client.calls == 3
+    assert len(state.tool_calls) == 2
+    assert state.tool_calls[0]["result"]["stderr"] == "dependency unavailable"
+    assert state.tool_calls[1]["result"]["data"]["runtime_denied"] is True
+    recovery = state.convergence["capability_recovery"]["template.list_dir"]
+    assert recovery["circuit_open"] is True
+    assert recovery["action"] == "skip_broken"
+
+
 def test_plan_step_schema_7_round_trips_semantics_and_factory_uses_task_type(make_config) -> None:
     legacy = PlanStep.from_dict({"id": "verify", "title": "Verify"})
     assert legacy.step_type == "verify"
@@ -213,3 +356,55 @@ def test_plan_step_schema_7_round_trips_semantics_and_factory_uses_task_type(mak
     assert next(item for item in bug_plan if item["id"] == "implement")["step_type"] == "implement"
     assert next(item for item in review_plan if item["id"] == "synthesize")["step_type"] == "synthesize"
     assert bug_plan[-1]["validation_rules"] == ["managed_validation"]
+
+
+@pytest.mark.parametrize("task_type", sorted(TASK_TYPES))
+def test_task_plan_factory_covers_every_registered_task_type(task_type, make_config) -> None:
+    route = TaskRouter(make_config()).route("Review this repository and produce bounded evidence")
+    reasons: tuple[str, ...] = ()
+    artifact_hints: tuple[str, ...] = ()
+    if task_type == "document_workflow":
+        reasons = ("artifact-required", "word-artifact-required")
+        artifact_hints = ("report.docx",)
+    route = replace(
+        route,
+        task_type=task_type,
+        require_plan=True,
+        reasons=reasons,
+        artifact_hints=artifact_hints,
+    )
+
+    plan = TaskPlanFactory().build(route)
+
+    assert plan
+    assert plan[0]["id"] == "scope"
+    assert [step["status"] for step in plan].count("in_progress") == 1
+    assert all(step["status"] in {"in_progress", "pending"} for step in plan)
+    assert all(step["estimated_tool_rounds"] >= 1 for step in plan)
+    assert all(step["progress_weight"] > 0 for step in plan)
+    known_ids: set[str] = set()
+    for step in plan:
+        assert set(step.get("dependencies", [])) <= known_ids
+        known_ids.add(step["id"])
+    if task_type in {"bug_fix", "feature_development", "refactor"}:
+        assert any(step["step_type"] == "implement" for step in plan)
+    elif task_type == "document_workflow":
+        assert any(step["step_type"] == "render" for step in plan)
+        assert plan[-1]["artifact_ids"] == ["report.docx"]
+        assert "document_parse" in plan[-1]["validation_rules"]
+    else:
+        assert any(step["step_type"] == "synthesize" for step in plan)
+
+
+def test_task_plan_factory_routes_mutation_reason_to_change_strategy(make_config) -> None:
+    route = replace(
+        TaskRouter(make_config()).route("Explain this module"),
+        task_type="code_explanation",
+        require_plan=True,
+        reasons=("mutation-request",),
+    )
+
+    plan = TaskPlanFactory().build(route)
+
+    assert any(step["id"] == "implement" and step["step_type"] == "implement" for step in plan)
+    assert plan[-1]["validation_rules"] == ["managed_validation"]

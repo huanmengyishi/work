@@ -486,6 +486,37 @@ def test_document_input_size_is_bounded(tmp_path: Path, make_config) -> None:
     assert "document exceeds 100 bytes" in result.stderr
 
 
+@pytest.mark.parametrize(
+    ("name", "content", "detected_format"),
+    [
+        ("report.json", '{"ok": true}\n', "json"),
+        ("report.yaml", "ok: true\n", "yaml"),
+        ("report.py", "value = 42\n", "python"),
+        ("report.md", "# Verified\n", "text"),
+    ],
+)
+def test_document_parse_emits_managed_receipts_for_supported_text_artifacts(
+    tmp_path: Path,
+    make_config,
+    name: str,
+    content: str,
+    detected_format: str,
+) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    (root / name).write_text(content, encoding="utf-8")
+    _, _, _, tools = build_manager(root, make_config, yolo=True)
+
+    _, result = tools.execute_model_call("document_parse", {"path": name})
+
+    assert result.success is True
+    receipt = result.data[ARTIFACT_VERIFICATION_METADATA_KEY]
+    assert receipt["passed"] is True
+    assert receipt["format"] == detected_format
+    assert receipt["path"] == name
+    assert receipt["content_complete"] is True
+
+
 def test_document_render_docx_uses_preview_apply_and_parse_verification(tmp_path: Path, make_config) -> None:
     root = tmp_path / "project"
     root.mkdir()

@@ -17,6 +17,10 @@ def make_config(tmp_path: Path):
                 "vector_path": str(tmp_path / "data" / "vector"),
                 "retrieval_limit": 8,
                 "vector_enabled": False,
+                # Most tests exercise unrelated Runtime protocol behavior with
+                # finite fake response queues. Smart reflection has dedicated
+                # boundary tests and remains enabled in production defaults.
+                "smart_reflection": False,
             },
             "events": {"jsonl_log": False},
         }

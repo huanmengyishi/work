@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import math
 from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime
 from typing import Any, ClassVar
@@ -8,6 +10,16 @@ from .contracts import (
     AGENT_STATE_FROZEN_FIELDS,
     AGENT_STATE_SCHEMA_VERSION,
     AGENT_STATE_SERIALIZED_FIELDS,
+)
+from .constants import (
+    MAX_AGENT_STATE_BYTES,
+    MAX_AGENT_STATE_COLLECTION_ITEMS,
+    MAX_AGENT_STATE_KEY_BYTES,
+    MAX_AGENT_STATE_MAPPING_KEYS,
+    MAX_AGENT_STATE_NESTING_DEPTH,
+    MAX_AGENT_STATE_RECORD_BYTES,
+    MAX_TOOL_CALLS_IN_STATE,
+    MAX_TOOL_HISTORY_CAPABILITIES,
 )
 from .model_router import COST_CLASSES, MODEL_TIERS
 from .project import Project
@@ -182,11 +194,16 @@ class AgentState:
     convergence: dict[str, Any] = field(default_factory=dict)
     model_metrics: dict[str, Any] = field(default_factory=dict)
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
+    tool_history_summary: dict[str, Any] = field(default_factory=dict)
+    artifact_registry: dict[str, Any] = field(default_factory=dict)
+    resume_checkpoint: dict[str, Any] = field(default_factory=dict)
+    intent_journal_head: dict[str, Any] = field(default_factory=dict)
     round: int = 0
     model_request_count: int = 0
     main_loop_model_request_count: int = 0
     context_compaction_model_request_count: int = 0
     final_synthesis_model_request_count: int = 0
+    memory_refinement_model_request_count: int = 0
     turn: int = 1
     final_answer: str = ""
     error: str = ""
@@ -236,6 +253,8 @@ class AgentState:
     def from_dict(cls, value: dict[str, Any]) -> "AgentState":
         if not isinstance(value, dict):
             raise TypeError("AgentState record must be a dictionary")
+        _validate_serialized_state(value, source="AgentState input")
+        _validate_raw_state_shape(value)
         plan = [PlanStep.from_dict(item) for item in value.get("plan", []) if isinstance(item, dict)]
         working_directory = str(value.get("working_directory") or "")
         git_branch = value.get("git_branch")
@@ -269,6 +288,10 @@ class AgentState:
             convergence=dict(value.get("convergence") or {}),
             model_metrics=dict(value.get("model_metrics") or {}),
             tool_calls=list(value.get("tool_calls") or []),
+            tool_history_summary=dict(value.get("tool_history_summary") or {}),
+            artifact_registry=dict(value.get("artifact_registry") or {}),
+            resume_checkpoint=dict(value.get("resume_checkpoint") or {}),
+            intent_journal_head=dict(value.get("intent_journal_head") or {}),
             round=int(value.get("round") or 0),
             model_request_count=max(0, int(value.get("model_request_count") or 0)),
             main_loop_model_request_count=max(0, int(value.get("main_loop_model_request_count") or 0)),
@@ -280,6 +303,10 @@ class AgentState:
                 0,
                 int(value.get("final_synthesis_model_request_count") or 0),
             ),
+            memory_refinement_model_request_count=max(
+                0,
+                int(value.get("memory_refinement_model_request_count") or 0),
+            ),
             turn=int(value.get("turn") or 1),
             final_answer=str(value.get("final_answer") or ""),
             error=str(value.get("error") or ""),
@@ -290,6 +317,7 @@ class AgentState:
         )
         if state.schema_version < cls.SCHEMA_VERSION:
             state._normalize_legacy_derived_fields()
+        state._prune_tool_calls()
         state._frozen_baseline = state.frozen_values()
         return state.validate()
 
@@ -324,6 +352,7 @@ class AgentState:
             "main_loop_model_request_count",
             "context_compaction_model_request_count",
             "final_synthesis_model_request_count",
+            "memory_refinement_model_request_count",
         ):
             if not _is_non_negative_int(getattr(self, field_name)):
                 raise ValueError(f"AgentState.{field_name} must be a non-negative integer")
@@ -331,6 +360,7 @@ class AgentState:
             self.main_loop_model_request_count
             + self.context_compaction_model_request_count
             + self.final_synthesis_model_request_count
+            + self.memory_refinement_model_request_count
         ):
             raise ValueError("AgentState.model_request_count must equal the sum of request phase counters")
         if not _is_positive_int(self.turn):
@@ -356,6 +386,14 @@ class AgentState:
         for key in ("http_attempt_count", "prompt_tokens", "completion_tokens", "total_tokens"):
             if not _is_non_negative_int(self.model_metrics.get(key, 0)):
                 raise ValueError(f"AgentState.model_metrics.{key} must be a non-negative integer")
+        for field_name in (
+            "tool_history_summary",
+            "artifact_registry",
+            "resume_checkpoint",
+            "intent_journal_head",
+        ):
+            if not isinstance(getattr(self, field_name), dict):
+                raise ValueError(f"AgentState.{field_name} must be a dictionary")
         if self.execution_context is not None:
             if not isinstance(self.execution_context, ExecutionContext):
                 raise ValueError("AgentState.execution_context must be an ExecutionContext")
@@ -365,6 +403,7 @@ class AgentState:
         _validate_iso_timestamp(self.created_at, "AgentState.created_at")
         _validate_iso_timestamp(self.updated_at, "AgentState.updated_at")
         self.validate_frozen_fields(self._frozen_baseline)
+        _validate_serialized_state(self._serialized_payload(), source="AgentState")
         return self
 
     def frozen_values(self) -> dict[str, Any]:
@@ -490,6 +529,8 @@ class AgentState:
             raise ValueError("AgentState.loaded_tools must be unique")
         if not isinstance(self.tool_calls, list) or not all(isinstance(item, dict) for item in self.tool_calls):
             raise ValueError("AgentState.tool_calls must contain dictionaries")
+        if len(self.tool_calls) > MAX_TOOL_CALLS_IN_STATE:
+            raise ValueError(f"AgentState.tool_calls exceeds the {MAX_TOOL_CALLS_IN_STATE} record hot limit")
         if not isinstance(self.request_history, list) or not all(
             isinstance(item, str) and item.strip() for item in self.request_history
         ):
@@ -571,6 +612,7 @@ class AgentState:
         self.main_loop_model_request_count = 0
         self.context_compaction_model_request_count = 0
         self.final_synthesis_model_request_count = 0
+        self.memory_refinement_model_request_count = 0
         # Transport attempts, token usage, and convergence gates describe one
         # Session turn. Preserve durable targets and compaction-circuit state,
         # but do not carry an exhausted read/stall window into a user-initiated
@@ -582,6 +624,7 @@ class AgentState:
             "validation_attachment_reads_used",
             "consecutive_read_only_rounds",
             "low_yield_rounds",
+            "exploration_rounds_observed",
             "nudge_count",
             "nudge_sent_for_stall",
             "hard_notice_sent",
@@ -620,6 +663,7 @@ class AgentState:
             "main_loop": "main_loop_model_request_count",
             "context_compaction": "context_compaction_model_request_count",
             "final_synthesis": "final_synthesis_model_request_count",
+            "memory_refinement": "memory_refinement_model_request_count",
         }
         field_name = counters.get(phase)
         if field_name is None:
@@ -650,6 +694,10 @@ class AgentState:
         self.validate_frozen_fields(self._frozen_baseline)
 
     def record_tool_call(self, request: dict[str, Any], result: dict[str, Any]) -> None:
+        # Import locally to keep AgentState's schema module independent from
+        # artifact verification implementation at import time.
+        from .artifact_registry import ArtifactRegistry
+
         self.tool_calls.append(
             {
                 "turn": self.turn,
@@ -659,9 +707,98 @@ class AgentState:
                 "recorded_at": utc_now_iso(),
             }
         )
+        ArtifactRegistry.observe_state(self, request, result)
+        self._prune_tool_calls()
+        self.resume_checkpoint = {
+            "schema_version": 1,
+            "turn": self.turn,
+            "round": self.round,
+            "tool_call_count": self._hot_tool_call_count(),
+            "pruned_tool_call_count": int(self.tool_history_summary.get("count") or 0),
+            "last_request_id": str(request.get("request_id") or "")[:200],
+            "phase": "tool_result_recorded",
+            "recorded_at": utc_now_iso(),
+        }
         self._update_execution_context(request, result)
         self.touch()
         self.validate_frozen_fields(self._frozen_baseline)
+
+    def record_checkpoint(self, *, phase: str, message_count: int) -> None:
+        """Persist a bounded locator for deterministic Resume diagnostics."""
+
+        self.resume_checkpoint = {
+            "schema_version": 1,
+            "turn": self.turn,
+            "round": self.round,
+            "tool_call_count": self._hot_tool_call_count(),
+            "pruned_tool_call_count": int(self.tool_history_summary.get("count") or 0),
+            "model_request_count": self.model_request_count,
+            "message_count": max(0, min(int(message_count), 20_000)),
+            "phase": str(phase).strip()[:64] or "checkpoint",
+            "recorded_at": utc_now_iso(),
+        }
+        self.touch()
+
+    def _hot_tool_call_count(self) -> int:
+        """Count actual hot receipts without the metadata-only prune marker."""
+
+        return sum(1 for item in self.tool_calls if item.get("type") != "pruned_history")
+
+    def _prune_tool_calls(self) -> None:
+        """Keep a 200-record hot window plus bounded aggregate audit facts."""
+
+        marker = next((item for item in self.tool_calls if item.get("type") == "pruned_history"), None)
+        records = [item for item in self.tool_calls if item.get("type") != "pruned_history"]
+        if marker is None and len(records) <= MAX_TOOL_CALLS_IN_STATE:
+            return
+        hot_limit = MAX_TOOL_CALLS_IN_STATE - 1
+        if len(records) <= hot_limit:
+            self.tool_calls = [marker, *records] if marker is not None else records
+            return
+        removed = records[:-hot_limit]
+        retained = records[-hot_limit:]
+        previous_count = int(self.tool_history_summary.get("count") or 0)
+        success_count = int(self.tool_history_summary.get("success_count") or 0)
+        failure_count = int(self.tool_history_summary.get("failure_count") or 0)
+        capabilities = [str(item) for item in self.tool_history_summary.get("capabilities", []) if str(item)]
+        turns = [
+            int(item.get("turn") or 1)
+            for item in removed
+            if isinstance(item.get("turn") or 1, int) and not isinstance(item.get("turn") or 1, bool)
+        ]
+        for item in removed:
+            request = item.get("request") if isinstance(item.get("request"), dict) else {}
+            result = item.get("result") if isinstance(item.get("result"), dict) else {}
+            capability = str(request.get("capability") or "").strip()
+            if not capability:
+                capability = f"{request.get('tool', '?')}.{request.get('action', '?')}"
+            if capability and capability not in capabilities:
+                capabilities.append(capability[:160])
+            if result.get("success") is True:
+                success_count += 1
+            else:
+                failure_count += 1
+        previous_min = self.tool_history_summary.get("first_turn")
+        previous_max = self.tool_history_summary.get("last_turn")
+        all_min = [value for value in (previous_min, min(turns) if turns else None) if isinstance(value, int)]
+        all_max = [value for value in (previous_max, max(turns) if turns else None) if isinstance(value, int)]
+        self.tool_history_summary = {
+            "schema_version": 1,
+            "count": previous_count + len(removed),
+            "success_count": success_count,
+            "failure_count": failure_count,
+            "capabilities": capabilities[:MAX_TOOL_HISTORY_CAPABILITIES],
+            "first_turn": min(all_min) if all_min else 1,
+            "last_turn": max(all_max) if all_max else self.turn,
+        }
+        summary_marker = {
+            "type": "pruned_history",
+            "turn": max(1, int(self.tool_history_summary["last_turn"])),
+            "round": 0,
+            "count": self.tool_history_summary["count"],
+            "capabilities": list(self.tool_history_summary["capabilities"]),
+        }
+        self.tool_calls = [summary_marker, *retained]
 
     def _update_execution_context(self, request: dict[str, Any], result: dict[str, Any]) -> None:
         if self.execution_context is None:
@@ -698,6 +835,9 @@ class AgentState:
 
     def to_dict(self) -> dict[str, Any]:
         self.validate()
+        return self._serialized_payload()
+
+    def _serialized_payload(self) -> dict[str, Any]:
         serialized = asdict(self)
         return {field_name: serialized[field_name] for field_name in self.SERIALIZED_FIELDS}
 
@@ -712,6 +852,126 @@ def limit_state_value(value: Any, *, depth: int = 0) -> Any:
     if isinstance(value, str):
         return value if len(value) <= 5000 else value[:5000] + "...[truncated]"
     return value
+
+
+_RAW_MAPPING_FIELDS = frozenset(
+    {
+        "project",
+        "execution_context",
+        "task_strategy",
+        "task_route",
+        "model_route",
+        "context_manifest",
+        "convergence",
+        "model_metrics",
+        "tool_history_summary",
+        "artifact_registry",
+        "resume_checkpoint",
+        "intent_journal_head",
+    }
+)
+_RAW_LIST_FIELDS = frozenset(
+    {
+        "request_history",
+        "plan",
+        "completed_steps",
+        "loaded_memories",
+        "loaded_tools",
+        "tool_calls",
+    }
+)
+
+
+def _validate_raw_state_shape(value: dict[str, Any]) -> None:
+    """Reject unsafe coercions before migration constructs mutable records."""
+
+    for field_name in _RAW_MAPPING_FIELDS:
+        raw = value.get(field_name)
+        if raw is not None and not isinstance(raw, dict):
+            raise ValueError(f"AgentState input {field_name} must be a dictionary")
+    for field_name in _RAW_LIST_FIELDS:
+        raw = value.get(field_name)
+        if raw is not None and not isinstance(raw, list):
+            raise ValueError(f"AgentState input {field_name} must be a list")
+    for field_name in ("plan", "tool_calls"):
+        raw = value.get(field_name) or []
+        if not all(isinstance(item, dict) for item in raw):
+            raise ValueError(f"AgentState input {field_name} must contain dictionaries")
+
+
+def _validate_serialized_state(value: dict[str, Any], *, source: str) -> None:
+    """Enforce deterministic JSON/UTF-8 limits before load or persistence."""
+
+    _validate_state_tree(value, source=source, depth=0, active=set())
+    tool_calls = value.get("tool_calls") or []
+    if isinstance(tool_calls, list):
+        for index, record in enumerate(tool_calls):
+            if not isinstance(record, dict):
+                continue
+            record_bytes = _serialized_utf8_bytes(record, source=f"{source}.tool_calls[{index}]")
+            if record_bytes > MAX_AGENT_STATE_RECORD_BYTES:
+                raise ValueError(
+                    f"{source}.tool_calls[{index}] exceeds the {MAX_AGENT_STATE_RECORD_BYTES} UTF-8 byte limit"
+                )
+    total_bytes = _serialized_utf8_bytes(value, source=source)
+    if total_bytes > MAX_AGENT_STATE_BYTES:
+        raise ValueError(f"{source} exceeds the {MAX_AGENT_STATE_BYTES} serialized UTF-8 byte limit")
+
+
+def _validate_state_tree(value: Any, *, source: str, depth: int, active: set[int]) -> None:
+    if depth > MAX_AGENT_STATE_NESTING_DEPTH:
+        raise ValueError(f"{source} exceeds the {MAX_AGENT_STATE_NESTING_DEPTH} level nesting limit")
+    if isinstance(value, dict):
+        if len(value) > MAX_AGENT_STATE_MAPPING_KEYS:
+            raise ValueError(f"{source} dictionary exceeds the {MAX_AGENT_STATE_MAPPING_KEYS} key limit")
+        identity = id(value)
+        if identity in active:
+            raise ValueError(f"{source} contains a recursive dictionary")
+        active.add(identity)
+        try:
+            for key, item in value.items():
+                if not isinstance(key, str):
+                    raise ValueError(f"{source} dictionary keys must be strings")
+                if len(key.encode("utf-8")) > MAX_AGENT_STATE_KEY_BYTES:
+                    raise ValueError(
+                        f"{source} dictionary key exceeds the {MAX_AGENT_STATE_KEY_BYTES} UTF-8 byte limit"
+                    )
+                _validate_state_tree(item, source=source, depth=depth + 1, active=active)
+        finally:
+            active.remove(identity)
+        return
+    if isinstance(value, (list, tuple)):
+        if len(value) > MAX_AGENT_STATE_COLLECTION_ITEMS:
+            raise ValueError(f"{source} collection exceeds the {MAX_AGENT_STATE_COLLECTION_ITEMS} item limit")
+        identity = id(value)
+        if identity in active:
+            raise ValueError(f"{source} contains a recursive collection")
+        active.add(identity)
+        try:
+            for item in value:
+                _validate_state_tree(item, source=source, depth=depth + 1, active=active)
+        finally:
+            active.remove(identity)
+        return
+    if value is None or isinstance(value, (str, bool, int)):
+        return
+    if isinstance(value, float) and math.isfinite(value):
+        return
+    raise ValueError(f"{source} contains a value that cannot be serialized safely")
+
+
+def _serialized_utf8_bytes(value: Any, *, source: str) -> int:
+    try:
+        encoded = json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError, RecursionError, UnicodeError) as exc:
+        raise ValueError(f"{source} cannot be serialized as bounded JSON") from exc
+    return len(encoded)
 
 
 def _non_empty_string(value: Any, field_name: str) -> str:

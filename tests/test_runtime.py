@@ -134,7 +134,7 @@ def test_runtime_builds_context_package_before_initial_and_resume_prompt(tmp_pat
     memory = MemoryStore(config)
     context_builder = RecordingContextBuilder(config)
     prompt_builder = RecordingPromptBuilder()
-    runtime = AgentRuntime(
+    runtime = AgentRuntime.with_default_services(
         config=config,
         project=project,
         memory=memory,
@@ -194,7 +194,9 @@ def test_runtime_checkpoint_resume_events_and_memory_pipeline(tmp_path: Path, ma
             {"role": "assistant", "content": "second complete"},
         ]
     )
-    runtime = AgentRuntime(config=config, project=project, memory=memory, tools=tools, client=client)
+    runtime = AgentRuntime.with_default_services(
+        config=config, project=project, memory=memory, tools=tools, client=client
+    )
 
     assert runtime.run("inspect the project") == "first complete"
     session_id = runtime.last_session_id
@@ -205,7 +207,7 @@ def test_runtime_checkpoint_resume_events_and_memory_pipeline(tmp_path: Path, ma
     payload = json.loads(session_path.read_text(encoding="utf-8"))
     state = payload["state"]
     assert state["status"] == "completed"
-    assert state["schema_version"] == 7
+    assert state["schema_version"] == 8
     assert state["task_route"]["mode"] == "standard"
     assert state["model_route"]["provider"] == "deepseek"
     assert state["context_manifest"]["used_chars"] <= state["context_manifest"]["max_chars"]
@@ -248,7 +250,9 @@ def test_runtime_injects_recovery_memory_after_tool_failure(tmp_path: Path, make
             {"role": "assistant", "content": "diagnosed"},
         ]
     )
-    runtime = AgentRuntime(config=config, project=project, memory=memory, tools=tools, client=client)
+    runtime = AgentRuntime.with_default_services(
+        config=config, project=project, memory=memory, tools=tools, client=client
+    )
     assert runtime.run("run the missing command") == "diagnosed"
     assert any("Failure Recovery Memory" in str(message.get("content")) for message in client.requests[1])
 
@@ -281,7 +285,7 @@ def test_runtime_adapts_deep_task_and_reports_reasoning_progress(tmp_path: Path,
         ]
     )
     progress: list[dict] = []
-    runtime = AgentRuntime(
+    runtime = AgentRuntime.with_default_services(
         config=config,
         project=project,
         memory=memory,
@@ -318,7 +322,7 @@ def test_runtime_rejects_progress_note_then_accepts_completed_answer(tmp_path: P
             {"role": "assistant", "content": "已检查当前项目，并给出基于文件列表的建议。"},
         ]
     )
-    runtime = AgentRuntime(
+    runtime = AgentRuntime.with_default_services(
         config=config,
         project=project,
         memory=memory,
@@ -663,7 +667,9 @@ def test_soft_target_stays_open_until_named_artifact_is_applied(
             {"role": "assistant", "content": "Created the requested summary.md through the managed workflow."},
         ]
     )
-    runtime = AgentRuntime(config=config, project=project, memory=memory, tools=tools, client=client)
+    runtime = AgentRuntime.with_default_services(
+        config=config, project=project, memory=memory, tools=tools, client=client
+    )
     prompt = "Create the report file summary.md"
     forced_route = replace(runtime.task_router.route(prompt), mode="standard", max_tool_rounds=1)
     monkeypatch.setattr(runtime.task_router, "route", lambda *_args, **_kwargs: forced_route)
@@ -708,7 +714,7 @@ def test_missing_artifact_uses_hard_budget_before_tool_free_failure(
             {"role": "assistant", "content": "The requested artifact was not created."},
         ]
     )
-    runtime = AgentRuntime(
+    runtime = AgentRuntime.with_default_services(
         config=config,
         project=project,
         memory=memory,
@@ -864,7 +870,7 @@ def test_runtime_uses_separate_final_synthesis_after_last_tool_round(tmp_path: P
     model_events = []
     events.subscribe("model.requested", model_events.append, name="test.model-requested")
     events.subscribe("model.responded", model_events.append, name="test.model-responded")
-    runtime = AgentRuntime(
+    runtime = AgentRuntime.with_default_services(
         config=config,
         project=project,
         memory=memory,
@@ -899,7 +905,7 @@ def test_resume_package_preserves_original_objective_and_tool_evidence(tmp_path:
             {"role": "assistant", "content": "continued"},
         ]
     )
-    runtime = AgentRuntime(
+    runtime = AgentRuntime.with_default_services(
         config=config,
         project=project,
         memory=memory,
@@ -944,7 +950,9 @@ def test_short_resume_keeps_deep_strategy_and_plan(tmp_path: Path, make_config) 
             {"role": "assistant", "content": "continued"},
         ]
     )
-    runtime = AgentRuntime(config=config, project=project, memory=memory, tools=tools, client=client)
+    runtime = AgentRuntime.with_default_services(
+        config=config, project=project, memory=memory, tools=tools, client=client
+    )
 
     assert runtime.run("全面审计整个代码库并深度重构所有安全问题") == "checkpoint"
     session_id = runtime.last_session_id
@@ -979,7 +987,7 @@ def test_concurrent_resume_rejects_second_session_turn(tmp_path: Path, make_conf
             assert release.wait(timeout=5)
             return super().chat(**kwargs)
 
-    initial_runtime = AgentRuntime(
+    initial_runtime = AgentRuntime.with_default_services(
         config=config,
         project=project,
         memory=memory,
@@ -988,14 +996,14 @@ def test_concurrent_resume_rejects_second_session_turn(tmp_path: Path, make_conf
     )
     assert initial_runtime.run("create resumable session") == "checkpoint"
     session_id = initial_runtime.last_session_id
-    first = AgentRuntime(
+    first = AgentRuntime.with_default_services(
         config=config,
         project=project,
         memory=memory,
         tools=ToolManager(config, project, memory, yolo=True),
         client=BlockingClient([{"role": "assistant", "content": "first"}]),
     )
-    second = AgentRuntime(
+    second = AgentRuntime.with_default_services(
         config=config,
         project=project,
         memory=memory,
@@ -1031,7 +1039,7 @@ def test_runtime_respects_small_context_hard_limit_and_input_limit(tmp_path: Pat
     project = ProjectManager(config).resolve_project(root)
     memory = MemoryStore(config)
     client = RecordingClient([{"role": "assistant", "content": "bounded"}])
-    runtime = AgentRuntime(
+    runtime = AgentRuntime.with_default_services(
         config=config,
         project=project,
         memory=memory,
@@ -1060,7 +1068,7 @@ def test_resume_repeated_failure_escalates_model_without_losing_task_type(tmp_pa
             {"role": "assistant", "content": "recovered"},
         ]
     )
-    runtime = AgentRuntime(
+    runtime = AgentRuntime.with_default_services(
         config=config,
         project=project,
         memory=memory,
@@ -1104,7 +1112,7 @@ def test_runtime_falls_back_from_malformed_context_limits(tmp_path: Path, make_c
     )
     project = ProjectManager(config).resolve_project(root)
     memory = MemoryStore(config)
-    runtime = AgentRuntime(
+    runtime = AgentRuntime.with_default_services(
         config=config,
         project=project,
         memory=memory,
@@ -1145,7 +1153,7 @@ def test_resume_keeps_large_scope_but_upgrades_architecture_model(tmp_path: Path
             {"role": "assistant", "content": "architecture complete"},
         ]
     )
-    runtime = AgentRuntime(
+    runtime = AgentRuntime.with_default_services(
         config=config,
         project=project,
         memory=memory,

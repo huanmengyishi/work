@@ -10,13 +10,13 @@ from uuid import uuid4
 
 from .capability_health import CapabilityHealthManager
 from .config import AppConfig
+from .contracts import SessionStoreProtocol
 from .events import AuditEventSubscriber, Event, EventBus
 from .memory import MemoryStore
 from .memory_pipeline import MemoryPipeline
 from .optimizer import PerformanceAnalysisPipeline, PerformanceHistory
 from .paths import storage_key
 from .project import Project
-from .session import SessionManager
 from .state import AgentState
 from .timeutil import utc_now_iso
 
@@ -30,7 +30,7 @@ PROGRESS_UPDATED = "ui.progress.updated"
 class SessionEventPipeline:
     """Own Session writes requested through the in-process Event Bus."""
 
-    def __init__(self, sessions: SessionManager, events: EventBus) -> None:
+    def __init__(self, sessions: SessionStoreProtocol, events: EventBus) -> None:
         self.sessions = sessions
         self.events = events
         events.subscribe(
@@ -261,7 +261,7 @@ class RuntimeEventPipelines:
         *,
         config: AppConfig,
         project: Project,
-        sessions: SessionManager,
+        sessions: SessionStoreProtocol,
         memory: MemoryStore,
         health: CapabilityHealthManager,
         events: EventBus,

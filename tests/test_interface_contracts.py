@@ -7,11 +7,15 @@ from pathlib import Path
 
 from agent import prompt as prompt_module
 from agent.cli import build_runtime
-from agent.context import ContextPackage
+from agent.context import ContextBuilder, ContextPackage
 from agent.contracts import (
     CONTEXT_INTERFACE_CHAIN,
     CORE_INTERFACE_CHAIN,
     CORE_INTERFACE_CONTRACT_VERSION,
+    ContextBuilderProtocol,
+    PromptBuilderProtocol,
+    RuntimeToolsProtocol,
+    SessionStoreProtocol,
 )
 from agent.memory import MemoryStore
 from agent.event_pipelines import RuntimeEventPipelines
@@ -20,6 +24,7 @@ from agent.model_router import ModelRoute
 from agent.project import ProjectManager
 from agent.prompt import PromptBuilder
 from agent.runtime import AgentRuntime
+from agent.session import SessionManager
 from agent.state import AgentState
 from agent.task_plan import TaskPlanFactory
 from agent.task_router import TaskRoute
@@ -34,7 +39,7 @@ def _parameter_names(callable_object) -> tuple[str, ...]:
 
 
 def test_core_interface_chain_and_runtime_entrypoints_are_versioned() -> None:
-    assert CORE_INTERFACE_CONTRACT_VERSION == 3
+    assert CORE_INTERFACE_CONTRACT_VERSION == 5
     assert CORE_INTERFACE_CHAIN == (
         "CLI",
         "Runtime",
@@ -221,3 +226,137 @@ def test_capability_execution_cannot_bypass_permission_manager(tmp_path: Path, m
     assert result.request_id == "contract-request"
     assert calls == ["permission", "handler"]
     tools.close()
+
+
+def test_runtime_constructor_requires_structural_lifecycle_dependencies_and_runs_with_fakes(
+    tmp_path: Path,
+    make_config,
+) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    config = make_config()
+    project = ProjectManager(config).resolve_project(root)
+    memory = MemoryStore(config)
+    concrete_tools = ToolManager(config, project, memory, yolo=True)
+    concrete_sessions = SessionManager(project)
+    concrete_context = ContextBuilder(config)
+    concrete_prompt = PromptBuilder()
+
+    class StructuralTools:
+        def __init__(self):
+            self.registry = concrete_tools.registry
+            self.health = concrete_tools.health
+            self.plan_manager = concrete_tools.plan_manager
+
+        def schemas(self):
+            return concrete_tools.schemas()
+
+        def capabilities(self, *, enabled_only=False):
+            return concrete_tools.capabilities(enabled_only=enabled_only)
+
+        def bind_state(self, state):
+            concrete_tools.bind_state(state)
+
+        def set_event_bus(self, events):
+            concrete_tools.set_event_bus(events)
+
+        def model_function_name(self, name):
+            return concrete_tools.model_function_name(name)
+
+        def canonical_capability_name(self, name):
+            return concrete_tools.canonical_capability_name(name)
+
+        def result_is_health_failure(self, result):
+            return concrete_tools.result_is_health_failure(result)
+
+        def capability_health_status(self, capability_name):
+            return concrete_tools.capability_health_status(capability_name)
+
+        def capability_summary(self):
+            return concrete_tools.capability_summary()
+
+        def execute_model_call(self, name, arguments, *, request_id=None, runtime_denied_reason=None):
+            return concrete_tools.execute_model_call(
+                name,
+                arguments,
+                request_id=request_id,
+                runtime_denied_reason=runtime_denied_reason,
+            )
+
+        def close(self):
+            concrete_tools.close()
+
+    class StructuralSessions:
+        def new_session_id(self):
+            return concrete_sessions.new_session_id()
+
+        def resolve_session_id(self, session_id=None):
+            return concrete_sessions.resolve_session_id(session_id)
+
+        def acquire(self, session_id):
+            return concrete_sessions.acquire(session_id)
+
+        def load_for_resume(self, session_id, *, max_rounds=16):
+            return concrete_sessions.load_for_resume(session_id, max_rounds=max_rounds)
+
+        def checkpoint(self, state, messages):
+            return concrete_sessions.checkpoint(state, messages)
+
+        def finalize(self, state, messages):
+            return concrete_sessions.finalize(state, messages)
+
+        def load(self, session_id=None):
+            return concrete_sessions.load(session_id)
+
+        def list_sessions(self, limit=20):
+            return concrete_sessions.list_sessions(limit=limit)
+
+    class StructuralContext:
+        def build(self, selected_project, *, refresh=False):
+            return concrete_context.build(selected_project, refresh=refresh)
+
+        def build_package(self, request):
+            return concrete_context.build_package(request)
+
+    class StructuralPrompt:
+        def build_initial(self, package):
+            return concrete_prompt.build_initial(package)
+
+        def build_resume(self, package):
+            return concrete_prompt.build_resume(package)
+
+    class StructuralClient:
+        def __init__(self):
+            self.responses = ["initial", "resumed"]
+
+        def chat(self, **_kwargs):
+            from agent.deepseek import ChatResponse
+
+            return ChatResponse(message={"role": "assistant", "content": self.responses.pop(0)}, raw={})
+
+    tools = StructuralTools()
+    sessions = StructuralSessions()
+    context = StructuralContext()
+    prompt = StructuralPrompt()
+    assert isinstance(tools, RuntimeToolsProtocol)
+    assert isinstance(sessions, SessionStoreProtocol)
+    assert isinstance(context, ContextBuilderProtocol)
+    assert isinstance(prompt, PromptBuilderProtocol)
+
+    constructor = inspect.signature(AgentRuntime.__init__)
+    for name in ("events", "context_builder", "prompt_builder", "sessions"):
+        assert constructor.parameters[name].default is inspect.Parameter.empty
+
+    runtime = AgentRuntime(
+        config=config,
+        project=project,
+        memory=memory,
+        tools=tools,
+        client=StructuralClient(),
+        events=EventBus(),
+        context_builder=context,
+        prompt_builder=prompt,
+        sessions=sessions,
+    )
+    assert runtime.run("verify structural dependency injection") == "initial"
+    assert runtime.resume("continue", runtime.last_session_id) == "resumed"

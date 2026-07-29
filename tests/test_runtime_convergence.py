@@ -770,7 +770,7 @@ def test_overflow_semantic_compaction_respects_open_circuit(tmp_path: Path, make
     config = make_config()
     project = ProjectManager(config).resolve_project(root)
     memory = MemoryStore(config)
-    runtime = AgentRuntime(
+    runtime = AgentRuntime.with_default_services(
         config=config,
         project=project,
         memory=memory,
@@ -1551,7 +1551,9 @@ def test_conditional_large_task_can_complete_with_honest_failed_validation_and_n
             },
         ]
     )
-    runtime = AgentRuntime(config=config, project=project, memory=memory, tools=tools, client=client)
+    runtime = AgentRuntime.with_default_services(
+        config=config, project=project, memory=memory, tools=tools, client=client
+    )
 
     answer = runtime.run(
         "全面审计整个大型 TypeScript 代码库；运行静态检查；若找到证据确凿的真实缺陷则修复，"
@@ -1626,7 +1628,9 @@ def test_single_validation_route_blocks_equivalent_shell_and_lsp_retries(
             },
         ]
     )
-    runtime = AgentRuntime(config=config, project=project, memory=memory, tools=tools, client=client)
+    runtime = AgentRuntime.with_default_services(
+        config=config, project=project, memory=memory, tools=tools, client=client
+    )
 
     answer = runtime.run("只运行一次项目已有的静态检查，不要重复等价命令；失败时如实报告验证限制")
 
@@ -1677,7 +1681,9 @@ def test_single_validation_rejects_compound_shell_then_allows_one_real_attempt(
             {"role": "assistant", "content": "只执行了一次测试并通过。"},
         ]
     )
-    runtime = AgentRuntime(config=config, project=project, memory=memory, tools=tools, client=client)
+    runtime = AgentRuntime.with_default_services(
+        config=config, project=project, memory=memory, tools=tools, client=client
+    )
 
     assert runtime.run("只运行一次验证并报告结果") == "只执行了一次测试并通过。"
     assert validation_calls == [["npm", "run", "test"]]
@@ -1717,7 +1723,9 @@ def test_single_validation_same_batch_skips_invalid_call_then_executes_one_valid
             {"role": "assistant", "content": "无效调用未执行，随后只执行了一次有效测试。"},
         ]
     )
-    runtime = AgentRuntime(config=config, project=project, memory=memory, tools=tools, client=client)
+    runtime = AgentRuntime.with_default_services(
+        config=config, project=project, memory=memory, tools=tools, client=client
+    )
 
     assert runtime.run("只运行一次验证并报告结果") == "无效调用未执行，随后只执行了一次有效测试。"
     assert validation_calls == [["npm", "run", "test"]]
@@ -1772,7 +1780,7 @@ def test_main_loop_rejects_dsml_answer_text_then_accepts_protocol_valid_answer(t
             {"role": "assistant", "content": "协议有效的最终答复。"},
         ]
     )
-    runtime = AgentRuntime(
+    runtime = AgentRuntime.with_default_services(
         config=config,
         project=project,
         memory=memory,
@@ -1807,7 +1815,7 @@ def test_main_loop_discards_structured_calls_when_content_contains_dsml(tmp_path
     mixed = model_tool_call("must-not-run", "list_dir", {"path": ".", "depth": 1})
     mixed["content"] = "preface\n<｜｜DSML｜｜tool_calls>\nstructured call follows"
     client = RecordingClient([mixed, {"role": "assistant", "content": "安全的最终答复。"}])
-    runtime = AgentRuntime(
+    runtime = AgentRuntime.with_default_services(
         config=config,
         project=project,
         memory=memory,
@@ -1878,7 +1886,7 @@ def test_runtime_executes_all_normalized_missing_and_duplicate_id_calls(
         ],
     }
     client = RecordingClient([malformed, {"role": "assistant", "content": "三项证据均已总结。"}])
-    runtime = AgentRuntime(
+    runtime = AgentRuntime.with_default_services(
         config=config,
         project=project,
         memory=memory,
@@ -1938,7 +1946,9 @@ def test_runtime_denies_excess_tool_calls_without_executing_handlers_and_keeps_p
             {"role": "assistant", "content": "已保留所有调用的配对结果。"},
         ]
     )
-    runtime = AgentRuntime(config=config, project=project, memory=memory, tools=tools, client=client)
+    runtime = AgentRuntime.with_default_services(
+        config=config, project=project, memory=memory, tools=tools, client=client
+    )
 
     assert runtime.run("检查四个文件并总结") == "已保留所有调用的配对结果。"
 
@@ -1990,7 +2000,9 @@ def test_runtime_hard_caps_protocol_projection_and_reports_calls_beyond_sixty_fo
             {"role": "assistant", "content": "协议硬限和配对结果均已验证。"},
         ]
     )
-    runtime = AgentRuntime(config=config, project=project, memory=memory, tools=tools, client=client)
+    runtime = AgentRuntime.with_default_services(
+        config=config, project=project, memory=memory, tools=tools, client=client
+    )
 
     assert runtime.run("检查大量并行读取请求并总结") == "协议硬限和配对结果均已验证。"
 
@@ -2058,7 +2070,7 @@ def test_runtime_request_budget_is_enforced_when_optional_compaction_is_disabled
     client = RecordingClient(
         [] if request_size == "over-limit" else [{"role": "assistant", "content": "预算内请求正常完成。"}]
     )
-    runtime = AgentRuntime(
+    runtime = AgentRuntime.with_default_services(
         config=config,
         project=project,
         memory=memory,
@@ -2098,7 +2110,7 @@ def test_auto_compaction_off_preserves_over_trigger_request_below_hard_limit(tmp
     project = ProjectManager(config).resolve_project(root)
     memory = MemoryStore(config)
     client = RecordingClient([])
-    runtime = AgentRuntime(
+    runtime = AgentRuntime.with_default_services(
         config=config,
         project=project,
         memory=memory,
@@ -2183,7 +2195,7 @@ def test_runtime_enforces_closed_exploration_phase_against_canonical_alias(
             {"role": "assistant", "content": "The closed exploration phase was enforced."},
         ]
     )
-    runtime = AgentRuntime(
+    runtime = AgentRuntime.with_default_services(
         config=config,
         project=project,
         memory=memory,
@@ -2226,7 +2238,7 @@ def test_runtime_hard_phase_schema_forces_plan_transition_before_status_or_tests
             {"role": "assistant", "content": "The plan-transition gate was enforced."},
         ]
     )
-    runtime = AgentRuntime(
+    runtime = AgentRuntime.with_default_services(
         config=config,
         project=project,
         memory=memory,
@@ -2280,7 +2292,7 @@ def test_runtime_allows_canonical_bounded_read_of_known_path_during_implement(
             {"role": "assistant", "content": "The bounded implementation evidence read was verified."},
         ]
     )
-    runtime = AgentRuntime(
+    runtime = AgentRuntime.with_default_services(
         config=config,
         project=project,
         memory=memory,
@@ -2347,7 +2359,7 @@ def test_runtime_bounds_five_same_round_tool_results_without_breaking_pairs(tmp_
             {"role": "assistant", "content": "五项工具证据已完成有界综合。"},
         ]
     )
-    runtime = AgentRuntime(
+    runtime = AgentRuntime.with_default_services(
         config=config,
         project=project,
         memory=memory,
@@ -2452,7 +2464,7 @@ def test_runtime_low_context_uses_non_thinking_tool_free_compaction_and_valid_ma
             ),
         ]
     )
-    runtime = AgentRuntime(
+    runtime = AgentRuntime.with_default_services(
         config=config,
         project=project,
         memory=memory,
@@ -2519,7 +2531,7 @@ def test_runtime_uses_emergency_collapse_after_three_compaction_failures_without
     project = ProjectManager(config).resolve_project(root)
     memory = MemoryStore(config)
     client = RecordingClient([])
-    runtime = AgentRuntime(
+    runtime = AgentRuntime.with_default_services(
         config=config,
         project=project,
         memory=memory,
@@ -2639,7 +2651,7 @@ def test_context_compaction_network_failure_records_attempts_and_checkpoint(
     project = ProjectManager(config).resolve_project(root)
     memory = MemoryStore(config)
     client = RecordingClient([AttemptError("compaction transport failed", http_attempt_count=2)])
-    runtime = AgentRuntime(
+    runtime = AgentRuntime.with_default_services(
         config=config,
         project=project,
         memory=memory,
@@ -2711,7 +2723,7 @@ def test_context_compaction_rejects_unusable_finish_reason(tmp_path: Path, make_
             )
         ]
     )
-    runtime = AgentRuntime(
+    runtime = AgentRuntime.with_default_services(
         config=config,
         project=project,
         memory=memory,
@@ -2815,7 +2827,9 @@ def test_runtime_does_not_execute_tool_calls_from_length_truncated_response(tmp_
             ),
         ]
     )
-    runtime = AgentRuntime(config=config, project=project, memory=memory, tools=tools, client=client)
+    runtime = AgentRuntime.with_default_services(
+        config=config, project=project, memory=memory, tools=tools, client=client
+    )
 
     assert runtime.run("检查文件并总结") == "截断调用未执行，已安全完成。"
     assert executed == 0
@@ -2860,7 +2874,9 @@ def test_runtime_does_not_execute_tool_calls_from_content_filtered_response(tmp_
             ),
         ]
     )
-    runtime = AgentRuntime(config=config, project=project, memory=memory, tools=tools, client=client)
+    runtime = AgentRuntime.with_default_services(
+        config=config, project=project, memory=memory, tools=tools, client=client
+    )
 
     assert runtime.run("检查文件并总结") == "异常响应已丢弃，未执行工具。"
     assert executed == 0
@@ -2901,7 +2917,7 @@ def test_repeated_unusable_finish_reason_fails_with_resume_and_zero_tool_executi
             ),
         ]
     )
-    runtime = AgentRuntime(
+    runtime = AgentRuntime.with_default_services(
         config=config,
         project=project,
         memory=memory,
@@ -2946,7 +2962,7 @@ def test_runtime_continues_length_truncated_text_and_merges_answer(tmp_path: Pat
             ),
         ]
     )
-    runtime = AgentRuntime(
+    runtime = AgentRuntime.with_default_services(
         config=config,
         project=project,
         memory=memory,
@@ -3000,7 +3016,7 @@ def test_length_continuation_failure_preserves_completed_usage_and_failed_attemp
             AttemptError("continuation transport failed", http_attempt_count=3),
         ]
     )
-    runtime = AgentRuntime(
+    runtime = AgentRuntime.with_default_services(
         config=config,
         project=project,
         memory=memory,
@@ -3063,7 +3079,7 @@ def test_final_synthesis_length_continuation_keeps_phase_and_tool_turn_metrics(
             ),
         ]
     )
-    runtime = AgentRuntime(
+    runtime = AgentRuntime.with_default_services(
         config=config,
         project=project,
         memory=memory,
@@ -3115,7 +3131,7 @@ def test_final_synthesis_rejects_unusable_finish_reason_and_preserves_resume(tmp
             ),
         ]
     )
-    runtime = AgentRuntime(
+    runtime = AgentRuntime.with_default_services(
         config=config,
         project=project,
         memory=memory,
@@ -3190,7 +3206,7 @@ def test_final_synthesis_rejects_tool_protocol_without_execution(
             ChatResponse(message=final_message, raw={}, finish_reason="tool_calls"),
         ]
     )
-    runtime = AgentRuntime(
+    runtime = AgentRuntime.with_default_services(
         config=config,
         project=project,
         memory=memory,
@@ -3230,7 +3246,7 @@ def test_soft_target_completion_failure_is_not_reported_as_hard_limit(tmp_path: 
             {"role": "assistant", "content": "I will verify next."},
         ]
     )
-    runtime = AgentRuntime(
+    runtime = AgentRuntime.with_default_services(
         config=config,
         project=project,
         memory=memory,
@@ -3254,7 +3270,7 @@ def test_non_stream_model_failure_persists_http_attempt_count(tmp_path: Path, ma
     project = ProjectManager(config).resolve_project(root)
     memory = MemoryStore(config)
     client = RecordingClient([AttemptError("all network attempts failed", http_attempt_count=3)])
-    runtime = AgentRuntime(
+    runtime = AgentRuntime.with_default_services(
         config=config,
         project=project,
         memory=memory,
@@ -3280,7 +3296,7 @@ def test_stream_interruption_records_attempts_without_advancing_tool_turn(tmp_pa
     project = ProjectManager(config).resolve_project(root)
     memory = MemoryStore(config)
     client = RecordingClient([DeepSeekStreamInterrupted("partial output cannot be replayed", http_attempt_count=3)])
-    runtime = AgentRuntime(
+    runtime = AgentRuntime.with_default_services(
         config=config,
         project=project,
         memory=memory,
@@ -3321,7 +3337,7 @@ def test_runtime_recovers_overflow_with_cheap_then_semantic_compaction(
             ),
         ]
     )
-    runtime = AgentRuntime(
+    runtime = AgentRuntime.with_default_services(
         config=config,
         project=project,
         memory=memory,
@@ -3391,7 +3407,7 @@ def test_final_synthesis_recovers_typed_overflow_without_advancing_tool_turn(
             ),
         ]
     )
-    runtime = AgentRuntime(
+    runtime = AgentRuntime.with_default_services(
         config=config,
         project=project,
         memory=memory,
@@ -3460,7 +3476,7 @@ def test_incomplete_final_preserves_substantive_synthesis_and_appends_resume(tmp
             {"role": "assistant", "content": substantive},
         ]
     )
-    runtime = AgentRuntime(
+    runtime = AgentRuntime.with_default_services(
         config=config,
         project=project,
         memory=memory,
@@ -3482,7 +3498,7 @@ def test_emergency_projection_scales_down_to_the_actual_context_budget(tmp_path:
     config = make_config()
     project = ProjectManager(config).resolve_project(root)
     memory = MemoryStore(config)
-    runtime = AgentRuntime(
+    runtime = AgentRuntime.with_default_services(
         config=config,
         project=project,
         memory=memory,
@@ -3598,7 +3614,7 @@ def test_runtime_compacts_last_tool_result_before_final_synthesis(tmp_path: Path
             {"role": "assistant", "content": "已根据末轮有界证据完成总结。"},
         ]
     )
-    runtime = AgentRuntime(
+    runtime = AgentRuntime.with_default_services(
         config=config,
         project=project,
         memory=memory,
@@ -3644,7 +3660,7 @@ def test_runtime_keeps_multi_tool_results_contiguous_before_recovery_context(tmp
             {"role": "assistant", "content": "已保留失败证据并完成其余读取。"},
         ]
     )
-    runtime = AgentRuntime(
+    runtime = AgentRuntime.with_default_services(
         config=config,
         project=project,
         memory=memory,
@@ -3699,7 +3715,7 @@ def test_runtime_resets_convergence_only_after_successful_real_progress(
     responses = [model_tool_call(f"read-{index}", "read_file", {"path": f"file-{index}.txt"}) for index in range(6)]
     responses.append(model_tool_call("step-progress", "agent_update_step", {"step_id": step_id, "status": "completed"}))
     client = RecordingClient(responses)
-    runtime = AgentRuntime(
+    runtime = AgentRuntime.with_default_services(
         config=config,
         project=project,
         memory=memory,
@@ -3733,7 +3749,7 @@ def test_runtime_checkpoints_exploration_state_after_observing_tool_round(
             AttemptError("stop after checkpoint", http_attempt_count=1),
         ]
     )
-    runtime = AgentRuntime(
+    runtime = AgentRuntime.with_default_services(
         config=config,
         project=project,
         memory=memory,
@@ -3784,7 +3800,7 @@ def test_runtime_resets_corrective_budget_after_successful_tool_progress(tmp_pat
             responses.append(model_tool_call("inspect-project", "list_dir", {"path": ".", "depth": 1}))
     responses.append({"role": "assistant", "content": "全部步骤已完成，结论已经验证。"})
     client = RecordingClient(responses)
-    runtime = AgentRuntime(
+    runtime = AgentRuntime.with_default_services(
         config=config,
         project=project,
         memory=memory,
@@ -3808,7 +3824,7 @@ def test_runtime_does_not_run_history_compactor_when_convergence_disabled(
     project = ProjectManager(config).resolve_project(root)
     memory = MemoryStore(config)
     client = RecordingClient([{"role": "assistant", "content": "无需压缩即可完成。"}])
-    runtime = AgentRuntime(
+    runtime = AgentRuntime.with_default_services(
         config=config,
         project=project,
         memory=memory,
@@ -3870,7 +3886,7 @@ def test_runtime_converges_after_read_only_rounds_and_compacts_history(tmp_path:
         ]
     )
     client = RecordingClient(responses)
-    runtime = AgentRuntime(
+    runtime = AgentRuntime.with_default_services(
         config=config,
         project=project,
         memory=memory,

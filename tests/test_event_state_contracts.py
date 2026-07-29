@@ -75,7 +75,7 @@ def test_session_load_rejects_oversized_symlink_and_invalid_messages(tmp_path: P
     path = sessions.checkpoint(state, [])
 
     sessions.MAX_SESSION_FILE_BYTES = 32
-    with pytest.raises(ValueError, match="checkpoint exceeds"):
+    with pytest.raises(ValueError, match="exceeds"):
         sessions.checkpoint(state, [])
 
     sessions.MAX_SESSION_FILE_BYTES = path.stat().st_size - 1
@@ -363,7 +363,7 @@ def test_agent_state_model_metrics_and_convergence_gates_are_per_turn_while_circ
 
     restored = AgentState.from_dict(state.to_dict())
 
-    assert restored.schema_version == 7
+    assert restored.schema_version == 8
     assert restored.model_request_count == 3
     assert restored.main_loop_model_request_count == 1
     assert restored.context_compaction_model_request_count == 1
@@ -417,7 +417,7 @@ def test_session_summary_names_persisted_tool_turns_without_implying_model_round
 
     persisted = json.loads(json_path.read_text(encoding="utf-8"))
     summary = markdown_path.read_text(encoding="utf-8")
-    assert persisted["state"]["schema_version"] == 7
+    assert persisted["state"]["schema_version"] == 8
     assert "- tool turn 3: file.read success=True duration_ms=4" in summary
     assert "- round 3:" not in summary
 
