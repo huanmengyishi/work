@@ -568,9 +568,15 @@ def _audit_day(timestamp: str) -> str:
 
 
 _SECRET_PATTERNS = (
+    re.compile(r"(?i)\b(?:authorization|cookie|set-cookie)\s*:\s*[^\r\n]+"),
     re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/-]{8,}"),
     re.compile(r"\bsk-[A-Za-z0-9_-]{8,}\b"),
-    re.compile(r"(?i)\b(DEEPSEEK_API_KEY|API_KEY|ACCESS_TOKEN|REFRESH_TOKEN)\s*[=:]\s*[^\s,;]+"),
+    re.compile(
+        r"(?i)\b(?:[a-z0-9]+[_-])*(?:api[_-]?key|access[_-]?token|refresh[_-]?token|"
+        r"authorization|cookie|password|passwd|secret|token)\s*[=:]\s*"
+        r"(?:\"[^\"]*\"|'[^']*'|[^\s,;]+)"
+    ),
+    re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?-----END [A-Z0-9 ]*PRIVATE KEY-----", re.DOTALL),
 )
 
 

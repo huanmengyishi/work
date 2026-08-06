@@ -431,7 +431,10 @@ class RuntimeValidationMixin:
             if item not in successful:
                 continue
             request = item.get("request") if isinstance(item.get("request"), dict) else {}
-            if (str(request.get("tool") or ""), str(request.get("action") or "")) != ("document", "render_docx"):
+            if (str(request.get("tool") or ""), str(request.get("action") or "")) not in {
+                ("document", "render_docx"),
+                ("document_generator", "render"),
+            }:
                 continue
             result = item.get("result") if isinstance(item.get("result"), dict) else {}
             data = result.get("data") if isinstance(result.get("data"), dict) else {}

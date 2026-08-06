@@ -1,49 +1,15 @@
 # Deep Agent V3
 
-Project-centric DeepSeek CLI agent for WSL/Linux. Start `agent` inside the
-project you want it to inspect or modify.
+DeepSeek-only project agent for WSL/Linux. The GitHub tree contains only the
+installable runtime and its minimal launch entry; tests, CI, development
+scripts, detailed reports, Word files, and private runtime data are kept local.
 
-Current release: `0.13.0` · AgentState schema: `8` · core interface contract: `5`
+Current release: `0.14.1` · AgentState schema: `8` · core interface contract: `6`
 
-DeepSeek remains the only inference provider. System actions continue through
-`ToolRequest -> PermissionManager -> ToolResult`; the model and Runtime do not
-bypass the Tool Manager.
-
-Latest Chinese documents:
-
-- [Usage guide (Markdown)](user-docs/DeepSeek-Agent-V3-使用说明.md)
-- [Work log (Markdown)](user-docs/DeepSeek-Agent-V3-工作日志.md)
-- [Usage guide (Word)](DeepSeek-Agent-V3-使用说明-0.13.0.docx)
-- [Work log (Word)](DeepSeek-Agent-V3-工作日志-0.13.0.docx)
-
-## What changed in 0.13.0
-
-- A successful task can make at most one extra, tool-free, budgeted DeepSeek
-  logical request to refine the lesson learned. Bounded transport retries and
-  key rotation still apply. `memory.smart_reflection` defaults to `true` when
-  the key is missing, but fewer than five managed tool calls in the current
-  turn always skip refinement. Failure never changes the completed task.
-- Runtime, convergence, history handling, tool declarations, and tool execution
-  are split into bounded modules while preserving one Runtime and one tool path.
-- AgentState keeps at most 200 hot tool records and applies byte, collection,
-  key, and nesting limits. Resume loads only the newest 16 complete model rounds;
-  complete transcripts remain in bounded, hashed cold generations.
-- Memory gains a bounded TTL/LRU query cache, strict JSON import/export, global
-  knowledge isolation, and model-produced kind/confidence/tags persistence.
-- Zero-model History Snip runs before model compaction. Capability backoff,
-  typed task-plan strategies, durable intent journals, and artifact lineage are
-  wired into the existing execution path.
-- Adaptive convergence, strategy adjustment, and deterministic experiments are
-  available but remain disabled by default.
-- The GitHub tree contains the application, tests/CI, the current release note,
-  and only the latest concise user documents. Detailed development evidence and
-  historical reports remain local and are not published.
-
-See [the 0.13.0 release note](docs/releases/v0.13.0.md) for compatibility notes.
-
-## Install and run
+## Install
 
 ```bash
+git clone https://github.com/huanmengyishi/work.git ~/AI-Agent
 cd ~/AI-Agent
 python3 -m venv .venv
 .venv/bin/python -m pip install --upgrade pip
@@ -51,15 +17,18 @@ python3 -m venv .venv
 .venv/bin/agent --version
 ```
 
-Optional heavy capabilities are installed explicitly:
+Optional capabilities are installed explicitly:
 
 ```bash
 .venv/bin/python -m pip install -e '.[browser,semantic,document,vector]'
 ```
 
-Store the private key outside the source tree:
+## Configure the DeepSeek key
+
+Keep the key outside the repository:
 
 ```bash
+mkdir -p ~/.config/deep-agent
 nano ~/.config/deep-agent/secrets.env
 chmod 600 ~/.config/deep-agent/secrets.env
 ```
@@ -68,135 +37,89 @@ chmod 600 ~/.config/deep-agent/secrets.env
 DEEPSEEK_API_KEY=replace_with_your_valid_key
 ```
 
-English and Chinese commas are accepted for a key pool. Key values are
-never shown by `doctor`; `secrets.env` takes priority over a legacy shell value.
+Multiple keys may be separated by English or Chinese commas. Never commit this
+file or copy keys, Memory, Sessions, logs, browser state, caches, or
+`.project-agent` data into the source tree.
 
-Run an offline check before any paid request:
+## Start and use
 
 ```bash
-agent doctor
 cd /path/to/project
-agent init
-agent "inspect this project and verify the requested change"
+~/AI-Agent/.venv/bin/agent init
+~/AI-Agent/.venv/bin/agent
+~/AI-Agent/.venv/bin/agent "inspect this project and verify the requested change"
 ```
 
-`agent doctor --online` validates every configured key and transient failures
-may be retried, so it can send multiple real DeepSeek requests. Use it only when
-an online credential check is intentionally required.
-
-## Memory refinement
-
-The default for a new or missing configuration key is:
-
-```yaml
-memory:
-  smart_reflection: true
-  smart_reflection_min_tool_calls: 5
-  smart_reflection_max_input_chars: 12000
-  smart_reflection_max_output_tokens: 768
-  smart_reflection_max_output_chars: 5000
-```
-
-The hard trigger floor is five managed tool calls in the current turn; setting
-a smaller configuration value cannot lower it. Refinement runs only after a
-successful completion, uses the injected DeepSeek client with tools disabled,
-shares the turn budget, and makes at most one logical request per turn. Existing
-explicit `false` values are preserved during migration. Disable it with
-`smart_reflection: false` when the extra completion-time request is not desired.
-
-## Common commands
+Useful commands:
 
 ```bash
 agent --help
 agent --version
 agent doctor
-agent init
-agent "task"
 agent sessions
 agent resume
-agent resume --session SESSION_ID "continue"
 agent context show
-agent context refresh
 agent tools --all
 agent health
 agent memory search "query"
-agent memory list --kind Correction
-agent memory stats
-agent memory maintain
-agent memory maintain --apply
-agent memory export backup.json --scope project
-agent memory import backup.json --target-scope preserve --conflict skip
 ```
 
-Memory export files contain real Memory content. Keep them private and out of
-Git; use `--force` or `--conflict replace` only after making a separate backup.
+Interactive input is submitted with one `Enter`. Empty input has explicit
+feedback, `Ctrl+C` returns to a recoverable prompt, and `/resume` continues a
+saved Session. `/vector-retry` performs one explicit lazy ChromaDB retry after
+the optional dependency has been installed or repaired.
 
-Interactive commands include `/new`, `/resume`, `/sessions`, `/status`, `/undo`,
-`/yolo on|off`, `/super-yolo on|off`, `/help`, and `/exit`. Press `Enter` once to
-submit. Empty input gives feedback, `Ctrl+C` returns to a recoverable prompt, and
-the terminal shows processing/thinking progress while a request is active.
+## Large documents and safe file changes
 
-Exit codes are `0` for completed, `2` for saved resumable incomplete, and `1`
-for configuration or Runtime failure.
-
-## Optional strategy controls
-
-```yaml
-optimizer:
-  adaptive_convergence_enabled: false
-  strategy_adjustment_enabled: false
-  experiments:
-    enabled: false
-
-runtime:
-  convergence:
-    history_snip_enabled: true
-```
-
-Adaptive and experimental behavior is opt-in. Vector search is also disabled by
-default and remains lazy even when enabled. Configuration migration only adds
-missing defaults; it does not replace existing user choices.
-
-## Data ownership and safety
+Large-document generation uses an approved outline, one durable chapter at a
+time, and process-independent checkpoints. Word output must follow:
 
 ```text
-~/AI-Agent/                         application, tests, current public docs
-~/.config/deep-agent/              private configuration and API key
-~/.local/share/deep-agent/         Memory, vectors, logs, metrics, shared data
-<project>/.project-agent/          project context, checkpoints, attachments
+document_generator_render -> file_apply -> document_parse -> document_generator_finalize
 ```
 
-Do not commit keys, Memory, Session transcripts, logs, browser state, caches, or
-`.project-agent` data. File mutations use snapshot-backed `file.diff`,
-`file.apply`, and `file.undo`. Network and dangerous actions remain permission
-controlled; `--super-yolo` deliberately relaxes hard policies and should be
-treated as unsafe.
+Completed chapter bodies are removed from later model context after their
+checkpoint hashes are verified. File mutations use the snapshot-backed
+`file_diff -> file_apply -> file_undo` flow.
 
-## Verify a checkout
+## Configuration defaults
+
+- DeepSeek is the only inference provider.
+- Heavy vector, adaptive, and experimental features remain disabled by default.
+- Configuration migration adds missing defaults and does not replace an
+  existing user choice.
+- The task wall clock defaults to one hour and all model/tool/network inputs
+  retain bounded size, count, timeout, and output limits.
+- `--super-yolo` relaxes permission policy and should be treated as unsafe.
+
+Configuration is stored under `~/.config/deep-agent`; runtime data is stored
+under `~/.local/share/deep-agent`; each managed project uses a private
+`.project-agent` directory.
+
+## Offline verification
+
+These checks do not call DeepSeek:
 
 ```bash
-.venv/bin/ruff check agent tests scripts
-.venv/bin/ruff format --check agent tests scripts
-.venv/bin/python -m compileall -q agent tests scripts
-.venv/bin/python -m pytest
-.venv/bin/python -m pip check
-git diff --check
+agent --version
+agent --help
+agent doctor
 ```
 
-The test suite includes real PTY coverage for Enter, processing feedback,
-Unicode-width rendering, and recoverable `Ctrl+C`. Release tests also reopen the
-generated Word files and enforce the public document tree.
+`agent doctor --online` makes real DeepSeek requests and may exercise multiple
+configured keys. Use it only when an online credential check is intentional.
 
-## Roll back
+## Risk and rollback
 
-Finish or preserve 0.13.0 sessions before running an older version; older code
-does not understand schema 8 checkpoints.
+Version `0.14.1` keeps AgentState schema `8`, but older releases may not
+understand newer workflow evidence. Preserve active Sessions and never delete
+Memory or project data during rollback.
 
 ```bash
 cd ~/AI-Agent
-git switch --detach v0.12.2
+git switch --detach v0.13.0
 .venv/bin/python -m pip install -e .
 ```
 
-Do not delete Memory, Session, vector, log, or `.project-agent` data during a
-rollback. Return with `git switch main` and reinstall the editable package.
+Return to the current `main`/tag and reinstall the package to restore the latest
+runtime.

@@ -93,10 +93,17 @@ class ProjectDaemon:
         self.stop_path.unlink(missing_ok=True)
         self._install_signal_handlers()
         self._write_pid(os.getpid())
-        interval = max(2, min(int(self.config.get("daemon.poll_interval_seconds", 10)), 3600))
-        maintenance_interval = max(
-            60,
-            min(int(self.config.get("daemon.memory_maintenance_seconds", 3600)), 7 * 24 * 3600),
+        interval = self.config.get_int(
+            "daemon.poll_interval_seconds",
+            10,
+            minimum=2,
+            maximum=3_600,
+        )
+        maintenance_interval = self.config.get_int(
+            "daemon.memory_maintenance_seconds",
+            3_600,
+            minimum=60,
+            maximum=7 * 24 * 3_600,
         )
         last_fingerprint = ""
         last_maintenance = 0.0
@@ -191,11 +198,22 @@ class ProjectDaemon:
             "--id",
             pending.id,
         ]
-        calculated_timeout = max(
-            60,
-            int(self.config.get("tools.shell.timeout_seconds", 120)) * max(1, len(pending.tasks)),
+        shell_timeout = self.config.get_int(
+            "tools.shell.timeout_seconds",
+            120,
+            minimum=1,
+            maximum=86_400,
         )
-        timeout = min(calculated_timeout, max(60, int(self.config.get("daemon.queue_timeout_seconds", 3600))))
+        calculated_timeout = max(60, shell_timeout * max(1, len(pending.tasks)))
+        timeout = min(
+            calculated_timeout,
+            self.config.get_int(
+                "daemon.queue_timeout_seconds",
+                3_600,
+                minimum=60,
+                maximum=7 * 24 * 3_600,
+            ),
+        )
         process = subprocess.Popen(
             command,
             cwd=self.project.root,

@@ -5,6 +5,43 @@ from typing import Any
 from .context import ContextPackage
 
 
+SYSTEM_PROMPT_TOOL_NAMES = frozenset(
+    {
+        "agent_update_plan",
+        "agent_update_step",
+        "document_parse",
+        "document_render_docx",
+        "document_generator_confirm_outline",
+        "document_generator_create_outline",
+        "document_generator_finalize",
+        "document_generator_next_chapter",
+        "document_generator_render",
+        "document_generator_rollback_chapter",
+        "document_generator_save_chapter",
+        "document_generator_status",
+        "file_apply",
+        "file_diff",
+        "find_files",
+        "git_diff_staged",
+        "list_dir",
+        "make_dir",
+        "memory_add",
+        "python_run",
+        "read_file",
+        "run_tests",
+        "search_code",
+        "shell_run",
+    }
+)
+"""Model-facing tool names referenced literally by :data:`SYSTEM_PROMPT`.
+
+The built-in capability contract test verifies that every name remains
+registered.  Keeping the set explicit makes Prompt edits independent of tool
+construction while preventing a silent rename from teaching the model a
+nonexistent capability.
+"""
+
+
 SYSTEM_PROMPT = """You are Deep Agent, a project-centric CLI coding agent powered only by DeepSeek.
 
 Operating rules:
@@ -14,6 +51,12 @@ Operating rules:
   Docker, or an MCP tool to bypass the preview, snapshot, and approval flow.
 - Create Word documents with document_render_docx followed by file_apply; verify them with document_parse.
   Never generate binary artifacts through python_run or shell_run.
+- For large documents, call document_generator_create_outline, wait for user approval, and only then call
+  document_generator_confirm_outline. Generate each chapter with document_generator_next_chapter and persist it with
+  document_generator_save_chapter; on a chapter failure, use document_generator_rollback_chapter only for that chapter.
+  Use document_generator_status to resume, then document_generator_render and file_apply. For Word output, re-open it
+  with document_parse before document_generator_finalize. The generator never calls the model itself, and render creates
+  only a managed preview, not the final file.
 - Create requested folders with make_dir. Do not use shell_run or python_run for routine directory creation.
 - Prefer list_dir, find_files, search_code, read_file, run_tests, and git_diff_staged over equivalent shell commands.
 - Inspect relevant files and verify changes before claiming completion.

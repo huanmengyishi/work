@@ -51,6 +51,21 @@ class RuntimeCompactionMixin:
             return False
         start, end = span
         history = list(messages[start:end])
+        original_budget = context_window.budget(messages, tools, max_output_tokens=model_route.max_tokens)
+        session_notes = self._session_notes(state)
+        if session_notes and self._compact_from_session_notes(
+            state,
+            messages,
+            start=start,
+            end=end,
+            tools=tools,
+            model_route=model_route,
+            context_window=context_window,
+            phase=phase,
+            session_notes=session_notes,
+            original_tokens=original_budget.estimated_tokens,
+        ):
+            return True
         auto_max_tokens = context_window.effective_output_tokens(
             min(auto_compaction_max_tokens, model_route.max_tokens)
         )
@@ -231,7 +246,6 @@ class RuntimeCompactionMixin:
             phase="context_compaction",
         )
 
-        original_budget = context_window.budget(messages, tools, max_output_tokens=model_route.max_tokens)
         candidate = [
             *messages[:start],
             {
@@ -245,6 +259,10 @@ class RuntimeCompactionMixin:
             *messages[end:],
         ]
         candidate = repair_tool_message_pairs(candidate).messages
+        # The semantic summary is the bounded fallback when Session Notes could
+        # not fit below the trigger. Reinject the three G1 sources here without
+        # duplicating the larger Notes projection that already failed admission.
+        self._restore_static_context(state, candidate, session_notes="")
         compacted_budget = context_window.budget(candidate, tools, max_output_tokens=model_route.max_tokens)
         if compacted_budget.estimated_tokens >= original_budget.estimated_tokens or compacted_budget.over_trigger:
             context_window.record_failure()
@@ -273,6 +291,49 @@ class RuntimeCompactionMixin:
             summarized_messages=end - start,
             ptl_drops=ptl_drops,
             phase=phase,
+        )
+        self._checkpoint_convergence_transition(
+            state,
+            messages,
+            transition="context_compacted",
+            phase=phase,
+            counter="context_compaction_count",
+        )
+        return True
+
+    def _compact_from_session_notes(
+        self,
+        state: AgentState,
+        messages: list[dict[str, Any]],
+        *,
+        start: int,
+        end: int,
+        tools: list[dict[str, Any]] | None,
+        model_route: ModelRoute,
+        context_window: ContextWindowController,
+        phase: str,
+        session_notes: str,
+        original_tokens: int,
+    ) -> bool:
+        """Replace old rounds with the Journal projection without a model call."""
+
+        candidate = repair_tool_message_pairs([*messages[:start], *messages[end:]]).messages
+        self._restore_static_context(state, candidate, session_notes=session_notes)
+        compacted_budget = context_window.budget(candidate, tools, max_output_tokens=model_route.max_tokens)
+        if compacted_budget.estimated_tokens >= original_tokens or compacted_budget.over_trigger:
+            return False
+        messages[:] = candidate
+        context_window.record_success()
+        self._progress(
+            "context.compacted",
+            state,
+            original_tokens=original_tokens,
+            final_tokens=compacted_budget.estimated_tokens,
+            summarized_messages=end - start,
+            ptl_drops=0,
+            phase=phase,
+            source="session_notes",
+            model_requests=0,
         )
         self._checkpoint_convergence_transition(
             state,
@@ -443,6 +504,7 @@ class RuntimeCompactionMixin:
                 *suffix,
             ]
             candidate = repair_tool_message_pairs(candidate).messages
+            self._restore_static_context(state, candidate)
             candidate_budget = context_window.budget(candidate, tools, max_output_tokens=model_route.max_tokens)
             if not candidate_budget.over_limit:
                 selected = candidate

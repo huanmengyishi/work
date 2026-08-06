@@ -14,6 +14,7 @@ from .contracts import (
     SessionStoreProtocol,
 )
 from .context import ContextBuilder
+from .context_continuity import SessionMemoryBuilder, StaticContextRestorer
 from .event_pipelines import (
     RuntimeEventPipelines,
 )
@@ -23,6 +24,7 @@ from .memory import MemoryStore
 from .memory_refinement import MemoryRefiner
 from .model_router import ModelRoute, ModelRouter, more_capable_model_route
 from .optimizer import PerformanceHistory
+from .intent_journal import IntentJournal
 from .paths import storage_key
 from .project import Project
 from .resilience import CapabilityRecoveryController, ResiliencePolicy
@@ -76,6 +78,17 @@ class AgentRuntime(
         self.context_builder = context_builder
         self.prompt_builder = prompt_builder
         self.sessions = sessions
+        journal = getattr(sessions, "intent_journal", None)
+        if not callable(getattr(journal, "read", None)):
+            journal = IntentJournal(project.agent_dir / "intent-journal")
+        self.session_memory_builder = SessionMemoryBuilder(
+            journal,
+            project.agent_dir / "SESSION_NOTES.md",
+        )
+        self.static_context_restorer = StaticContextRestorer(
+            project.context_path,
+            max_context_chars=self._context_file_limit(config),
+        )
         self.task_router = TaskRouter(config)
         self.model_router = ModelRouter(config)
         self.task_plan_factory = TaskPlanFactory()
@@ -105,6 +118,15 @@ class AgentRuntime(
         self.strategy_adjuster = StrategyAdjuster(config, performance_history, project_id=project.id)
         self.experiment_runner = ExperimentRunner(config, project_id=project.id)
         self.experiment_runner.attach(self.events)
+
+    @staticmethod
+    def _context_file_limit(config: AppConfig) -> int:
+        return config.get_int(
+            "context.max_context_file_chars",
+            8_000,
+            minimum=256,
+            maximum=64_000,
+        )
 
     @classmethod
     def with_default_services(

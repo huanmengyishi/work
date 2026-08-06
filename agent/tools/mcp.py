@@ -5,11 +5,14 @@ import fnmatch
 import hashlib
 import ipaddress
 import json
+import logging
 import os
 import queue
 import re
 import subprocess
+import sys
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -19,6 +22,7 @@ from typing import Any, Callable
 
 from .. import __version__
 from ..config import AppConfig
+from ..memory_refinement import redact_sensitive_text
 from .base import ToolResult, truncate_text
 from .registry import ToolCapability
 
@@ -26,7 +30,14 @@ from .registry import ToolCapability
 MCP_PROTOCOL_VERSION = "2025-03-26"
 MAX_TOOL_LIST_PAGES = 100
 MAX_REMOTE_TOOLS = 2_000
+MAX_MCP_SERVERS = 1_000
+MAX_MCP_TIMEOUT_SECONDS = 86_400
+MAX_MCP_MESSAGE_BYTES = 4_194_304
+MAX_MCP_STRUCTURED_CHARS = 1_048_576
+MAX_MCP_QUEUED_MESSAGES = 1_024
+MAX_MCP_PENDING_RESPONSES = 1_024
 SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9_]+")
+logger = logging.getLogger(__name__)
 SAFE_INHERITED_ENV = {
     "PATH",
     "HOME",
@@ -52,6 +63,26 @@ SAFE_INHERITED_ENV = {
     "all_proxy",
     "no_proxy",
 }
+
+
+def _bounded_int(value: Any, *, default: int, minimum: int, maximum: int, label: str) -> int:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        logger.warning("mcp_invalid_integer key=%s action=use_default", label)
+        return default
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError, OverflowError):
+        logger.warning("mcp_invalid_integer key=%s action=use_default", label)
+        return default
+    if parsed < minimum:
+        logger.warning("mcp_integer_below_minimum key=%s action=clamp", label)
+        return minimum
+    if parsed > maximum:
+        logger.warning("mcp_integer_above_maximum key=%s action=clamp", label)
+        return maximum
+    return parsed
 
 
 class RejectRedirect(urllib.request.HTTPRedirectHandler):
@@ -94,10 +125,13 @@ def parse_sse_message(value: str) -> dict[str, Any]:
 
 
 def rpc_result(server_name: str, message: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(message, dict):
+        raise RuntimeError(f"MCP {server_name} response must be a JSON object")
     error = message.get("error")
     if isinstance(error, dict):
-        code = error.get("code")
-        detail = str(error.get("message") or "MCP request failed")
+        raw_code = error.get("code")
+        code = raw_code if isinstance(raw_code, int) and not isinstance(raw_code, bool) else "unknown"
+        detail = redact_sensitive_text(str(error.get("message") or "MCP request failed"), maximum=1_000)
         raise RuntimeError(f"MCP {server_name} JSON-RPC {code}: {detail}")
     result = message.get("result")
     return result if isinstance(result, dict) else {}
@@ -140,12 +174,13 @@ def tool_call_result(server_name: str, tool_name: str, result: dict[str, Any]) -
                 content_meta.append({"type": item_type, "mimeType": item.get("mimeType")})
     structured = result.get("structuredContent")
     if structured is not None:
-        text_parts.append(json.dumps(structured, ensure_ascii=False, indent=2))
+        rendered_structured = json.dumps(structured, ensure_ascii=False, indent=2)
+        text_parts.append(rendered_structured)
     output = truncate_text("\n".join(part for part in text_parts if part).strip())
     is_error = bool(result.get("isError", False))
     data = {"server": server_name, "tool": tool_name, "content": content_meta}
     if structured is not None:
-        data["structuredContent"] = structured
+        data["structuredContent"] = _bounded_structured_content(structured)
     return ToolResult(not is_error, output if not is_error else "", output if is_error else "", data=data)
 
 
@@ -155,7 +190,7 @@ def resource_result(server_name: str, uri: str, result: dict[str, Any]) -> ToolR
         return ToolResult(False, "", f"MCP {server_name} returned an invalid resources/read result")
     text_parts: list[str] = []
     metadata: list[dict[str, Any]] = []
-    for item in contents:
+    for item in contents[:1_000]:
         if not isinstance(item, dict):
             continue
         if "text" in item:
@@ -169,6 +204,17 @@ def resource_result(server_name: str, uri: str, result: dict[str, Any]) -> ToolR
         )
     output = truncate_text("\n\n".join(part for part in text_parts if part).strip())
     return ToolResult(True, output, data={"server": server_name, "uri": uri, "contents": metadata})
+
+
+def _bounded_structured_content(value: Any) -> Any:
+    rendered = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    if len(rendered) <= MAX_MCP_STRUCTURED_CHARS:
+        return value
+    return {
+        "truncated": True,
+        "original_chars": len(rendered),
+        "sha256": hashlib.sha256(rendered.encode("utf-8", errors="replace")).hexdigest(),
+    }
 
 
 @dataclass(frozen=True)
@@ -202,8 +248,9 @@ class MCPClient:
         self.call_timeout = call_timeout
         self.protocol_version = protocol_version
         self.process: subprocess.Popen[str] | None = None
-        self._messages: queue.Queue[dict[str, Any]] = queue.Queue()
+        self._messages: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=MAX_MCP_QUEUED_MESSAGES)
         self._pending: dict[int, dict[str, Any]] = {}
+        self._message_overflow = threading.Event()
         self._stderr: list[str] = []
         self._next_id = 1
         self._request_lock = threading.Lock()
@@ -211,6 +258,9 @@ class MCPClient:
     def start(self) -> None:
         if self.process and self.process.poll() is None:
             return
+        self._messages = queue.Queue(maxsize=MAX_MCP_QUEUED_MESSAGES)
+        self._pending.clear()
+        self._message_overflow.clear()
         try:
             self.process = subprocess.Popen(
                 [self.command, *self.args],
@@ -256,36 +306,18 @@ class MCPClient:
                 timeout=self.call_timeout,
             )
         except Exception as exc:
-            return ToolResult(False, "", f"MCP {self.name}.{tool_name} failed: {exc}")
+            detail = redact_sensitive_text(str(exc), maximum=1_000)
+            return ToolResult(False, "", f"MCP {self.name}.{tool_name} failed: {detail}")
         if not isinstance(result, dict):
             return ToolResult(False, "", f"MCP {self.name}.{tool_name} returned an invalid result")
-        text_parts: list[str] = []
-        content_meta: list[dict[str, Any]] = []
-        content = result.get("content")
-        if isinstance(content, list):
-            for item in content:
-                if not isinstance(item, dict):
-                    continue
-                item_type = str(item.get("type") or "unknown")
-                if item_type == "text":
-                    text_parts.append(str(item.get("text") or ""))
-                else:
-                    content_meta.append({"type": item_type, "mimeType": item.get("mimeType")})
-        structured = result.get("structuredContent")
-        if structured is not None:
-            text_parts.append(json.dumps(structured, ensure_ascii=False, indent=2))
-        output = truncate_text("\n".join(part for part in text_parts if part).strip())
-        is_error = bool(result.get("isError", False))
-        data = {"server": self.name, "tool": tool_name, "content": content_meta}
-        if structured is not None:
-            data["structuredContent"] = structured
-        return ToolResult(not is_error, output if not is_error else "", output if is_error else "", data=data)
+        return tool_call_result(self.name, tool_name, result)
 
     def read_resource(self, uri: str) -> ToolResult:
         try:
             result = self.request("resources/read", {"uri": uri}, timeout=self.call_timeout)
         except Exception as exc:
-            return ToolResult(False, "", f"MCP {self.name} resource read failed: {exc}")
+            detail = redact_sensitive_text(str(exc), maximum=1_000)
+            return ToolResult(False, "", f"MCP {self.name} resource read failed: {detail}")
         return resource_result(self.name, uri, result)
 
     def request(self, method: str, params: dict[str, Any], *, timeout: int) -> dict[str, Any]:
@@ -294,13 +326,7 @@ class MCPClient:
             self._next_id += 1
             self._send({"jsonrpc": "2.0", "id": request_id, "method": method, "params": params})
             message = self._wait_for_response(request_id, timeout)
-        error = message.get("error")
-        if isinstance(error, dict):
-            code = error.get("code")
-            detail = str(error.get("message") or "MCP request failed")
-            raise RuntimeError(f"JSON-RPC {code}: {detail}")
-        result = message.get("result")
-        return result if isinstance(result, dict) else {}
+        return rpc_result(self.name, message)
 
     def notify(self, method: str, params: dict[str, Any]) -> None:
         self._send({"jsonrpc": "2.0", "method": method, "params": params})
@@ -329,6 +355,8 @@ class MCPClient:
         if not process or process.poll() is not None or not process.stdin:
             raise RuntimeError(f"MCP server {self.name} is not running; inspect local logs for server diagnostics")
         payload = json.dumps(message, ensure_ascii=False, separators=(",", ":"))
+        if len(payload.encode("utf-8", errors="replace")) > MAX_MCP_MESSAGE_BYTES:
+            raise ValueError("MCP stdio request exceeds the bounded message size")
         try:
             process.stdin.write(payload + "\n")
             process.stdin.flush()
@@ -338,37 +366,69 @@ class MCPClient:
     def _wait_for_response(self, request_id: int, timeout: int) -> dict[str, Any]:
         if request_id in self._pending:
             return self._pending.pop(request_id)
-        try:
-            while True:
-                message = self._messages.get(timeout=timeout)
+        deadline = time.monotonic() + timeout
+        while True:
+            if self._message_overflow.is_set():
+                raise RuntimeError("MCP stdio message queue exceeded its bounded capacity")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(f"MCP request timed out after {timeout}s")
+            try:
+                message = self._messages.get(timeout=remaining)
+                if message.get("_deep_agent_error"):
+                    raise RuntimeError(str(message["_deep_agent_error"])[:500])
                 message_id = message.get("id")
                 if message_id == request_id:
                     return message
+                if message_id is None and isinstance(message.get("error"), dict):
+                    return message
                 if isinstance(message_id, int):
+                    if message_id not in self._pending and len(self._pending) >= MAX_MCP_PENDING_RESPONSES:
+                        raise RuntimeError("MCP stdio pending response count exceeded its bounded capacity")
                     self._pending[message_id] = message
-        except queue.Empty as exc:
-            raise TimeoutError(f"MCP request timed out after {timeout}s") from exc
+            except queue.Empty as exc:
+                raise TimeoutError(f"MCP request timed out after {timeout}s") from exc
+
+    def _enqueue_message(self, message: dict[str, Any]) -> None:
+        try:
+            self._messages.put_nowait(message)
+        except queue.Full:
+            self._message_overflow.set()
 
     def _read_stdout(self) -> None:
         process = self.process
         if not process or not process.stdout:
             return
-        for line in process.stdout:
+        while True:
+            line = process.stdout.readline(MAX_MCP_MESSAGE_BYTES + 1)
+            if not line:
+                return
+            if len(line.encode("utf-8", errors="replace")) > MAX_MCP_MESSAGE_BYTES:
+                while line and not line.endswith("\n"):
+                    line = process.stdout.readline(MAX_MCP_MESSAGE_BYTES + 1)
+                self._enqueue_message({"_deep_agent_error": "MCP stdio response exceeded 4 MiB"})
+                continue
             try:
                 value = json.loads(line)
             except json.JSONDecodeError:
                 continue
             if isinstance(value, dict):
-                self._messages.put(value)
+                self._enqueue_message(value)
 
     def _read_stderr(self) -> None:
         process = self.process
         if not process or not process.stderr:
             return
-        for line in process.stderr:
+        while True:
+            line = process.stderr.readline(1_001)
+            if not line:
+                return
+            if len(line) > 1_000 and not line.endswith("\n"):
+                while line and not line.endswith("\n"):
+                    line = process.stderr.readline(1_001)
             text = line.strip()
             if text:
-                self._stderr.append(text[:1000])
+                self._stderr.append(redact_sensitive_text(text, maximum=1_000))
                 del self._stderr[:-20]
 
 
@@ -414,14 +474,16 @@ class MCPHttpClient:
         try:
             result = self.request("tools/call", {"name": tool_name, "arguments": arguments}, timeout=self.call_timeout)
         except Exception as exc:
-            return ToolResult(False, "", f"MCP {self.name}.{tool_name} failed: {exc}")
+            detail = redact_sensitive_text(str(exc), maximum=1_000)
+            return ToolResult(False, "", f"MCP {self.name}.{tool_name} failed: {detail}")
         return tool_call_result(self.name, tool_name, result)
 
     def read_resource(self, uri: str) -> ToolResult:
         try:
             result = self.request("resources/read", {"uri": uri}, timeout=self.call_timeout)
         except Exception as exc:
-            return ToolResult(False, "", f"MCP {self.name} resource read failed: {exc}")
+            detail = redact_sensitive_text(str(exc), maximum=1_000)
+            return ToolResult(False, "", f"MCP {self.name} resource read failed: {detail}")
         return resource_result(self.name, uri, result)
 
     def request(self, method: str, params: dict[str, Any], *, timeout: int) -> dict[str, Any]:
@@ -450,6 +512,8 @@ class MCPHttpClient:
 
     def _post(self, payload: dict[str, Any], *, timeout: int) -> dict[str, Any]:
         body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        if len(body) > MAX_MCP_MESSAGE_BYTES:
+            raise ValueError("MCP HTTP request exceeds the bounded message size")
         headers = self._request_headers()
         headers["Content-Type"] = "application/json"
         request = urllib.request.Request(self.url, data=body, headers=headers, method="POST")
@@ -458,8 +522,8 @@ class MCPHttpClient:
                 session_id = response.headers.get("Mcp-Session-Id")
                 if session_id:
                     self.session_id = session_id
-                raw = response.read(4_194_305)
-                if len(raw) > 4_194_304:
+                raw = response.read(MAX_MCP_MESSAGE_BYTES + 1)
+                if len(raw) > MAX_MCP_MESSAGE_BYTES:
                     raise RuntimeError("MCP HTTP response exceeds 4 MiB")
                 if not raw.strip():
                     return {}
@@ -470,7 +534,7 @@ class MCPHttpClient:
                     else json.loads(raw)
                 )
         except urllib.error.HTTPError as exc:
-            detail = exc.read(8192).decode("utf-8", errors="replace")
+            detail = redact_sensitive_text(exc.read(8192).decode("utf-8", errors="replace"), maximum=1_000)
             raise RuntimeError(f"MCP HTTP {exc.code}: {detail}") from exc
         except (urllib.error.URLError, json.JSONDecodeError) as exc:
             raise RuntimeError(f"MCP HTTP request failed: {exc}") from exc
@@ -486,11 +550,16 @@ class MCPSseClient(MCPHttpClient):
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self.endpoint: str | None = None
-        self._messages: queue.Queue[dict[str, Any]] = queue.Queue()
+        self._messages: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=MAX_MCP_QUEUED_MESSAGES)
+        self._message_overflow = threading.Event()
+        self._stream_error = ""
         self._stream = None
         self._reader: threading.Thread | None = None
 
     def start(self) -> None:
+        self._messages = queue.Queue(maxsize=MAX_MCP_QUEUED_MESSAGES)
+        self._message_overflow.clear()
+        self._stream_error = ""
         request = urllib.request.Request(
             self.url, headers={"Accept": "text/event-stream", **self.headers}, method="GET"
         )
@@ -551,6 +620,8 @@ class MCPSseClient(MCPHttpClient):
         if not self.endpoint:
             raise RuntimeError("MCP SSE endpoint is unavailable")
         body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        if len(body) > MAX_MCP_MESSAGE_BYTES:
+            raise ValueError("MCP SSE request exceeds the bounded message size")
         headers = {"Content-Type": "application/json", "Accept": "application/json", **self.headers}
         request = urllib.request.Request(self.endpoint, data=body, headers=headers, method="POST")
         try:
@@ -567,13 +638,34 @@ class MCPSseClient(MCPHttpClient):
             pass
 
     def _wait_sse(self, request_id: int, timeout: int) -> dict[str, Any]:
-        try:
-            while True:
-                message = self._messages.get(timeout=timeout)
-                if message.get("id") == request_id:
+        deadline = time.monotonic() + timeout
+        while True:
+            if self._message_overflow.is_set():
+                raise RuntimeError("MCP SSE message queue exceeded its bounded capacity")
+            if self._stream_error:
+                raise RuntimeError(self._stream_error)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(f"MCP SSE request timed out after {timeout}s")
+            try:
+                message = self._messages.get(timeout=remaining)
+                if message.get("_deep_agent_error"):
+                    raise RuntimeError(str(message["_deep_agent_error"])[:500])
+                message_id = message.get("id")
+                if message_id == request_id or (message_id is None and isinstance(message.get("error"), dict)):
                     return message
-        except queue.Empty as exc:
-            raise TimeoutError(f"MCP SSE request timed out after {timeout}s") from exc
+            except queue.Empty as exc:
+                raise TimeoutError(f"MCP SSE request timed out after {timeout}s") from exc
+
+    def _enqueue_sse_message(self, message: dict[str, Any]) -> None:
+        try:
+            self._messages.put_nowait(message)
+        except queue.Full:
+            self._message_overflow.set()
+
+    def _fail_sse_stream(self, message: str) -> None:
+        self._stream_error = message[:500]
+        self._enqueue_sse_message({"_deep_agent_error": self._stream_error})
 
     def _read_stream(self) -> None:
         stream = self._stream
@@ -581,8 +673,17 @@ class MCPSseClient(MCPHttpClient):
             return
         event = "message"
         data_lines: list[str] = []
+        event_bytes = 0
         try:
-            for raw in stream:
+            while True:
+                raw = stream.readline(MAX_MCP_MESSAGE_BYTES + 1)
+                if not raw:
+                    return
+                if len(raw) > MAX_MCP_MESSAGE_BYTES:
+                    while raw and not raw.endswith(b"\n"):
+                        raw = stream.readline(MAX_MCP_MESSAGE_BYTES + 1)
+                    self._fail_sse_stream("MCP SSE event exceeded 4 MiB")
+                    return
                 line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
                 if not line:
                     data = "\n".join(data_lines)
@@ -594,13 +695,18 @@ class MCPSseClient(MCPHttpClient):
                         except json.JSONDecodeError:
                             value = None
                         if isinstance(value, dict):
-                            self._messages.put(value)
-                    event, data_lines = "message", []
+                            self._enqueue_sse_message(value)
+                    event, data_lines, event_bytes = "message", [], 0
                 elif line.startswith("event:"):
                     event = line[6:].strip()
                 elif line.startswith("data:"):
+                    event_bytes += len(raw)
+                    if event_bytes > MAX_MCP_MESSAGE_BYTES:
+                        self._fail_sse_stream("MCP SSE event exceeded 4 MiB")
+                        return
                     data_lines.append(line[5:].lstrip())
         except (OSError, ValueError, AttributeError):
+            self._fail_sse_stream("MCP SSE stream ended with a bounded transport error")
             return
 
 
@@ -625,8 +731,8 @@ class MCPManager:
             self.statuses.append(MCPServerStatus("configuration", True, False, error="mcp.servers must be a list"))
             return registrations
 
-        max_servers = max(0, int(self.config.get("mcp.max_servers", 10)))
-        max_tools = max(0, int(self.config.get("mcp.max_tools", 80)))
+        max_servers = self.config.get_int("mcp.max_servers", 10, minimum=0, maximum=MAX_MCP_SERVERS)
+        max_tools = self.config.get_int("mcp.max_tools", 80, minimum=0, maximum=MAX_REMOTE_TOOLS)
         enabled_specs = [spec for spec in servers if isinstance(spec, dict) and bool(spec.get("enabled", True))]
         if len(enabled_specs) > max_servers:
             self.statuses.append(
@@ -679,7 +785,9 @@ class MCPManager:
                     registrations.append(self._resource_registration(name, client, spec))
                 self.statuses.append(MCPServerStatus(name, True, True, tool_count=len(selected) + resource_count))
             except Exception as exc:
-                self.statuses.append(MCPServerStatus(name, True, False, error=str(exc)))
+                self.statuses.append(
+                    MCPServerStatus(name, True, False, error=redact_sensitive_text(str(exc), maximum=1_000))
+                )
         return registrations
 
     def close(self) -> None:
@@ -700,8 +808,32 @@ class MCPManager:
 
     def _build_client(self, name: str, spec: dict[str, Any]) -> Any:
         transport = str(spec.get("transport") or "stdio")
-        startup_timeout = int(spec.get("startup_timeout_seconds") or self.config.get("mcp.startup_timeout_seconds", 15))
-        call_timeout = int(spec.get("call_timeout_seconds") or self.config.get("mcp.call_timeout_seconds", 120))
+        startup_default = self.config.get_int(
+            "mcp.startup_timeout_seconds",
+            15,
+            minimum=1,
+            maximum=MAX_MCP_TIMEOUT_SECONDS,
+        )
+        call_default = self.config.get_int(
+            "mcp.call_timeout_seconds",
+            120,
+            minimum=1,
+            maximum=MAX_MCP_TIMEOUT_SECONDS,
+        )
+        startup_timeout = _bounded_int(
+            spec.get("startup_timeout_seconds"),
+            default=startup_default,
+            minimum=1,
+            maximum=MAX_MCP_TIMEOUT_SECONDS,
+            label=f"mcp.servers.{name}.startup_timeout_seconds",
+        )
+        call_timeout = _bounded_int(
+            spec.get("call_timeout_seconds"),
+            default=call_default,
+            minimum=1,
+            maximum=MAX_MCP_TIMEOUT_SECONDS,
+            label=f"mcp.servers.{name}.call_timeout_seconds",
+        )
         protocol_version = str(spec.get("protocol_version") or MCP_PROTOCOL_VERSION)
         if transport in {"streamable_http", "sse"}:
             url = str(spec.get("url") or "").strip()
@@ -722,6 +854,8 @@ class MCPManager:
         command = str(spec.get("command") or "").strip()
         if not command:
             raise ValueError("stdio MCP server command is required")
+        if command == "{python}":
+            command = sys.executable
         args_value = spec.get("args", [])
         if not isinstance(args_value, list):
             raise ValueError("MCP server args must be a list")
@@ -805,7 +939,19 @@ class MCPManager:
         client: Any,
         spec: dict[str, Any],
     ) -> tuple[ToolCapability, Callable[..., ToolResult]]:
-        timeout = int(spec.get("resource_timeout_seconds") or self.config.get("mcp.resource_timeout_seconds", 60))
+        default_timeout = self.config.get_int(
+            "mcp.resource_timeout_seconds",
+            60,
+            minimum=1,
+            maximum=MAX_MCP_TIMEOUT_SECONDS,
+        )
+        timeout = _bounded_int(
+            spec.get("resource_timeout_seconds"),
+            default=default_timeout,
+            minimum=1,
+            maximum=MAX_MCP_TIMEOUT_SECONDS,
+            label=f"mcp.servers.{server_name}.resource_timeout_seconds",
+        )
         capability = ToolCapability(
             "mcp",
             f"{server_name}.resources.read",

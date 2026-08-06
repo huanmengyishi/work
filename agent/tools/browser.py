@@ -2,8 +2,12 @@ from __future__ import annotations
 
 import json
 import mimetypes
+import multiprocessing
+import os
 import re
+import signal
 import shutil
+import time
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -14,6 +18,8 @@ from .base import ToolResult, truncate_text
 
 SESSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 SAFE_FILENAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
+BROWSER_STARTUP_TIMEOUT_SECONDS = 30
+WORKER_STOP_GRACE_SECONDS = 2
 
 
 class BrowserTool:
@@ -21,7 +27,7 @@ class BrowserTool:
 
     def __init__(self, cwd: Path, timeout: int = 180, max_download_bytes: int = 100_000_000) -> None:
         self.cwd = cwd
-        self.timeout = timeout
+        self.timeout = max(1, min(int(timeout), 86_400))
         self.max_download_bytes = max(1, min(int(max_download_bytes), 500_000_000))
         self.session_root = cwd / ".project-agent" / "browser-sessions"
         self.download_root = cwd / ".project-agent" / "downloads"
@@ -42,6 +48,12 @@ class BrowserTool:
                 self._session_name(session_name)
             except ValueError as exc:
                 return ToolResult(False, "", str(exc))
+        return self._run_bounded_operation(
+            "open_url",
+            {"url": url, "session_name": session_name},
+        )
+
+    def _open_url_inline(self, url: str, session_name: str | None = None) -> ToolResult:
         try:
             with self._context(session_name) as context:
                 page = context.pages[0] if context.pages else context.new_page()
@@ -70,6 +82,28 @@ class BrowserTool:
             return ToolResult(False, "", error)
         if not selector:
             return ToolResult(False, "", "download selector is empty")
+        if session_name:
+            try:
+                self._session_name(session_name)
+            except ValueError as exc:
+                return ToolResult(False, "", str(exc))
+        return self._run_bounded_operation(
+            "download",
+            {
+                "url": url,
+                "selector": selector,
+                "session_name": session_name,
+                "filename": filename,
+            },
+        )
+
+    def _download_inline(
+        self,
+        url: str,
+        selector: str,
+        session_name: str | None = None,
+        filename: str | None = None,
+    ) -> ToolResult:
         try:
             safe_session = self._session_name(session_name or "default")
             destination_dir = self.download_root / safe_session
@@ -109,6 +143,125 @@ class BrowserTool:
         except Exception as exc:
             return ToolResult(False, "", f"browser download failed: {exc}")
 
+    def _run_bounded_operation(self, operation: str, payload: dict[str, Any]) -> ToolResult:
+        context = multiprocessing.get_context("spawn")
+        receiver, sender = context.Pipe(duplex=False)
+        process = context.Process(
+            target=_browser_worker,
+            args=(
+                sender,
+                str(self.cwd),
+                self.timeout,
+                self.max_download_bytes,
+                operation,
+                payload,
+            ),
+            daemon=True,
+            name="deep-agent-browser",
+        )
+        started = time.monotonic()
+        try:
+            process.start()
+        except (OSError, RuntimeError) as exc:
+            receiver.close()
+            sender.close()
+            return ToolResult(False, "", f"browser worker could not start: {type(exc).__name__}")
+        sender.close()
+        total_deadline = started + max(1, self.timeout)
+        startup_limit = min(self.timeout, BROWSER_STARTUP_TIMEOUT_SECONDS)
+        startup_deadline = min(total_deadline, started + startup_limit)
+        try:
+            kind, value = self._receive_worker_message(receiver, process, startup_deadline)
+            if kind == "result":
+                return self._worker_result(value)
+            if kind != "startup_complete":
+                self._stop_worker(process)
+                if kind == "timeout":
+                    return ToolResult(
+                        False,
+                        "",
+                        f"browser startup timed out after {startup_limit}s; "
+                        "check Playwright installation and browser binaries",
+                        data={"timed_out": True, "phase": "startup"},
+                    )
+                return ToolResult(False, "", "browser worker exited before startup completed")
+            kind, value = self._receive_worker_message(receiver, process, total_deadline)
+            if kind == "result":
+                return self._worker_result(value)
+            self._stop_worker(process)
+            if kind == "timeout":
+                return ToolResult(
+                    False,
+                    "",
+                    f"browser operation timed out after {self.timeout}s",
+                    data={"timed_out": True, "phase": "operation"},
+                )
+            return ToolResult(False, "", "browser worker exited before returning a result")
+        finally:
+            receiver.close()
+            if process.is_alive():
+                self._stop_worker(process)
+            else:
+                process.join(timeout=0)
+
+    @staticmethod
+    def _receive_worker_message(receiver, process, deadline: float) -> tuple[str, Any]:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return "timeout", None
+            if receiver.poll(min(remaining, 0.1)):
+                try:
+                    value = receiver.recv()
+                except EOFError:
+                    return "worker_exit", None
+                if isinstance(value, tuple) and len(value) == 2 and isinstance(value[0], str):
+                    return value
+                return "invalid_result", None
+            if not process.is_alive():
+                return "worker_exit", None
+
+    @staticmethod
+    def _worker_result(value: Any) -> ToolResult:
+        if not isinstance(value, dict):
+            return ToolResult(False, "", "browser worker returned an invalid result")
+        data = value.get("data")
+        return ToolResult(
+            bool(value.get("success")),
+            str(value.get("stdout") or "")[:20_000],
+            str(value.get("stderr") or "")[:20_000],
+            data=data if isinstance(data, dict) else None,
+            duration_ms=max(0, int(value.get("duration_ms") or 0)),
+        )
+
+    @staticmethod
+    def _stop_worker(process) -> None:
+        if not process.is_alive():
+            process.join(timeout=0)
+            return
+        if os.name == "posix" and process.pid:
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                process.terminate()
+            except OSError:
+                process.terminate()
+        else:
+            process.terminate()
+        process.join(timeout=WORKER_STOP_GRACE_SECONDS)
+        if not process.is_alive():
+            return
+        if os.name == "posix" and process.pid:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                process.kill()
+            except OSError:
+                process.kill()
+        else:
+            process.kill()
+        process.join(timeout=WORKER_STOP_GRACE_SECONDS)
+
     def close_session(self, session_name: str, clear_data: bool = False) -> ToolResult:
         try:
             name = self._session_name(session_name)
@@ -140,7 +293,11 @@ class BrowserTool:
         from playwright.sync_api import sync_playwright
 
         playwright = sync_playwright().start()
-        launch_options: dict[str, Any] = {"headless": True, "accept_downloads": True}
+        launch_options: dict[str, Any] = {
+            "headless": True,
+            "accept_downloads": True,
+            "timeout": min(max(1, self.timeout), BROWSER_STARTUP_TIMEOUT_SECONDS) * 1000,
+        }
         proxy = proxy_url_from_env()
         if proxy:
             launch_options["proxy"] = {"server": proxy}
@@ -162,6 +319,9 @@ class BrowserTool:
         except Exception:
             playwright.stop()
             raise
+        notifier = getattr(self, "_startup_notifier", None)
+        if notifier is not None:
+            notifier()
         return _BrowserContext(playwright, context)
 
     @staticmethod
@@ -204,3 +364,45 @@ class _BrowserContext:
         finally:
             self.playwright.stop()
         return False
+
+
+def _browser_worker(
+    connection,
+    cwd: str,
+    timeout: int,
+    max_download_bytes: int,
+    operation: str,
+    payload: dict[str, Any],
+) -> None:
+    try:
+        if os.name == "posix":
+            os.setsid()
+        tool = BrowserTool(Path(cwd), timeout=timeout, max_download_bytes=max_download_bytes)
+        tool._startup_notifier = lambda: connection.send(("startup_complete", None))
+        if operation == "open_url":
+            result = tool._open_url_inline(
+                str(payload.get("url") or ""),
+                payload.get("session_name"),
+            )
+        elif operation == "download":
+            result = tool._download_inline(
+                str(payload.get("url") or ""),
+                str(payload.get("selector") or ""),
+                payload.get("session_name"),
+                payload.get("filename"),
+            )
+        else:
+            result = ToolResult(False, "", "browser worker received an unknown operation")
+        connection.send(("result", result.to_dict()))
+    except BaseException as exc:
+        try:
+            connection.send(
+                (
+                    "result",
+                    ToolResult(False, "", f"browser worker failed: {type(exc).__name__}").to_dict(),
+                )
+            )
+        except (BrokenPipeError, EOFError, OSError):
+            pass
+    finally:
+        connection.close()

@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import re
+import stat
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -17,7 +18,7 @@ from .base import ToolResult, truncate_text
 from .pathsafe import resolve_project_path
 
 
-ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,199}$")
 MISSING_HASH = "missing"
 
 
@@ -123,9 +124,6 @@ class FileEditTool:
             return ToolResult(False, "", f"preview is not pending: {preview_id} ({record.get('status')})")
         target = resolve_project_path(self.project.root, str(record["path"]), require_file=True)
         current = self._read_bytes(target)
-        if self._hash(current) != record["base_hash"]:
-            return ToolResult(False, "", "file changed after preview; create a fresh file_diff before applying")
-
         if record.get("binary") and record.get("after_exists"):
             encoded = record.get("content_base64")
             if not isinstance(encoded, str):
@@ -138,6 +136,13 @@ class FileEditTool:
             return ToolResult(False, "", f"preview result exceeds file-edit limit: {len(after_bytes)} bytes")
         if self._hash(after_bytes) != str(record.get("result_hash") or ""):
             return ToolResult(False, "", "preview content changed after review; create a fresh preview")
+        if self._hash(current) != record["base_hash"]:
+            reconciled = self._reconcile_interrupted_apply(
+                record, session_id=session_id, target=target, current=current
+            )
+            if reconciled is not None:
+                return reconciled
+            return ToolResult(False, "", "file changed after preview; create a fresh file_diff before applying")
         snapshot_id = uuid4().hex
         snapshot_dir = self._session_snapshot_dir(session_id) / snapshot_id
         snapshot_dir.mkdir(parents=True, exist_ok=False)
@@ -190,9 +195,81 @@ class FileEditTool:
             True,
             f"applied {record['path']} (snapshot {snapshot_id})",
             data={
+                "status": "applied",
                 "snapshot_id": snapshot_id,
                 "preview_id": preview_id,
                 "path": record["path"],
+                "result_hash": record["result_hash"],
+                "before_exists": bool(manifest["before_exists"]),
+                "after_exists": bool(manifest["after_exists"]),
+            },
+        )
+
+    def _reconcile_interrupted_apply(
+        self,
+        record: dict[str, Any],
+        *,
+        session_id: str,
+        target: Path,
+        current: bytes | None,
+    ) -> ToolResult | None:
+        """Finish a previously prepared apply after a process interruption."""
+
+        result_hash = str(record.get("result_hash") or "")
+        if self._hash(current) != result_hash:
+            return None
+        candidates: list[tuple[Path, dict[str, Any]]] = []
+        session_dir = self._session_snapshot_dir(session_id)
+        for index, snapshot_dir in enumerate(session_dir.iterdir()):
+            if index >= 4_096:
+                return None
+            if not snapshot_dir.is_dir() or snapshot_dir.is_symlink():
+                continue
+            try:
+                manifest = self._read_json(snapshot_dir / "manifest.json")
+            except (FileNotFoundError, OSError, ValueError, json.JSONDecodeError):
+                continue
+            if (
+                manifest.get("schema_version") == 1
+                and manifest.get("session_id") == session_id
+                and manifest.get("preview_id") == record.get("preview_id")
+                and manifest.get("path") == record.get("path")
+                and manifest.get("before_hash") == record.get("base_hash")
+                and manifest.get("after_hash") == result_hash
+                and manifest.get("status") in {"prepared", "applied"}
+            ):
+                candidates.append((snapshot_dir, manifest))
+        if len(candidates) != 1:
+            return None
+        snapshot_dir, manifest = candidates[0]
+        snapshot_id = str(manifest.get("snapshot_id") or "")
+        self._validate_id(snapshot_id, "snapshot")
+        if snapshot_dir.name != snapshot_id or self._hash(self._read_bytes(target)) != result_hash:
+            return None
+        stack = self._load_stack(session_id)
+        matching = [item for item in stack if item.get("snapshot_id") == snapshot_id]
+        if any(item.get("status") != "applied" for item in matching):
+            return None
+        manifest["status"] = "applied"
+        manifest.setdefault("applied_at", utc_now_iso())
+        self._write_json(snapshot_dir / "manifest.json", manifest)
+        if not matching:
+            stack.append({"snapshot_id": snapshot_id, "status": "applied", "created_at": utc_now_iso()})
+            self._write_stack(session_id, stack)
+        record["status"] = "applied"
+        record["snapshot_id"] = snapshot_id
+        record.setdefault("applied_at", utc_now_iso())
+        self._write_json(self._preview_path(str(record["preview_id"])), record)
+        return ToolResult(
+            True,
+            f"reconciled applied {record['path']} (snapshot {snapshot_id})",
+            data={
+                "status": "applied",
+                "reconciled": True,
+                "snapshot_id": snapshot_id,
+                "preview_id": record["preview_id"],
+                "path": record["path"],
+                "result_hash": result_hash,
                 "before_exists": bool(manifest["before_exists"]),
                 "after_exists": bool(manifest["after_exists"]),
             },
@@ -291,16 +368,144 @@ class FileEditTool:
         record = self._load_preview(preview_id)
         return f"Apply file preview {preview_id} to {record['path']}?\n\n{truncate_text(str(record['diff']), 8000)}"
 
+    def applied_preview_receipt(
+        self,
+        *,
+        preview_id: str,
+        session_id: str,
+        path: str,
+        result_hash: str,
+    ) -> dict[str, str] | None:
+        """Return bounded proof that this exact preview remains applied.
+
+        Comparing only the target bytes cannot prove that the managed
+        ``file_apply`` path ran: another writer could create identical bytes.
+        Bind the preview record, Session, normalized path, active snapshot
+        manifest, and current target hash before exposing an apply receipt.
+        """
+
+        try:
+            self._validate_id(preview_id, "preview")
+            self._validate_id(session_id, "session")
+            if not re.fullmatch(r"[0-9a-f]{64}", result_hash):
+                return None
+            target = resolve_project_path(self.project.root, path, require_file=True)
+            relative = self._relative(target)
+            record = self._load_preview(preview_id)
+            self._check_session(record, session_id)
+            snapshot_id = str(record.get("snapshot_id") or "")
+            self._validate_id(snapshot_id, "snapshot")
+            if (
+                record.get("schema_version") != 1
+                or record.get("preview_id") != preview_id
+                or record.get("status") != "applied"
+                or record.get("path") != relative
+                or record.get("result_hash") != result_hash
+                or record.get("after_exists") is not True
+            ):
+                return None
+            manifest = self._read_json(self.snapshot_root / session_id / snapshot_id / "manifest.json")
+            self._check_session(manifest, session_id)
+            if (
+                manifest.get("schema_version") != 1
+                or manifest.get("snapshot_id") != snapshot_id
+                or manifest.get("status") != "applied"
+                or manifest.get("preview_id") != preview_id
+                or manifest.get("path") != relative
+                or manifest.get("after_exists") is not True
+                or manifest.get("after_hash") != result_hash
+            ):
+                return None
+            stack = self._load_stack(session_id)
+            selected_index = next(
+                (
+                    index
+                    for index, item in enumerate(stack)
+                    if item.get("snapshot_id") == snapshot_id and item.get("status") == "applied"
+                ),
+                None,
+            )
+            if selected_index is None:
+                return None
+            for item in stack[selected_index + 1 :]:
+                if item.get("status") != "applied":
+                    continue
+                newer_id = str(item.get("snapshot_id") or "")
+                self._validate_id(newer_id, "snapshot")
+                newer = self._read_json(self.snapshot_root / session_id / newer_id / "manifest.json")
+                if newer.get("status") == "applied" and newer.get("path") == relative:
+                    return None
+            if self._hash(self._read_bytes(target)) != result_hash:
+                return None
+        except (FileNotFoundError, OSError, TypeError, ValueError, json.JSONDecodeError):
+            return None
+        return {
+            "status": "applied",
+            "preview_id": preview_id,
+            "snapshot_id": snapshot_id,
+            "session_id": session_id,
+            "path": relative,
+            "result_hash": result_hash,
+        }
+
     def _restore(self, snapshot_dir: Path, manifest: dict[str, Any], *, verify_after: bool) -> None:
         target = resolve_project_path(self.project.root, str(manifest["path"]), require_file=True)
+        before_content: bytes | None = None
+        if manifest.get("before_exists"):
+            before_content = self._read_snapshot_bytes(snapshot_dir / "before.bin")
+            if self._hash(before_content) != manifest.get("before_hash"):
+                raise RuntimeError("snapshot content does not match its manifest; refusing to restore")
+        elif manifest.get("before_hash") != MISSING_HASH:
+            raise RuntimeError("snapshot manifest is inconsistent; refusing to restore")
         if verify_after and self._hash(self._read_bytes(target)) != manifest["after_hash"]:
             raise RuntimeError("snapshot target no longer matches the applied version")
         if manifest.get("before_exists"):
-            self._replace_target(target, (snapshot_dir / "before.bin").read_bytes(), int(manifest["before_mode"]))
+            self._replace_target(target, before_content, int(manifest["before_mode"]))
         elif target.exists():
             target.unlink()
         if self._hash(self._read_bytes(target)) != manifest["before_hash"]:
             raise RuntimeError("snapshot restore hash verification failed")
+
+    def _read_snapshot_bytes(self, path: Path) -> bytes:
+        try:
+            metadata = path.lstat()
+        except FileNotFoundError as exc:
+            raise RuntimeError("snapshot content is missing; refusing to restore") from exc
+        if not stat.S_ISREG(metadata.st_mode):
+            raise RuntimeError("snapshot content is not a regular file; refusing to restore")
+        if metadata.st_size > self.max_file_bytes:
+            raise RuntimeError("snapshot content exceeds the file-edit limit; refusing to restore")
+        flags = os.O_RDONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            descriptor = os.open(path, flags)
+        except OSError as exc:
+            raise RuntimeError("snapshot content cannot be opened safely; refusing to restore") from exc
+        try:
+            opened = os.fstat(descriptor)
+            if not stat.S_ISREG(opened.st_mode) or (opened.st_dev, opened.st_ino) != (
+                metadata.st_dev,
+                metadata.st_ino,
+            ):
+                raise RuntimeError("snapshot content changed during secure open; refusing to restore")
+            with os.fdopen(descriptor, "rb") as handle:
+                descriptor = -1
+                content = handle.read(self.max_file_bytes + 1)
+                completed = os.fstat(handle.fileno())
+                if (
+                    completed.st_dev,
+                    completed.st_ino,
+                    completed.st_size,
+                    completed.st_mtime_ns,
+                ) != (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns):
+                    raise RuntimeError("snapshot content changed while it was being read; refusing to restore")
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+        if len(content) > self.max_file_bytes:
+            raise RuntimeError("snapshot content exceeds the file-edit limit; refusing to restore")
+        return content
 
     def _replace_target(self, target: Path, content: bytes | None, mode: int) -> None:
         if content is None:
@@ -399,7 +604,12 @@ class FileEditTool:
         if not path.exists():
             return []
         data = self._read_json(path)
-        return list(data.get("snapshots") or [])
+        if data.get("schema_version") != 1 or data.get("session_id") != session_id:
+            raise ValueError("snapshot stack is invalid or belongs to a different session")
+        snapshots = data.get("snapshots")
+        if not isinstance(snapshots, list) or not all(isinstance(item, dict) for item in snapshots):
+            raise ValueError("snapshot stack entries are invalid")
+        return list(snapshots)
 
     def _append_stack(self, session_id: str, snapshot_id: str) -> None:
         stack = self._load_stack(session_id)
@@ -422,9 +632,39 @@ class FileEditTool:
         if not ID_RE.fullmatch(value):
             raise ValueError(f"invalid {label} id")
 
-    @staticmethod
-    def _read_json(path: Path) -> dict[str, Any]:
-        value = json.loads(path.read_text(encoding="utf-8"))
+    def _read_json(self, path: Path) -> dict[str, Any]:
+        maximum = max(1_048_576, self.max_file_bytes * 2 + 262_144)
+        metadata = path.lstat()
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > maximum:
+            raise ValueError(f"invalid bounded JSON record: {path}")
+        flags = os.O_RDONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(path, flags)
+        try:
+            opened = os.fstat(descriptor)
+            if not stat.S_ISREG(opened.st_mode) or (opened.st_dev, opened.st_ino) != (
+                metadata.st_dev,
+                metadata.st_ino,
+            ):
+                raise ValueError(f"JSON record changed during secure open: {path}")
+            with os.fdopen(descriptor, "rb") as handle:
+                descriptor = -1
+                raw = handle.read(maximum + 1)
+                completed = os.fstat(handle.fileno())
+                if (
+                    completed.st_dev,
+                    completed.st_ino,
+                    completed.st_size,
+                    completed.st_mtime_ns,
+                ) != (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns):
+                    raise ValueError(f"JSON record changed while it was read: {path}")
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+        if len(raw) > maximum:
+            raise ValueError(f"JSON record exceeds bounded size: {path}")
+        value = json.loads(raw.decode("utf-8"))
         if not isinstance(value, dict):
             raise ValueError(f"invalid JSON record: {path}")
         return value

@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import hashlib
+import json
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -14,6 +17,54 @@ from .tool_orchestration import PreparedToolCall, ToolBatchInterrupted, execute_
 class ToolBatchOutcome:
     made_progress: bool
     recovery_chars_used: int
+
+
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _checkpointed_chapter_projection(request: Any, result: Any) -> dict[str, Any] | None:
+    """Replace a saved chapter body with its verified bounded receipt."""
+
+    if getattr(request, "capability", "") != "document_generator.save_chapter" or result.success is not True:
+        return None
+    data = result.data if isinstance(result.data, dict) else {}
+    args = request.args if isinstance(request.args, dict) else {}
+    chapter_hash = data.get("chapter_sha256")
+    chapter_bytes = data.get("chapter_bytes")
+    markdown = args.get("markdown")
+    workflow_id = str(args.get("workflow_id") or "")
+    chapter_id = str(args.get("chapter_id") or "")
+    if (
+        data.get("document_workflow_event") != "chapter_completed"
+        or not isinstance(markdown, str)
+        or not isinstance(chapter_hash, str)
+        or not _SHA256_RE.fullmatch(chapter_hash)
+        or not isinstance(chapter_bytes, int)
+        or isinstance(chapter_bytes, bool)
+        or chapter_bytes < 1
+        or hashlib.sha256(markdown.strip().encode("utf-8")).hexdigest() != chapter_hash
+        or len(markdown.strip().encode("utf-8")) != chapter_bytes
+        or workflow_id != str(data.get("workflow_id") or "")
+        or chapter_id != str(data.get("chapter_id") or "")
+    ):
+        return None
+    return {
+        "workflow_id": workflow_id,
+        "chapter_id": chapter_id,
+        "markdown": (
+            f"[checkpointed chapter body omitted from model history; utf8_bytes={chapter_bytes}; sha256={chapter_hash}]"
+        ),
+        "summary": str(args.get("summary") or "")[:2_000],
+    }
+
+
+def _replace_call_arguments(call: dict[str, Any], arguments: dict[str, Any]) -> None:
+    function = call.get("function")
+    if not isinstance(function, dict):
+        return
+    updated = dict(function)
+    updated["arguments"] = json.dumps(arguments, ensure_ascii=False, separators=(",", ":"))
+    call["function"] = updated
 
 
 class RuntimeToolBatchMixin:
@@ -195,7 +246,17 @@ class RuntimeToolBatchMixin:
                 success=result.success,
                 duration_ms=result.duration_ms,
             )
-            state.record_tool_call(request.to_dict(), result.to_dict())
+            request_record = request.to_dict()
+            result_record = result.to_dict()
+            chapter_projection = _checkpointed_chapter_projection(request, result)
+            if chapter_projection is not None:
+                request_record["args"] = chapter_projection
+            state.record_tool_call(request_record, result_record)
+            if chapter_projection is not None:
+                # The assistant message is already in ``messages``. Mutate its
+                # matching call only after the managed receipt is durable in
+                # AgentState, and before the Session checkpoint/next request.
+                _replace_call_arguments(call, chapter_projection)
             recovery_decision = self.capability_recovery.observe(
                 state.convergence,
                 request.capability,
@@ -215,8 +276,8 @@ class RuntimeToolBatchMixin:
                         ),
                     }
                 )
-            round_requests.append(request.to_dict())
-            round_results.append(result.to_dict())
+            round_requests.append(request_record)
+            round_results.append(result_record)
             tool_messages.append(
                 {
                     "role": "tool",
@@ -272,8 +333,10 @@ class RuntimeToolBatchMixin:
             self._checkpoint_session(state, messages)
             raise tool_interruption
         made_progress = convergence.observe_round(state, round_requests, round_results)
-        if convergence.enabled or self.config.get("runtime.checkpoint_each_tool", True):
-            self._checkpoint_session(state, messages)
+        # Tool results may describe effects that cannot be replayed safely.  A
+        # complete assistant/tool batch is therefore a durability boundary,
+        # independent of convergence and the legacy per-tool preference.
+        self._checkpoint_session(state, messages)
 
         return ToolBatchOutcome(
             made_progress=made_progress,

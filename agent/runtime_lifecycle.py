@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 from typing import Any
 
 from .convergence import (
@@ -20,6 +21,9 @@ from .progress import ProgressTracker
 from .state import AgentState
 from .task_router import TaskRoute
 from .task_strategy import TaskStrategy
+
+
+logger = logging.getLogger(__name__)
 
 
 class RuntimeLifecycleMixin:
@@ -140,8 +144,9 @@ class RuntimeLifecycleMixin:
                     session_id=state.session_id,
                     run_id=state.run_id,
                 )
-            except Exception:
+            except Exception as exc:
                 metadata.setdefault("observability_errors", []).append("model.requested")
+                self._log_refinement_exception("model.requested", exc)
 
             stage = "model_request"
             response = self.client.chat(
@@ -155,8 +160,9 @@ class RuntimeLifecycleMixin:
             )
             try:
                 state.record_model_response(response)
-            except Exception:
+            except Exception as exc:
                 metadata.setdefault("observability_errors", []).append("model.metrics")
+                self._log_refinement_exception("model.metrics", exc)
             stage = "response_validation"
             refinement = self.memory_refiner.parse_response(
                 response.message,
@@ -182,12 +188,13 @@ class RuntimeLifecycleMixin:
                     session_id=state.session_id,
                     run_id=state.run_id,
                 )
-            except Exception:
+            except Exception as exc:
                 metadata.setdefault("observability_errors", []).append("model.responded")
+                self._log_refinement_exception("model.responded", exc)
             try:
                 state.touch()
-            except Exception:
-                pass
+            except Exception as exc:
+                self._log_refinement_exception("state.touch", exc)
             return refinement.to_dict() if refinement is not None else None
         except Exception as exc:
             http_attempt_count = getattr(exc, "http_attempt_count", 0)
@@ -198,18 +205,20 @@ class RuntimeLifecycleMixin:
             ):
                 try:
                     state.record_model_response(ChatResponse(message={}, raw={}, http_attempt_count=http_attempt_count))
-                except Exception:
-                    pass
+                except Exception as metric_exc:
+                    self._log_refinement_exception("failed_response.metrics", metric_exc)
             try:
                 category = self.resilience.classify(exc).value
-            except Exception:
+            except Exception as classify_exc:
+                self._log_refinement_exception("failure.classification", classify_exc)
                 category = "internal_error"
             metadata.update({"status": "failed", "reason": f"{stage}_{category}"[:160]})
+            self._log_refinement_exception(stage, exc, category=category)
             try:
                 state.convergence["memory_refinement"] = metadata
                 state.touch()
-            except Exception:
-                pass
+            except Exception as persist_exc:
+                self._log_refinement_exception("failure.state_update", persist_exc)
             return None
         finally:
             # This optional stage is downstream of verified completion. Restore
@@ -223,6 +232,18 @@ class RuntimeLifecycleMixin:
                 state.failure_count = failure_count
                 if state.execution_context is not None and prompt_phase is not None:
                     state.execution_context.prompt_phase = prompt_phase
+
+    @staticmethod
+    def _log_refinement_exception(stage: str, exc: BaseException, *, category: str = "recoverable") -> None:
+        level = logging.ERROR if isinstance(exc, OSError) else logging.WARNING
+        logger.log(
+            level,
+            "memory_refinement_failure stage=%s category=%s exception=%s errno=%s",
+            stage,
+            category,
+            type(exc).__name__,
+            getattr(exc, "errno", None),
+        )
 
     def _progress(self, event: str, state: AgentState, **payload: Any) -> None:
         if self.event_pipelines.progress is None:
@@ -250,10 +271,10 @@ class RuntimeLifecycleMixin:
             run_id=state.run_id,
         )
 
-    @staticmethod
-    def _strategy_from_state(state: AgentState) -> TaskStrategy:
+    @classmethod
+    def _strategy_from_state(cls, state: AgentState) -> TaskStrategy:
         value = state.task_strategy or {}
-        return TaskStrategy(
+        return cls._build_task_strategy(
             mode=str(value.get("mode") or "standard"),
             score=int(value.get("score") or 0),
             reasons=tuple(str(item) for item in value.get("reasons", [])),
@@ -262,6 +283,29 @@ class RuntimeLifecycleMixin:
             max_tool_rounds=max(1, int(value.get("max_tool_rounds") or 8)),
             require_plan=bool(value.get("require_plan", False)),
             chunked_context=bool(value.get("chunked_context", False)),
+        )
+
+    @staticmethod
+    def _build_task_strategy(
+        *,
+        mode: str,
+        score: int,
+        reasons: tuple[str, ...],
+        thinking_enabled: bool,
+        reasoning_effort: str | None,
+        max_tool_rounds: int,
+        require_plan: bool,
+        chunked_context: bool,
+    ) -> TaskStrategy:
+        return TaskStrategy(
+            mode=mode,
+            score=score,
+            reasons=reasons,
+            thinking_enabled=thinking_enabled,
+            reasoning_effort=reasoning_effort,
+            max_tool_rounds=max_tool_rounds,
+            require_plan=require_plan,
+            chunked_context=chunked_context,
         )
 
     def _adjust_strategy(
@@ -306,9 +350,9 @@ class RuntimeLifecycleMixin:
         ranks = {"simple": 0, "standard": 1, "large": 2, "deep": 3}
         return previous if ranks.get(previous.mode, 1) > ranks.get(selected.mode, 1) else selected
 
-    @staticmethod
-    def _strategy_from_routes(task: TaskRoute, model: ModelRoute) -> TaskStrategy:
-        return TaskStrategy(
+    @classmethod
+    def _strategy_from_routes(cls, task: TaskRoute, model: ModelRoute) -> TaskStrategy:
+        return cls._build_task_strategy(
             mode=task.mode,
             score=task.score,
             reasons=task.reasons,
@@ -420,6 +464,7 @@ class RuntimeLifecycleMixin:
             session_id=state.session_id,
             run_id=state.run_id,
         )
+        self._refresh_session_notes(state)
 
     def _checkpoint_convergence_transition(
         self,
@@ -453,6 +498,20 @@ class RuntimeLifecycleMixin:
             session_id=state.session_id,
             run_id=state.run_id,
         )
+        self._refresh_session_notes(state)
+
+    def _refresh_session_notes(self, state: AgentState) -> None:
+        builder = getattr(self, "session_memory_builder", None)
+        if builder is None:
+            return
+        try:
+            builder.refresh(state.session_id)
+        except Exception as exc:
+            logger.warning(
+                "session_notes_refresh_failed exception=%s errno=%s",
+                type(exc).__name__,
+                getattr(exc, "errno", None),
+            )
 
     def _persist_failed_terminal(self, state: AgentState, messages: list[dict[str, Any]]) -> None:
         """Persist the failed State before publishing its terminal derivatives.

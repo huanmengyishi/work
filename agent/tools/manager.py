@@ -4,8 +4,9 @@ import json
 import re
 import threading
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
+from ..artifact import ARTIFACT_VERIFICATION_METADATA_KEY
 from ..capability_health import CapabilityHealthManager
 from ..config import AppConfig
 from ..events import EventBus
@@ -19,6 +20,7 @@ from .browser import BrowserTool
 from .capabilities import builtin_capability_declarations
 from .docker import DockerTool
 from .document import DocumentTool
+from .document_generator import DocumentGeneratorTool
 from .executor import ApprovalHandler, ToolExecutionOwnership, ToolExecutor
 from .file_edit import FileEditTool
 from .git import GitTool
@@ -34,6 +36,141 @@ from .shell import ShellTool
 from .templates import SafeTemplateTool
 
 _DATE_LITERAL_RE = re.compile(r"(?<!\d)20\d{2}(?:年\s*\d{1,2}月(?:\s*\d{1,2}日)?|[-/.]\d{1,2}(?:[-/.]\d{1,2})?)(?!\d)")
+
+
+ToolBuilder = Callable[["ToolManager"], Any]
+
+
+def _build_shell(manager: "ToolManager") -> ShellTool:
+    return ShellTool(
+        manager.cwd,
+        manager._capability_timeout("shell.run", 120),
+        max_output_bytes=manager._max_result_bytes,
+    )
+
+
+def _build_python(manager: "ToolManager") -> PythonTool:
+    return PythonTool(
+        manager.cwd,
+        manager._capability_timeout("python.run", 120),
+        max_output_bytes=manager._max_result_bytes,
+    )
+
+
+def _build_git(manager: "ToolManager") -> GitTool:
+    return GitTool(
+        manager.cwd,
+        manager._capability_timeout("git.status", 120),
+        max_output_bytes=manager._max_result_bytes,
+    )
+
+
+def _build_document(manager: "ToolManager") -> DocumentTool:
+    return DocumentTool(
+        manager.cwd,
+        manager._capability_timeout("document.parse", 180),
+        max_input_bytes=manager.config.get_int(
+            "tools.document.max_input_bytes",
+            25_000_000,
+            minimum=1,
+            maximum=1_073_741_824,
+        ),
+        max_result_bytes=manager._max_result_bytes,
+    )
+
+
+def _build_document_generator(manager: "ToolManager") -> DocumentGeneratorTool:
+    return DocumentGeneratorTool(manager.project, manager.document, manager.file_edit)
+
+
+def _build_docker(manager: "ToolManager") -> DockerTool:
+    return DockerTool(
+        manager.cwd,
+        manager._capability_timeout("docker.run", 180),
+        max_output_bytes=manager._max_result_bytes,
+    )
+
+
+def _build_browser(manager: "ToolManager") -> BrowserTool:
+    return BrowserTool(
+        manager.cwd,
+        manager._capability_timeout("browser.open_url", 180),
+        max_download_bytes=manager.config.get_int(
+            "tools.browser.max_download_bytes",
+            100_000_000,
+            minimum=1,
+            maximum=1_073_741_824,
+        ),
+    )
+
+
+def _build_http(manager: "ToolManager") -> HttpTool:
+    allowed_domains = manager.config.get("tools.http.allowed_domains", [])
+    return HttpTool(
+        manager.cwd,
+        allowed_domains=([str(item) for item in allowed_domains] if isinstance(allowed_domains, list) else []),
+        timeout=manager._capability_timeout("http.request", 30),
+        max_response_bytes=manager.config.get_int(
+            "tools.http.max_response_bytes",
+            1_048_576,
+            minimum=1,
+            maximum=104_857_600,
+        ),
+    )
+
+
+def _build_lsp(manager: "ToolManager") -> LSPManager:
+    return LSPManager(
+        manager.cwd,
+        timeout=manager._capability_timeout("lsp.diagnostics", 60),
+        max_diagnostics=manager.config.get_int(
+            "tools.lsp.max_diagnostics",
+            200,
+            minimum=1,
+            maximum=10_000,
+        ),
+    )
+
+
+def _build_file_edit(manager: "ToolManager") -> FileEditTool:
+    return FileEditTool(
+        manager.project,
+        manager.config.get_int(
+            "tools.file.max_file_bytes",
+            2_000_000,
+            minimum=1,
+            maximum=1_073_741_824,
+        ),
+    )
+
+
+def _build_templates(manager: "ToolManager") -> SafeTemplateTool:
+    return SafeTemplateTool(
+        manager.cwd,
+        manager._capability_timeout("template.run_tests", 300),
+        max_input_bytes=manager.config.get_int(
+            "tools.template.max_input_bytes",
+            67_108_864,
+            minimum=1,
+            maximum=1_073_741_824,
+        ),
+        max_result_bytes=manager._max_result_bytes,
+    )
+
+
+TOOL_BUILDERS: dict[str, ToolBuilder] = {
+    "browser": _build_browser,
+    "docker": _build_docker,
+    "document": _build_document,
+    "document_generator": _build_document_generator,
+    "file_edit": _build_file_edit,
+    "git": _build_git,
+    "http": _build_http,
+    "lsp": _build_lsp,
+    "python": _build_python,
+    "shell": _build_shell,
+    "templates": _build_templates,
+}
 
 
 class _DisabledMCPFacade:
@@ -65,20 +202,7 @@ class _DisabledMCPFacade:
 
 
 class ToolManager:
-    _LAZY_TOOL_NAMES = frozenset(
-        {
-            "browser",
-            "docker",
-            "document",
-            "file_edit",
-            "git",
-            "http",
-            "lsp",
-            "python",
-            "shell",
-            "templates",
-        }
-    )
+    _LAZY_TOOL_NAMES = frozenset(TOOL_BUILDERS)
 
     def __init__(
         self,
@@ -111,15 +235,45 @@ class ToolManager:
         self._permission = PermissionManager(config, project.root)
         self.registry = ToolCapabilityRegistry(config)
         self.health = health or CapabilityHealthManager(config, project.id)
-        self._max_result_bytes = int(config.get("tools.tool_result.max_attachment_bytes", 8_388_608))
+        self._max_result_bytes = config.get_int(
+            "tools.tool_result.max_attachment_bytes",
+            8_388_608,
+            minimum=1,
+            maximum=1_073_741_824,
+        )
         self.result_store = ToolResultStore(
             project.agent_dir,
             max_attachment_bytes=self._max_result_bytes,
-            persist_threshold_bytes=int(config.get("tools.tool_result.persist_threshold_bytes", 12_000)),
-            preview_chars=int(config.get("tools.tool_result.preview_chars", 12_000)),
-            max_read_chars=int(config.get("tools.tool_result.max_read_chars", 32_000)),
-            max_attachments_per_session=int(config.get("tools.tool_result.max_attachments_per_session", 512)),
-            max_session_bytes=int(config.get("tools.tool_result.max_session_bytes", 268_435_456)),
+            persist_threshold_bytes=config.get_int(
+                "tools.tool_result.persist_threshold_bytes",
+                12_000,
+                minimum=1,
+                maximum=1_073_741_824,
+            ),
+            preview_chars=config.get_int(
+                "tools.tool_result.preview_chars",
+                12_000,
+                minimum=1,
+                maximum=100_000,
+            ),
+            max_read_chars=config.get_int(
+                "tools.tool_result.max_read_chars",
+                32_000,
+                minimum=1,
+                maximum=100_000,
+            ),
+            max_attachments_per_session=config.get_int(
+                "tools.tool_result.max_attachments_per_session",
+                512,
+                minimum=1,
+                maximum=10_000,
+            ),
+            max_session_bytes=config.get_int(
+                "tools.tool_result.max_session_bytes",
+                268_435_456,
+                minimum=1,
+                maximum=1_073_741_824,
+            ),
         )
         self._register_capabilities()
         self._mcp_instance: MCPManager | None = None
@@ -376,70 +530,7 @@ class ToolManager:
             return instance
 
     def _build_lazy_tool(self, name: str) -> Any:
-        if name == "shell":
-            return ShellTool(
-                self.cwd,
-                self._capability_timeout("shell.run", 120),
-                max_output_bytes=self._max_result_bytes,
-            )
-        if name == "python":
-            return PythonTool(
-                self.cwd,
-                self._capability_timeout("python.run", 120),
-                max_output_bytes=self._max_result_bytes,
-            )
-        if name == "git":
-            return GitTool(
-                self.cwd,
-                self._capability_timeout("git.status", 120),
-                max_output_bytes=self._max_result_bytes,
-            )
-        if name == "document":
-            return DocumentTool(
-                self.cwd,
-                self._capability_timeout("document.parse", 180),
-                max_input_bytes=int(self.config.get("tools.document.max_input_bytes", 25_000_000)),
-                max_result_bytes=self._max_result_bytes,
-            )
-        if name == "docker":
-            return DockerTool(
-                self.cwd,
-                self._capability_timeout("docker.run", 180),
-                max_output_bytes=self._max_result_bytes,
-            )
-        if name == "browser":
-            return BrowserTool(
-                self.cwd,
-                self._capability_timeout("browser.open_url", 180),
-                max_download_bytes=int(self.config.get("tools.browser.max_download_bytes", 100_000_000)),
-            )
-        if name == "http":
-            allowed_domains = self.config.get("tools.http.allowed_domains", [])
-            return HttpTool(
-                self.cwd,
-                allowed_domains=([str(item) for item in allowed_domains] if isinstance(allowed_domains, list) else []),
-                timeout=self._capability_timeout("http.request", 30),
-                max_response_bytes=int(self.config.get("tools.http.max_response_bytes", 1_048_576)),
-            )
-        if name == "lsp":
-            return LSPManager(
-                self.cwd,
-                timeout=self._capability_timeout("lsp.diagnostics", 60),
-                max_diagnostics=int(self.config.get("tools.lsp.max_diagnostics", 200)),
-            )
-        if name == "file_edit":
-            return FileEditTool(
-                self.project,
-                int(self.config.get("tools.file.max_file_bytes", 2_000_000)),
-            )
-        if name == "templates":
-            return SafeTemplateTool(
-                self.cwd,
-                self._capability_timeout("template.run_tests", 300),
-                max_input_bytes=int(self.config.get("tools.template.max_input_bytes", 67_108_864)),
-                max_result_bytes=self._max_result_bytes,
-            )
-        raise AttributeError(f"unknown lazy tool: {name}")
+        return TOOL_BUILDERS[name](self)
 
     def _capability_timeout(self, capability_name: str, default: int) -> int:
         capability, _handler = self.registry.resolve(capability_name)
@@ -588,7 +679,12 @@ class ToolManager:
             return ToolResult(False, "", "document_render_docx path must end with .docx")
         markdown_limit = max(
             1,
-            min(int(self.config.get("tools.document.max_render_chars", 250_000)), 1_000_000),
+            self.config.get_int(
+                "tools.document.max_render_chars",
+                250_000,
+                minimum=1,
+                maximum=1_000_000,
+            ),
         )
         if len(markdown) > markdown_limit:
             return ToolResult(False, "", f"document_render_docx markdown exceeds {markdown_limit} characters")
@@ -614,6 +710,95 @@ class ToolManager:
             }
         )[:100]
         return ToolResult(preview.success, preview.stdout, preview.stderr, data=data)
+
+    def _document_generator_create_outline(
+        self,
+        title: str,
+        output_path: str,
+        chapters: list[dict[str, Any]],
+    ) -> ToolResult:
+        return self.document_generator.create_outline(
+            session_id=self._require_state().session_id,
+            title=title,
+            output_path=output_path,
+            chapters=chapters,
+        )
+
+    def _document_generator_confirm_outline(self, workflow_id: str, outline_hash: str) -> ToolResult:
+        return self.document_generator.confirm_outline(
+            session_id=self._require_state().session_id,
+            workflow_id=workflow_id,
+            outline_hash=outline_hash,
+        )
+
+    def _document_generator_next_chapter(self, workflow_id: str) -> ToolResult:
+        return self.document_generator.next_chapter(
+            session_id=self._require_state().session_id,
+            workflow_id=workflow_id,
+        )
+
+    def _document_generator_save_chapter(
+        self,
+        workflow_id: str,
+        chapter_id: str,
+        markdown: str,
+        summary: str,
+    ) -> ToolResult:
+        return self.document_generator.save_chapter(
+            session_id=self._require_state().session_id,
+            workflow_id=workflow_id,
+            chapter_id=chapter_id,
+            markdown=markdown,
+            summary=summary,
+        )
+
+    def _document_generator_rollback_chapter(self, workflow_id: str, chapter_id: str) -> ToolResult:
+        return self.document_generator.rollback_chapter(
+            session_id=self._require_state().session_id,
+            workflow_id=workflow_id,
+            chapter_id=chapter_id,
+        )
+
+    def _document_generator_status(self, workflow_id: str) -> ToolResult:
+        return self.document_generator.status(
+            session_id=self._require_state().session_id,
+            workflow_id=workflow_id,
+        )
+
+    def _document_generator_render(self, workflow_id: str) -> ToolResult:
+        return self.document_generator.render(
+            session_id=self._require_state().session_id,
+            workflow_id=workflow_id,
+        )
+
+    def _document_generator_finalize(self, workflow_id: str) -> ToolResult:
+        state = self._require_state()
+        status = self.document_generator.status(session_id=state.session_id, workflow_id=workflow_id)
+        if not status.success:
+            return status
+        verification_result: dict[str, Any] | None = None
+        output_path = str((status.data or {}).get("output_path") or "")
+        if Path(output_path).suffix.lower() == ".docx":
+            artifacts = state.artifact_registry.get("artifacts")
+            entry = artifacts.get(output_path) if isinstance(artifacts, dict) else None
+            preview_id = str((status.data or {}).get("render_preview_id") or "")
+            if (
+                isinstance(entry, dict)
+                and entry.get("verified") is True
+                and entry.get("workflow_id") == workflow_id
+                and entry.get("workflow_render_preview_id") == preview_id
+                and entry.get("workflow_apply_matches") is True
+                and isinstance(entry.get("verification"), dict)
+            ):
+                verification_result = {
+                    "success": True,
+                    "data": {ARTIFACT_VERIFICATION_METADATA_KEY: dict(entry["verification"])},
+                }
+        return self.document_generator.finalize(
+            session_id=state.session_id,
+            workflow_id=workflow_id,
+            verification_result=verification_result,
+        )
 
     def _docker_run(self, args: list[str]) -> ToolResult:
         return self.docker.run(args)

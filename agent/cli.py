@@ -16,6 +16,7 @@ from .config import AppConfig, load_config
 from .console import ConsoleUI
 from .context import ContextBuilder
 from .deepseek import DeepSeekClient, missing_api_key_message
+from .diagnostics import LOG_LEVELS, configure_logging
 from .daemon import ProjectDaemon
 from .global_knowledge import GlobalKnowledgeBase
 from .memory import MemoryStore
@@ -52,6 +53,8 @@ COMMANDS = {
 
 def main(argv: list[str] | None = None) -> int:
     values = list(sys.argv[1:] if argv is None else argv)
+    values, log_level = _extract_log_level(values)
+    configure_logging(log_level)
     auto_approve = "--auto-approve" in values
     yolo_flag = "--yolo" in values
     super_yolo_flag = "--super-yolo" in values
@@ -144,6 +147,39 @@ def main(argv: list[str] | None = None) -> int:
     return 2
 
 
+def _extract_log_level(values: list[str]) -> tuple[list[str], str]:
+    """Extract the global diagnostic flag before config loading or dispatch."""
+
+    cleaned: list[str] = []
+    selected = "WARNING"
+    index = 0
+    while index < len(values):
+        value = values[index]
+        if value == "--":
+            cleaned.extend(values[index:])
+            break
+        if value == "--log-level":
+            if index + 1 >= len(values):
+                _log_level_error("argument --log-level: expected one argument")
+            selected = values[index + 1].upper()
+            index += 2
+        elif value.startswith("--log-level="):
+            selected = value.partition("=")[2].upper()
+            index += 1
+        else:
+            cleaned.append(value)
+            index += 1
+        if selected not in LOG_LEVELS:
+            choices = ", ".join(sorted(LOG_LEVELS))
+            _log_level_error(f"argument --log-level: invalid choice; choose from {choices}")
+    return cleaned, selected
+
+
+def _log_level_error(message: str) -> None:
+    parser = argparse.ArgumentParser(prog="agent", add_help=False)
+    parser.error(message)
+
+
 def build_help_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="agent",
@@ -157,6 +193,12 @@ def build_help_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--version", action="store_true", help="Show the installed version.")
+    parser.add_argument(
+        "--log-level",
+        choices=sorted(LOG_LEVELS),
+        default="WARNING",
+        help="Set safe diagnostic verbosity (default: WARNING).",
+    )
     parser.add_argument(
         "--auto-approve",
         action="store_true",
@@ -830,13 +872,22 @@ def cmd_parallel(
     super_yolo: bool = False,
 ) -> int:
     project = ProjectManager(config).resolve_project(Path.cwd())
-    runner = ParallelWorktreeRunner(project, config.data_dir)
+    runner = ParallelWorktreeRunner(
+        project,
+        config.data_dir,
+        task_timeout_seconds=config.get_int(
+            "runtime.parallel_subprocess_timeout_seconds",
+            3_600,
+            minimum=1,
+            maximum=86_400,
+        ),
+    )
     flags = ["--super-yolo"] if super_yolo else ["--yolo"] if yolo else ["--auto-approve"]
     try:
         run_id, results = runner.run(
             args.tasks,
-            min_tasks=int(config.get("runtime.parallel_min_tasks", 8)),
-            max_workers=args.workers or int(config.get("runtime.parallel_max_workers", 4)),
+            min_tasks=config.get_int("runtime.parallel_min_tasks", 8, minimum=1, maximum=128),
+            max_workers=args.workers or config.get_int("runtime.parallel_max_workers", 4, minimum=1, maximum=64),
             agent_flags=flags,
         )
     except Exception as exc:
@@ -867,8 +918,18 @@ def repl(
         super_yolo=super_yolo,
         show_thinking=bool(config.get("runtime.show_thinking", True)),
         show_reasoning_content=bool(config.get("runtime.show_reasoning_content", True)),
-        progress_interval_seconds=int(config.get("runtime.progress_interval_seconds", 10)),
-        hard_tool_turn_limit=int(config.get("runtime.max_tool_rounds_hard_limit", 32)),
+        progress_interval_seconds=config.get_int(
+            "runtime.progress_interval_seconds",
+            10,
+            minimum=1,
+            maximum=3_600,
+        ),
+        hard_tool_turn_limit=config.get_int(
+            "runtime.max_tool_rounds_hard_limit",
+            32,
+            minimum=1,
+            maximum=1_024,
+        ),
     )
     runtime = build_runtime(
         config,
@@ -927,6 +988,14 @@ def repl(
                 "Approval mode: "
                 + ("SUPER YOLO" if runtime.tools.super_yolo else "YOLO" if runtime.tools.yolo else "safe")
             )
+            continue
+        if prompt == "/vector-retry":
+            if not bool(config.get("memory.vector_enabled", False)):
+                ui.info("Vector memory is disabled in configuration; no load failure was reset.")
+            elif memory.vector.reset_load_failure():
+                ui.info("Vector memory load failure was reset; the next vector operation will retry once.")
+            else:
+                ui.info("Vector memory has no failed load to reset.")
             continue
         if prompt.startswith("/yolo"):
             parts = prompt.split(maxsplit=1)

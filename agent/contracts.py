@@ -8,10 +8,10 @@ a compatibility change and must increment ``CORE_INTERFACE_CONTRACT_VERSION``.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, ContextManager, Protocol, runtime_checkable
+from typing import Any, ContextManager, Iterable, Protocol, runtime_checkable
 
 
-CORE_INTERFACE_CONTRACT_VERSION = 5
+CORE_INTERFACE_CONTRACT_VERSION = 6
 CORE_INTERFACE_CHAIN = (
     "CLI",
     "Runtime",
@@ -201,6 +201,124 @@ class SessionStoreProtocol(Protocol):
 
 
 @runtime_checkable
+class MemoryStoreProtocol(Protocol):
+    """Memory surface shared by Runtime, tool, and event-pipeline boundaries."""
+
+    def search(
+        self,
+        query: str,
+        project_id: str | None = None,
+        limit: int | None = None,
+        *,
+        global_only: bool = False,
+        record_usage: bool = True,
+        kinds: Iterable[Any] | None = None,
+        truncate_query: bool = False,
+    ) -> list[Any]: ...
+
+    def search_recovery(self, error_text: str, project_id: str, limit: int = 4) -> list[Any]: ...
+
+    def add_memory(
+        self,
+        *,
+        kind: Any,
+        title: str,
+        content: str,
+        tags: Iterable[str] = (),
+        project_id: str | None = None,
+        confidence: float | None = None,
+        expires_at: str | None = None,
+    ) -> int: ...
+
+    def get_memory(self, memory_id: int) -> Any | None: ...
+
+    def list_memories(
+        self,
+        *,
+        project_id: str | None = None,
+        limit: int = 50,
+        kind: str | None = None,
+        tag: str | None = None,
+        global_only: bool = False,
+        include_global: bool = True,
+    ) -> list[Any]: ...
+
+    def update_memory(
+        self,
+        memory_id: int,
+        *,
+        title: str | None = None,
+        content: str | None = None,
+        tags: Iterable[str] | None = None,
+        confidence: float | None = None,
+        expires_at: str | None = None,
+    ) -> Any: ...
+
+    def delete_memory(
+        self,
+        memory_id: int,
+        *,
+        project_id: object = ...,
+        kinds: Iterable[Any] | None = None,
+    ) -> bool: ...
+
+    def record_usage_once(
+        self,
+        usage_id: str,
+        memory_ids: Iterable[int],
+        *,
+        run_id: str,
+        project_id: str | None,
+    ) -> bool: ...
+
+    def is_pipeline_run_processed(self, run_id: str) -> bool: ...
+
+    def mark_pipeline_run_processed(
+        self,
+        run_id: str,
+        project_id: str | None,
+        summary_memory_id: int | None,
+        experience_memory_id: int | None,
+    ) -> None: ...
+
+    def update_summary(self, *, scope: str, content: str, project_id: str | None = None) -> None: ...
+
+    def persist_lesson_file(
+        self,
+        *,
+        kind: Any,
+        title: str,
+        content: str,
+        project: Any | None,
+        global_memory: bool = True,
+    ) -> None: ...
+
+
+@runtime_checkable
+class RecoveryControllerProtocol(Protocol):
+    """Deterministic capability backoff consumed by the Runtime tool loop."""
+
+    def before_call(
+        self,
+        convergence: dict[str, Any],
+        capability: str,
+        *,
+        current_round: int,
+    ) -> Any: ...
+
+    def observe(
+        self,
+        convergence: dict[str, Any],
+        capability: str,
+        *,
+        current_round: int,
+        success: bool,
+        health_failure: bool,
+        health_status: str,
+    ) -> Any: ...
+
+
+@runtime_checkable
 class ContextBuilderProtocol(Protocol):
     """Project snapshot and ContextPackage construction consumed by Runtime."""
 
@@ -228,8 +346,10 @@ __all__ = [
     "AGENT_STATE_SERIALIZED_FIELDS",
     "AGENT_STATE_FROZEN_FIELDS",
     "ContextBuilderProtocol",
+    "MemoryStoreProtocol",
     "ModelClientProtocol",
     "PromptBuilderProtocol",
+    "RecoveryControllerProtocol",
     "RuntimeToolsProtocol",
     "SessionStoreProtocol",
     "ToolExecutorProtocol",

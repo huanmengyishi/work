@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Any, Protocol
 
 from .task_router import TaskRoute
@@ -11,12 +10,16 @@ class TaskPlanStrategy(Protocol):
 
     task_types: frozenset[str]
 
+    def matches(self, route: TaskRoute) -> bool: ...
+
     def build(self, route: TaskRoute) -> list[dict[str, Any]]: ...
 
 
-@dataclass(frozen=True)
 class DocumentWorkflowStrategy:
     task_types: frozenset[str] = frozenset({"document_workflow"})
+
+    def matches(self, route: TaskRoute) -> bool:
+        return route.task_type in self.task_types
 
     def build(self, route: TaskRoute) -> list[dict[str, Any]]:
         scale_rounds = _scale_rounds(route)
@@ -98,10 +101,12 @@ class DocumentWorkflowStrategy:
         return steps
 
 
-@dataclass(frozen=True)
 class ChangeWorkflowStrategy:
-    task_types: frozenset[str]
-    title: str
+    task_types: frozenset[str] = frozenset()
+    title = "Implement bounded changes"
+
+    def matches(self, route: TaskRoute) -> bool:
+        return route.task_type in self.task_types
 
     def build(self, route: TaskRoute) -> list[dict[str, Any]]:
         criteria = "Requested changes are applied through the managed file workflow."
@@ -114,23 +119,32 @@ class ChangeWorkflowStrategy:
 
 
 class BugFixStrategy(ChangeWorkflowStrategy):
-    def __init__(self) -> None:
-        super().__init__(frozenset({"bug_fix"}), "Implement the proven root-cause fix")
+    task_types = frozenset({"bug_fix"})
+    title = "Implement the proven root-cause fix"
 
 
 class FeatureDevStrategy(ChangeWorkflowStrategy):
-    def __init__(self) -> None:
-        super().__init__(frozenset({"feature_development"}), "Implement the bounded feature and acceptance behavior")
+    task_types = frozenset({"feature_development"})
+    title = "Implement the bounded feature and acceptance behavior"
 
 
 class RefactorStrategy(ChangeWorkflowStrategy):
-    def __init__(self) -> None:
-        super().__init__(frozenset({"refactor"}), "Refactor while preserving observable behavior")
+    task_types = frozenset({"refactor"})
+    title = "Refactor while preserving observable behavior"
 
 
-@dataclass(frozen=True)
+class MutationWorkflowStrategy(ChangeWorkflowStrategy):
+    """Catch mutation intent after all task-type-specific strategies."""
+
+    def matches(self, route: TaskRoute) -> bool:
+        return route.task_type != "document_workflow" and "mutation-request" in route.reasons
+
+
 class EvidenceWorkflowStrategy:
     task_types: frozenset[str] = frozenset({"question", "code_explanation", "review", "architecture"})
+
+    def matches(self, route: TaskRoute) -> bool:
+        return route.task_type in self.task_types
 
     def build(self, route: TaskRoute) -> list[dict[str, Any]]:
         titles = {
@@ -154,6 +168,7 @@ class TaskPlanFactory:
             BugFixStrategy(),
             FeatureDevStrategy(),
             RefactorStrategy(),
+            MutationWorkflowStrategy(),
             EvidenceWorkflowStrategy(),
         )
 
@@ -162,15 +177,10 @@ class TaskPlanFactory:
             raise TypeError("TaskPlanFactory requires a TaskRoute from TaskRouter")
         if not route.require_plan:
             return []
-        if route.task_type != "document_workflow" and "mutation-request" in route.reasons:
-            return ChangeWorkflowStrategy(
-                frozenset({route.task_type}),
-                "Implement bounded changes",
-            ).build(route)
         for strategy in self.strategies:
-            if route.task_type in strategy.task_types:
+            if strategy.matches(route):
                 return strategy.build(route)
-        fallback: TaskPlanStrategy = EvidenceWorkflowStrategy(frozenset({route.task_type}))
+        fallback: TaskPlanStrategy = EvidenceWorkflowStrategy()
         return fallback.build(route)
 
 
@@ -280,6 +290,7 @@ __all__ = [
     "DocumentWorkflowStrategy",
     "EvidenceWorkflowStrategy",
     "FeatureDevStrategy",
+    "MutationWorkflowStrategy",
     "RefactorStrategy",
     "TaskPlanFactory",
     "TaskPlanStrategy",

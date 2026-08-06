@@ -29,7 +29,7 @@ class RuntimeSynthesisMixin:
         round_number: int,
         request_phase: str,
     ) -> ChatResponse:
-        if response.finish_reason != "length":
+        if response.finish_reason != "length" or not isinstance(response.message, dict):
             return response
         partial = str(response.message.get("content") or "")
         # Tool-call JSON may be incomplete. Never write or execute it.
@@ -73,6 +73,14 @@ class RuntimeSynthesisMixin:
                 phase=request_phase,
                 counter="length_continuation_count",
             )
+            self._progress(
+                "model.length_continuation_requested",
+                state,
+                round=round_number,
+                attempt=attempt,
+                max_attempts=max_continuations,
+                phase=request_phase,
+            )
             try:
                 last = self.client.chat(
                     messages=continuation_messages,
@@ -96,6 +104,14 @@ class RuntimeSynthesisMixin:
                 raise
             total_http_attempts += max(0, int(last.http_attempt_count or 0))
             total_usage = self._merge_usage(total_usage, last.usage)
+            if not isinstance(last.message, dict):
+                return ChatResponse(
+                    message=last.message,
+                    raw=last.raw,
+                    finish_reason=last.finish_reason,
+                    usage=total_usage,
+                    http_attempt_count=total_http_attempts,
+                )
             piece = str(last.message.get("content") or "")
             combined += piece
             continuation_messages.append({"role": "assistant", "content": piece})
@@ -279,7 +295,14 @@ class RuntimeSynthesisMixin:
                 "thinking.content",
                 state,
                 round=synthesis_round,
-                content=reasoning[: int(self.config.get("runtime.max_reasoning_display_chars", 4000))],
+                content=reasoning[
+                    : self._bounded_config_int(
+                        "runtime.max_reasoning_display_chars",
+                        4_000,
+                        minimum=0,
+                        maximum=1_000_000,
+                    )
+                ],
             )
         self.events.publish(
             "model.responded",
@@ -327,11 +350,7 @@ class RuntimeSynthesisMixin:
             )
 
     def _bounded_config_int(self, dotted: str, default: int, *, minimum: int, maximum: int) -> int:
-        try:
-            parsed = int(self.config.get(dotted, default))
-        except (TypeError, ValueError, OverflowError):
-            parsed = default
-        return max(minimum, min(parsed, maximum))
+        return self.config.get_int(dotted, default, minimum=minimum, maximum=maximum)
 
 
 __all__ = ["RuntimeSynthesisMixin"]

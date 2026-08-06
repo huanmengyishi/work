@@ -107,7 +107,7 @@ class ModelRouter:
             model=model,
             thinking_enabled=thinking_enabled,
             reasoning_effort=reasoning_effort,
-            max_tokens=_positive_int(self.config.get("model.max_tokens", 4096), default=4096),
+            max_tokens=self.config.get_int("model.max_tokens", 4_096, minimum=1, maximum=10_000_000),
             cost_class=_cost_class_for_tier(tier),
             reasons=tuple(dict.fromkeys(reasons)),
         )

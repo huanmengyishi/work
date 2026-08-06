@@ -14,8 +14,33 @@ DEFAULT_DENY_SHELL_PATTERNS = (
     r"(?i)(?:^|[;&|]\s*)sudo(?:\s|$)",
     r"(?i)(?:^|[;&|]\s*)su(?:\s|$)",
     r"(?i)\b(?:shutdown|reboot|poweroff|halt|mkfs(?:\.[a-z0-9]+)?|fdisk|parted)\b",
-    r"(?i)\brm\s+(?:-[a-z]*r[a-z]*f[a-z]*|-[a-z]*f[a-z]*r[a-z]*)\s+(?:--no-preserve-root\s+)?(?:/|~|\$HOME|\.\.?)(?:\s|$)",
+    (
+        r"(?i)\brm\b"
+        r"(?=[^;&|\n]*(?:(?:-[a-z]*r[a-z]*f[a-z]*|-[a-z]*f[a-z]*r[a-z]*)\b|"
+        r"(?:-r|--recursive)\b[^;&|\n]*(?:-f|--force)\b|"
+        r"(?:-f|--force)\b[^;&|\n]*(?:-r|--recursive)\b))"
+        r"[^;&|\n]*?(?:^|\s)(?:--\s+)?[\"']?"
+        r"(?:/+(?:\*+)?|~/?|\$(?:HOME|\{HOME\})/?|\.\.?/?(?:\*+)?)"
+        r"[\"']?(?:\s|$)"
+    ),
     r"(?i)\bchmod\s+(?:-[a-z]*R[a-z]*\s+)?777\s+/(?:\s|$)",
+    (
+        r"(?is)\b(?:curl|wget)\b[^;&|\n]*\|\s*"
+        r"(?:(?:env|command|nohup)\s+)*(?:/[\w./-]+/)?"
+        r"(?:(?:ba|da|z|k)?sh|python(?:3(?:\.\d+)?)?|perl|ruby|node)\b"
+    ),
+    (
+        r"(?is)\b(?:(?:ba|da|z|k)?sh|python(?:3(?:\.\d+)?)?|perl|ruby|node)\b"
+        r"[^;&|\n]*<\s*\(\s*(?:curl|wget)\b"
+    ),
+    r"(?is):\s*\(\s*\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:",
+    r"(?is)\b([a-z_]\w*)\s*\(\s*\)\s*\{\s*\1\s*\|\s*\1\s*&\s*\}\s*;\s*\1\b",
+    r"(?i)(?:^|[\\/=\s\"'`(:])\.project-?agent(?:$|[\\/)\s\"'`;&|])",
+    (
+        r"(?i)(?:^|[\\/=\s\"'`(:])\."
+        r"(?:config[\\/]deep-agent|local[\\/]share[\\/]deep-agent)"
+        r"(?:$|[\\/)\s\"'`;&|])"
+    ),
 )
 
 
@@ -85,8 +110,9 @@ class PermissionManager:
             return PermissionDecision(False, "shell command is empty")
         if "\x00" in command:
             return PermissionDecision(False, "shell command contains a NUL byte")
-        configured = self.config.get("permissions.deny_shell_patterns", list(DEFAULT_DENY_SHELL_PATTERNS))
-        patterns = configured if isinstance(configured, list) else list(DEFAULT_DENY_SHELL_PATTERNS)
+        configured = self.config.get("permissions.deny_shell_patterns", [])
+        extensions = configured if isinstance(configured, list) else []
+        patterns = [*DEFAULT_DENY_SHELL_PATTERNS, *extensions]
         for pattern in patterns:
             try:
                 if re.search(str(pattern), command):

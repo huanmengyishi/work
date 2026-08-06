@@ -182,6 +182,18 @@ class IntentJournal:
                 redact_sensitive_text(str(state.current_step or ""), maximum=80),
                 160,
             ),
+            "execution_decision": self._execution_decision(state),
+            "error": self._bounded_text(
+                redact_sensitive_text(str(state.error or ""), maximum=1_000),
+                1_024,
+            ),
+            "recent_error": self._bounded_text(
+                redact_sensitive_text(
+                    str(state.execution_context.recent_error if state.execution_context is not None else ""),
+                    maximum=1_000,
+                ),
+                1_024,
+            ),
             "external_impacts": projected_impacts,
             "external_impacts_projection": impact_projection,
             "resume_checkpoint": self._safe_checkpoint(state.resume_checkpoint),
@@ -464,7 +476,14 @@ class IntentJournal:
             return []
         impacts: list[dict[str, Any]] = []
         for path, value in list(artifacts.items())[:MAX_ARTIFACT_REGISTRY_ITEMS]:
-            if not isinstance(value, dict) or value.get("state") not in {"generated", "verified"}:
+            if not isinstance(value, dict):
+                continue
+            artifact_state = str(value.get("state") or "")
+            workflow_id = str(value.get("workflow_id") or "")
+            is_document_workflow_progress = (
+                artifact_state in {"planned", "in_progress"} and 1 <= len(workflow_id) <= 200
+            )
+            if artifact_state not in {"generated", "verified"} and not is_document_workflow_progress:
                 continue
             all_step_ids = [
                 cls._bounded_text(redact_sensitive_text(str(item), maximum=80), 160)
@@ -480,7 +499,16 @@ class IntentJournal:
                 {
                     "path": cls._bounded_text(redact_sensitive_text(str(path), maximum=500), 512),
                     "kind": cls._bounded_text(str(value.get("kind") or "file"), 32),
-                    "state": cls._bounded_text(str(value.get("state") or "generated"), 32),
+                    "state": cls._bounded_text(artifact_state or "generated", 32),
+                    "workflow_id": cls._bounded_text(workflow_id, 200),
+                    "workflow_status": cls._bounded_text(str(value.get("workflow_status") or ""), 64),
+                    "workflow_event": cls._bounded_text(str(value.get("workflow_event") or ""), 64),
+                    "completed_chapters": cls._bounded_non_negative_int(value.get("completed_chapters")),
+                    "total_chapters": cls._bounded_non_negative_int(value.get("total_chapters")),
+                    "chapter_id": cls._bounded_text(str(value.get("chapter_id") or ""), 64),
+                    "chapter_sha256": cls._bounded_text(str(value.get("chapter_sha256") or ""), 64),
+                    "preview_id": cls._bounded_text(str(value.get("workflow_render_preview_id") or ""), 200),
+                    "workflow_finalized": value.get("workflow_finalized") is True,
                     "snapshot_id": cls._bounded_text(
                         redact_sensitive_text(str(value.get("snapshot_id") or ""), maximum=200),
                         256,
@@ -492,6 +520,26 @@ class IntentJournal:
                 }
             )
         return impacts
+
+    @staticmethod
+    def _bounded_non_negative_int(value: object) -> int:
+        return max(0, min(value, 1_000_000)) if isinstance(value, int) and not isinstance(value, bool) else 0
+
+    @classmethod
+    def _execution_decision(cls, state: AgentState) -> dict[str, str]:
+        route = state.task_route if isinstance(state.task_route, dict) else {}
+        strategy = state.task_strategy if isinstance(state.task_strategy, dict) else {}
+        values = {
+            "mode": strategy.get("mode"),
+            "task_type": route.get("task_type"),
+            "scale": route.get("scale"),
+            "risk": route.get("risk"),
+        }
+        return {
+            key: cls._bounded_text(redact_sensitive_text(str(value), maximum=80), 160)
+            for key, value in values.items()
+            if value is not None and str(value).strip()
+        }
 
     @classmethod
     def _project_values(cls, values: list[str], *, budget: int) -> tuple[list[str], dict[str, Any]]:

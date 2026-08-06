@@ -9,6 +9,7 @@ PRIVATE_AGENT_DIRS = {
     "snapshots",
     "browser-sessions",
     "downloads",
+    "document-workflows",
     "queues",
     "parallel",
     "memory",

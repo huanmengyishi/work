@@ -4,8 +4,8 @@ import re
 from typing import Any, Mapping
 
 from .config import AppConfig
+from .contracts import MemoryStoreProtocol
 from .events import Event, EventBus
-from .memory import MemoryStore
 from .memory_refinement import MemoryRefiner, redact_sensitive_text, sanitize_memory_tags
 from .project import Project
 from .reflection import ReflectionEngine
@@ -19,7 +19,7 @@ class MemoryPipeline:
         *,
         config: AppConfig,
         project: Project,
-        memory: MemoryStore,
+        memory: MemoryStoreProtocol,
         events: EventBus,
     ) -> None:
         self.config = config

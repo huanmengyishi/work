@@ -88,10 +88,11 @@ class SessionManager:
         path = self._json_path(state.session_id)
         previous_generations: list[dict[str, Any]] = []
         transient_paths: set[Path] = set()
+        backup_payload: dict[str, Any] | None = None
         committed = False
         try:
             if path.exists() or path.is_symlink():
-                previous_generations, transient_paths = self._existing_message_generations(path)
+                previous_generations, transient_paths, backup_payload = self._existing_message_generations(path)
             generation = uuid4().hex
             message_name = f"{state.session_id}.{generation}.messages.jsonl"
             message_path = self.session_dir / message_name
@@ -116,6 +117,11 @@ class SessionManager:
                 raise ValueError(f"session checkpoint exceeds the {self.MAX_SESSION_FILE_BYTES} byte limit")
             self._atomic_write_bytes(message_path, message_content)
             transient_paths.add(message_path)
+            if backup_payload is not None:
+                backup_content = json.dumps(backup_payload, ensure_ascii=False, indent=2) + "\n"
+                if len(backup_content.encode("utf-8")) > self.MAX_SESSION_FILE_BYTES:
+                    raise ValueError(f"session backup exceeds the {self.MAX_SESSION_FILE_BYTES} byte limit")
+                self._atomic_write(self._backup_path(path), backup_content)
             self._atomic_write(path, content)
             committed = True
         finally:
@@ -309,6 +315,18 @@ class SessionManager:
         return items
 
     def _read_payload(self, path: Path) -> dict[str, Any]:
+        try:
+            return self._read_payload_file(path)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            try:
+                return self._read_payload_file(self._backup_path(path))
+            except (OSError, ValueError) as backup_error:
+                raise SessionInconsistencyError(
+                    "session checkpoint is corrupted and no usable backup is available; "
+                    f"start a new session or restore a trusted backup: {path}"
+                ) from backup_error
+
+    def _read_payload_file(self, path: Path) -> dict[str, Any]:
         metadata = path.lstat()
         if not stat.S_ISREG(metadata.st_mode):
             raise ValueError(f"session path is not a regular file: {path}")
@@ -317,9 +335,33 @@ class SessionManager:
         flags = os.O_RDONLY
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
-        descriptor = os.open(path, flags)
-        with os.fdopen(descriptor, "r", encoding="utf-8") as handle:
-            payload = json.load(handle)
+        try:
+            descriptor = os.open(path, flags)
+        except OSError as exc:
+            raise SessionInconsistencyError(f"session path cannot be opened safely: {path}") from exc
+        try:
+            opened = os.fstat(descriptor)
+            if not stat.S_ISREG(opened.st_mode) or (opened.st_dev, opened.st_ino) != (
+                metadata.st_dev,
+                metadata.st_ino,
+            ):
+                raise SessionInconsistencyError(f"session path changed during secure open: {path}")
+            if opened.st_size != metadata.st_size:
+                raise SessionInconsistencyError(f"session path changed during secure open: {path}")
+            with os.fdopen(descriptor, "r", encoding="utf-8") as handle:
+                descriptor = -1
+                payload = json.load(handle)
+                completed = os.fstat(handle.fileno())
+                if (
+                    completed.st_dev,
+                    completed.st_ino,
+                    completed.st_size,
+                    completed.st_mtime_ns,
+                ) != (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns):
+                    raise SessionInconsistencyError(f"session path changed while it was being read: {path}")
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
         if not isinstance(payload, dict):
             raise SessionInconsistencyError(f"invalid session file: {path}")
         return payload
@@ -470,7 +512,21 @@ class SessionManager:
             descriptor = os.open(message_path, flags)
         except OSError as exc:
             raise SessionInconsistencyError(f"session message path cannot be opened safely: {message_path}") from exc
-        return os.fdopen(descriptor, "rb")
+        try:
+            opened = os.fstat(descriptor)
+            if not stat.S_ISREG(opened.st_mode) or (opened.st_dev, opened.st_ino) != (
+                file_metadata.st_dev,
+                file_metadata.st_ino,
+            ):
+                raise SessionInconsistencyError(f"session message path changed during secure open: {message_path}")
+            if opened.st_size != expected_bytes:
+                raise SessionInconsistencyError(
+                    f"session message byte count does not match its manifest: {message_path}"
+                )
+            return os.fdopen(descriptor, "rb")
+        except Exception:
+            os.close(descriptor)
+            raise
 
     def _message_store_path(self, session_path: Path, metadata: dict[str, Any]) -> tuple[Path, int]:
         if metadata.get("format") != "jsonl":
@@ -533,7 +589,7 @@ class SessionManager:
     def _existing_message_generations(
         self,
         session_path: Path,
-    ) -> tuple[list[dict[str, Any]], set[Path]]:
+    ) -> tuple[list[dict[str, Any]], set[Path], dict[str, Any]]:
         payload = self._read_payload(session_path)
         state_data = self._state_data(payload, session_path)
         existing_state = AgentState.from_dict(state_data)
@@ -556,7 +612,7 @@ class SessionManager:
                 recorded_at=existing_state.updated_at,
             )
             self._atomic_write_bytes(path, content)
-            return [metadata], {path}
+            return [metadata], {path}, payload
         if schema_version != self.PAYLOAD_SCHEMA_VERSION or not isinstance(message_store, dict):
             raise SessionInconsistencyError(f"invalid session file: {session_path}")
         cold = self._cold_generation_metadata(payload, session_path)
@@ -565,7 +621,10 @@ class SessionManager:
         paths = [self._message_store_path(session_path, item)[0] for item in [*cold, active]]
         if len(paths) != len(set(paths)):
             raise SessionInconsistencyError(f"session message generations contain duplicate paths: {session_path}")
-        return [*cold, active], set()
+        backup_payload = dict(payload)
+        backup_payload["messages"] = active
+        backup_payload["cold_messages"] = []
+        return [*cold, active], set(), backup_payload
 
     def _cold_generation_metadata(
         self,
@@ -718,32 +777,58 @@ class SessionManager:
             raise ValueError("invalid session id")
         return self.session_dir / f"{session_id}.json"
 
+    @staticmethod
+    def _backup_path(path: Path) -> Path:
+        return path.with_name(f"{path.name}.bak")
+
     def _markdown_path(self, session_id: str) -> Path:
         return self.session_dir / f"{session_id}.md"
 
     @staticmethod
     def _atomic_write(path: Path, content: str) -> None:
+        SessionManager._atomic_write_bytes(path, content.encode("utf-8"))
+
+    @staticmethod
+    def _atomic_write_bytes(path: Path, content: bytes) -> None:
         temp = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+        descriptor: int | None = None
         try:
-            temp.write_text(content, encoding="utf-8")
-            temp.replace(path)
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            descriptor = os.open(temp, flags, 0o600)
+            with os.fdopen(descriptor, "wb") as handle:
+                descriptor = None
+                handle.write(content)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp, path)
+            try:
+                path.chmod(0o600)
+            except OSError:
+                pass
+            SessionManager._fsync_directory(path.parent)
         finally:
+            if descriptor is not None:
+                os.close(descriptor)
             try:
                 temp.unlink()
             except FileNotFoundError:
                 pass
 
     @staticmethod
-    def _atomic_write_bytes(path: Path, content: bytes) -> None:
-        temp = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+    def _fsync_directory(directory: Path) -> None:
+        flags = os.O_RDONLY
+        if hasattr(os, "O_DIRECTORY"):
+            flags |= os.O_DIRECTORY
         try:
-            temp.write_bytes(content)
-            temp.replace(path)
+            descriptor = os.open(directory, flags)
+        except OSError:
+            return
+        try:
+            os.fsync(descriptor)
         finally:
-            try:
-                temp.unlink()
-            except FileNotFoundError:
-                pass
+            os.close(descriptor)
 
     @staticmethod
     def _mark(status: str) -> str:

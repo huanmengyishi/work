@@ -23,6 +23,14 @@ _LIFECYCLE_CAPABILITIES = frozenset(
     {
         ("document", "parse"),
         ("document", "render_docx"),
+        ("document_generator", "create_outline"),
+        ("document_generator", "confirm_outline"),
+        ("document_generator", "finalize"),
+        ("document_generator", "next_chapter"),
+        ("document_generator", "render"),
+        ("document_generator", "rollback_chapter"),
+        ("document_generator", "save_chapter"),
+        ("document_generator", "status"),
         ("file", "apply"),
         ("file", "diff"),
         ("file", "undo"),
@@ -104,7 +112,7 @@ class ArtifactRegistry:
                 cls._record_source_dates(registry, data)
             return
 
-        path_value = data.get("path") or args.get("path")
+        path_value = data.get("path") or data.get("output_path") or args.get("path") or args.get("output_path")
         path = cls._normalize_path(state, str(path_value or ""))
         if not path:
             if success:
@@ -140,11 +148,81 @@ class ArtifactRegistry:
         entry["error"] = ""
         if capability == ("template", "make_dir"):
             entry.update({"kind": "directory", "state": "generated", "generated": True})
-        elif capability in {("file", "diff"), ("document", "render_docx")}:
+        elif tool == "document_generator":
+            workflow_status = str(data.get("workflow_status") or "")[:64]
+            workflow_event = str(data.get("document_workflow_event") or "")[:64]
+            completed_chapters = cls._bounded_count(data.get("completed_chapters"))
+            total_chapters = cls._bounded_count(data.get("total_chapters"))
+            entry.update(
+                {
+                    "workflow_id": str(data.get("workflow_id") or "")[:200],
+                    "workflow_status": workflow_status,
+                    "workflow_event": workflow_event,
+                    "completed_chapters": completed_chapters,
+                    "total_chapters": total_chapters,
+                }
+            )
+            for key, maximum in (
+                ("outline_hash", 64),
+                ("chapter_id", 64),
+                ("chapter_sha256", 64),
+            ):
+                if data.get(key):
+                    entry[key] = str(data.get(key) or "")[:maximum]
+            if action == "create_outline":
+                entry.update({"state": "planned", "generated": False, "workflow_finalized": False})
+            elif action == "render":
+                preview_id = str(data.get("preview_id") or "")[:200]
+                entry.update(
+                    {
+                        "state": "in_progress",
+                        "generated": False,
+                        "verified": False,
+                        "preview_id": preview_id,
+                        "workflow_render_preview_id": preview_id,
+                        "workflow_apply_matches": False,
+                        "workflow_finalized": False,
+                        "generated_metadata_dates": [
+                            str(item)[:80] for item in list(data.get("generated_metadata_dates") or [])[:100]
+                        ],
+                    }
+                )
+            elif action == "finalize":
+                expected_preview = str(entry.get("workflow_render_preview_id") or "")
+                finalized_preview = str(data.get("render_preview_id") or "")
+                apply_verified = data.get("apply_verified") is True
+                if apply_verified and expected_preview and finalized_preview == expected_preview:
+                    entry.update(
+                        {
+                            "state": "verified" if entry.get("verified") else "generated",
+                            "generated": True,
+                            "workflow_apply_matches": True,
+                            "workflow_finalized": True,
+                            "snapshot_id": str(data.get("apply_snapshot_id") or entry.get("snapshot_id") or "")[:200],
+                            "result_hash": str(data.get("apply_result_hash") or "")[:64],
+                        }
+                    )
+                else:
+                    entry.update(
+                        {
+                            "state": "in_progress",
+                            "generated": False,
+                            "verified": False,
+                            "workflow_finalized": False,
+                            "error": "document workflow finalize receipt did not match its render preview",
+                        }
+                    )
+            elif entry.get("state") not in {"generated", "verified"}:
+                entry["state"] = "planned" if workflow_status == "awaiting_confirmation" else "in_progress"
+        elif capability in {
+            ("file", "diff"),
+            ("document", "render_docx"),
+        }:
             entry.update(
                 {
                     "state": "in_progress",
                     "preview_id": str(data.get("preview_id") or "")[:200],
+                    "workflow_id": str(data.get("workflow_id") or entry.get("workflow_id") or "")[:200],
                     "generated_metadata_dates": [
                         str(item)[:80] for item in list(data.get("generated_metadata_dates") or [])[:100]
                     ],
@@ -160,15 +238,34 @@ class ArtifactRegistry:
                 and route_schema < 2
             )
             generated = after_exists is True or legacy_unknown_exists
-            entry.update(
-                {
-                    "state": "generated" if generated else "planned",
-                    "generated": generated,
-                    "verified": False,
-                    "preview_id": str(data.get("preview_id") or "")[:200],
-                    "snapshot_id": str(data.get("snapshot_id") or "")[:200],
-                }
-            )
+            applied_preview = str(data.get("preview_id") or "")[:200]
+            workflow_preview = str(entry.get("workflow_render_preview_id") or "")
+            workflow_matches = not workflow_preview or applied_preview == workflow_preview
+            if generated and workflow_matches:
+                entry.update(
+                    {
+                        "state": "generated",
+                        "generated": True,
+                        "verified": False,
+                        "preview_id": applied_preview,
+                        "snapshot_id": str(data.get("snapshot_id") or "")[:200],
+                        "result_hash": str(data.get("result_hash") or "")[:64],
+                        "workflow_apply_matches": bool(workflow_preview),
+                    }
+                )
+            else:
+                entry.update(
+                    {
+                        "state": "in_progress" if workflow_preview else "planned",
+                        "generated": False,
+                        "verified": False,
+                        "workflow_apply_matches": False,
+                        "snapshot_id": str(data.get("snapshot_id") or "")[:200],
+                        "last_applied_preview_id": applied_preview,
+                    }
+                )
+                if workflow_preview and applied_preview != workflow_preview:
+                    entry["error"] = "applied preview does not match the active document workflow render"
         elif capability == ("document", "parse"):
             receipt = data.get(ARTIFACT_VERIFICATION_METADATA_KEY)
             passed = cls._receipt_passes(path, result, receipt)
@@ -220,6 +317,8 @@ class ArtifactRegistry:
                 )
             if hint.lower().endswith(".docx") and entry.get("state") != "verified":
                 return True, f"the requested Word artifact is not verified in ArtifactRegistry: {hint}"
+            if entry.get("workflow_id") and entry.get("workflow_finalized") is not True:
+                return True, f"the requested document workflow is not finalized in ArtifactRegistry: {hint}"
         return True, ""
 
     @classmethod
@@ -377,7 +476,18 @@ class ArtifactRegistry:
     def _safe_receipt(value: object) -> dict[str, Any]:
         if not isinstance(value, Mapping):
             return {}
-        allowed = {"schema_version", "artifact_id", "path", "format", "passed", "size_bytes", "sha256", "checks_run"}
+        allowed = {
+            "schema_version",
+            "artifact_id",
+            "path",
+            "format",
+            "passed",
+            "content_complete",
+            "size_bytes",
+            "content_sha256",
+            "checks_run",
+            "errors",
+        }
         return {str(key): item for key, item in value.items() if key in allowed}
 
     @staticmethod
@@ -388,6 +498,10 @@ class ArtifactRegistry:
             if text and text not in existing:
                 existing.append(text)
         registry["source_date_literals"] = existing[:200]
+
+    @staticmethod
+    def _bounded_count(value: object) -> int:
+        return max(0, min(value, 1_000_000)) if isinstance(value, int) and not isinstance(value, bool) else 0
 
 
 __all__ = ["ARTIFACT_STATES", "ArtifactRegistry"]

@@ -60,6 +60,27 @@ class OptionalChromaStore:
             self.status = self._load()
             return self.status.enabled
 
+    def reset_load_failure(self) -> bool:
+        """Allow one later lazy load after an explicitly acknowledged failure.
+
+        Failed imports or initialization remain sticky by default so ordinary
+        Memory operations cannot repeatedly probe an unavailable heavy
+        dependency. Callers may invoke this after installing or repairing
+        ChromaDB; the next real vector operation then makes one new load
+        attempt. Concurrent reset/load calls share the same lock.
+        """
+
+        if not self._configured_enabled:
+            return False
+        with self._load_lock:
+            if not self._load_attempted or self._collection is not None or self.status.enabled:
+                return False
+            self._client = None
+            self._collection = None
+            self._load_attempted = False
+            self.status = VectorStatus(True, "load failure reset; retry on next vector operation")
+            return True
+
     def is_enabled(self) -> bool:
         return self._configured_enabled and (not self._load_attempted or self.status.enabled)
 

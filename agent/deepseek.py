@@ -3,6 +3,7 @@ from __future__ import annotations
 import errno
 import http.client
 import json
+import logging
 import re
 import socket
 import ssl
@@ -14,7 +15,11 @@ from dataclasses import dataclass
 from typing import Any
 
 from .config import AppConfig
+from .exceptions import ModelCompatibilityError
 from .unicode_text import normalize_unicode_data
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -97,19 +102,31 @@ class DeepSeekClient:
 
         data, http_attempt_count = self._request_with_key_pool(normalize_unicode_data(payload))
         data = normalize_unicode_data(data)
-        choices = data.get("choices") or []
-        if not choices:
-            raise _DeepSeekRequestError(
-                f"DeepSeek API returned no choices: {data}",
+        if not isinstance(data, dict):
+            raise ModelCompatibilityError(
+                f"DeepSeek API returned an incompatible top-level response type: {type(data).__name__}",
                 http_attempt_count=http_attempt_count,
             )
-        message = choices[0].get("message") or {}
+        choices = data.get("choices")
+        if not isinstance(choices, list) or not choices:
+            structure = "empty list" if isinstance(choices, list) else type(choices).__name__
+            raise ModelCompatibilityError(
+                f"DeepSeek API returned incompatible choices; expected a non-empty list, got {structure}",
+                http_attempt_count=http_attempt_count,
+            )
+        first_choice = choices[0]
+        if not isinstance(first_choice, dict):
+            raise ModelCompatibilityError(
+                f"DeepSeek API returned an incompatible choices[0] type: {type(first_choice).__name__}",
+                http_attempt_count=http_attempt_count,
+            )
+        message = first_choice.get("message")
         if not isinstance(message, dict):
-            raise _DeepSeekRequestError(
-                f"DeepSeek API returned invalid message: {data}",
+            raise ModelCompatibilityError(
+                f"DeepSeek API returned an incompatible choices[0].message type: {type(message).__name__}",
                 http_attempt_count=http_attempt_count,
             )
-        finish_reason = choices[0].get("finish_reason")
+        finish_reason = first_choice.get("finish_reason")
         usage = data.get("usage")
         return ChatResponse(
             message=message,
@@ -124,8 +141,7 @@ class DeepSeekClient:
         ready = 0
         failures: list[int] = []
         http_attempt_count = 0
-        retries = max(0, min(int(self.config.get("model.network_retries", 2)), 5))
-        base_delay = max(0.0, min(float(self.config.get("model.retry_base_seconds", 1.0)), 10.0))
+        retries, base_delay = self._retry_config()
         payload = {
             "model": self.model,
             "messages": [
@@ -145,6 +161,7 @@ class DeepSeekClient:
                         failures.append(exc.code)
                         break
                     if exc.code in {408, 500, 502, 503, 504} and attempt < retries:
+                        _log_retry("key_check", attempt, retries, status=exc.code)
                         time.sleep(base_delay * (2**attempt))
                         continue
                     raise _DeepSeekRequestError(
@@ -158,6 +175,7 @@ class DeepSeekClient:
                             http_attempt_count=http_attempt_count,
                         ) from exc
                     if attempt < retries:
+                        _log_retry("key_check", attempt, retries, exception=exc)
                         time.sleep(base_delay * (2**attempt))
                         continue
                     raise _DeepSeekRequestError(
@@ -294,7 +312,11 @@ class DeepSeekClient:
             "model": str(model or self.model),
             "messages": messages,
             "temperature": self.config.get("model.temperature", 0.2),
-            "max_tokens": max_tokens if max_tokens is not None else self.config.get("model.max_tokens", 4096),
+            "max_tokens": (
+                max_tokens
+                if max_tokens is not None
+                else self.config.get_int("model.max_tokens", 4096, minimum=1, maximum=20_000)
+            ),
         }
         if tools:
             payload["tools"] = tools
@@ -341,8 +363,7 @@ class DeepSeekClient:
         http_attempt_count = 0
         key_count = len(self.api_keys)
         start_index, claim_generation = self._claim_key_pool_start(key_count)
-        retries = max(0, min(int(self.config.get("model.network_retries", 2)), 5))
-        base_delay = max(0.0, min(float(self.config.get("model.retry_base_seconds", 1.0)), 10.0))
+        retries, base_delay = self._retry_config()
         for offset in range(key_count):
             key_index = (start_index + offset) % key_count
             key = self.api_keys[key_index]
@@ -355,6 +376,7 @@ class DeepSeekClient:
                         failures.append(exc.code)
                         break
                     if exc.code in {408, 500, 502, 503, 504} and attempt < retries:
+                        _log_retry("chat", attempt, retries, status=exc.code)
                         time.sleep(base_delay * (2**attempt))
                         continue
                     body = _bounded_http_error_body(exc)
@@ -374,6 +396,7 @@ class DeepSeekClient:
                             http_attempt_count=http_attempt_count,
                         ) from exc
                     if attempt < retries:
+                        _log_retry("chat", attempt, retries, exception=exc)
                         time.sleep(base_delay * (2**attempt))
                         continue
                     raise _DeepSeekRequestError(
@@ -405,8 +428,7 @@ class DeepSeekClient:
         http_attempt_count = 0
         key_count = len(self.api_keys)
         start_index, claim_generation = self._claim_key_pool_start(key_count)
-        retries = max(0, min(int(self.config.get("model.network_retries", 2)), 5))
-        base_delay = max(0.0, min(float(self.config.get("model.retry_base_seconds", 1.0)), 10.0))
+        retries, base_delay = self._retry_config()
         for offset in range(key_count):
             key_index = (start_index + offset) % key_count
             key = self.api_keys[key_index]
@@ -436,6 +458,7 @@ class DeepSeekClient:
                             http_attempt_count=http_attempt_count,
                         ) from exc
                     if attempt < retries:
+                        _log_retry("stream_schema", attempt, retries, exception=exc)
                         time.sleep(base_delay * (2**attempt))
                         continue
                     raise _DeepSeekRequestError(
@@ -449,6 +472,7 @@ class DeepSeekClient:
                         switch_key = True
                         break
                     if exc.code in {408, 500, 502, 503, 504} and not attempt_started and attempt < retries:
+                        _log_retry("stream", attempt, retries, status=exc.code)
                         time.sleep(base_delay * (2**attempt))
                         continue
                     body = _bounded_http_error_body(exc)
@@ -473,6 +497,7 @@ class DeepSeekClient:
                             http_attempt_count=http_attempt_count,
                         ) from exc
                     if attempt < retries:
+                        _log_retry("stream", attempt, retries, exception=exc)
                         time.sleep(base_delay * (2**attempt))
                         continue
                     raise _DeepSeekRequestError(
@@ -513,7 +538,7 @@ class DeepSeekClient:
             },
             method="POST",
         )
-        timeout = max(30, min(int(self.config.get("model.timeout_seconds", 300)), 1800))
+        timeout = self.config.get_int("model.timeout_seconds", 300, minimum=30, maximum=1800)
         reasoning_parts: list[str] = []
         content_parts: list[str] = []
         tool_calls: dict[int, dict[str, Any]] = {}
@@ -604,7 +629,7 @@ class DeepSeekClient:
             },
             method="POST",
         )
-        timeout = max(30, min(int(self.config.get("model.timeout_seconds", 300)), 1800))
+        timeout = self.config.get_int("model.timeout_seconds", 300, minimum=30, maximum=1800)
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read().decode("utf-8"))
 
@@ -615,6 +640,40 @@ class DeepSeekClient:
         if isinstance(value, bool):
             return value
         return str(value or "").lower() in {"enabled", "true", "on", "1"}
+
+    def _retry_config(self) -> tuple[int, float]:
+        retries = self.config.get_int("model.network_retries", 2, minimum=0, maximum=5)
+        base_delay = _bounded_float(self.config.get("model.retry_base_seconds", 1.0), 1.0, 0.0, 10.0)
+        return retries, base_delay
+
+
+def _log_retry(
+    phase: str,
+    attempt: int,
+    retries: int,
+    *,
+    status: int | None = None,
+    exception: BaseException | None = None,
+) -> None:
+    logger.warning(
+        "deepseek_retry phase=%s next_attempt=%s max_attempts=%s status=%s exception=%s errno=%s",
+        phase,
+        attempt + 2,
+        retries + 1,
+        status,
+        type(exception).__name__ if exception is not None else None,
+        getattr(exception, "errno", None) if exception is not None else None,
+    )
+
+
+def _bounded_float(value: Any, default: float, minimum: float, maximum: float) -> float:
+    if isinstance(value, bool):
+        return default
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return max(minimum, min(maximum, parsed))
 
 
 _TRANSIENT_ERRNOS = frozenset(

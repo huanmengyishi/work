@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import shlex
 import signal
@@ -10,7 +11,7 @@ import threading
 import time
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol, runtime_checkable
 from uuid import uuid4
 
 
@@ -18,6 +19,24 @@ DEFAULT_MAX_RESULT_SOURCE_BYTES = 8 * 1024 * 1024
 MAX_RESULT_SOURCE_BYTES_HARD_LIMIT = 64 * 1024 * 1024
 _CAPTURE_MARKER = b"\n...[source middle omitted]...\n"
 _PIPE_CHUNK_BYTES = 64 * 1024
+_DRAIN_JOIN_TIMEOUT_SECONDS = 5
+_LOG = logging.getLogger(__name__)
+
+
+@runtime_checkable
+class _ReadableBinaryPipe(Protocol):
+    def read(self, size: int = -1) -> bytes: ...
+
+    def close(self) -> None: ...
+
+
+@runtime_checkable
+class _WritableBinaryPipe(Protocol):
+    def write(self, content: bytes) -> int: ...
+
+    def flush(self) -> None: ...
+
+    def close(self) -> None: ...
 
 
 @dataclass(frozen=True)
@@ -184,14 +203,18 @@ class BoundedByteCapture:
         self._head = bytearray()
         self._tail = bytearray()
         self._truncated = False
+        self._accepting = True
+        self._lock = threading.RLock()
 
     @property
     def truncated(self) -> bool:
-        return self._truncated
+        with self._lock:
+            return self._truncated
 
     @property
     def sha256(self) -> str:
-        return self._digest.hexdigest()
+        with self._lock:
+            return self._digest.hexdigest()
 
     @property
     def captured_bytes(self) -> int:
@@ -201,20 +224,30 @@ class BoundedByteCapture:
         if not chunk:
             return
         value = bytes(chunk)
-        self.total_bytes += len(value)
-        self._digest.update(value)
-        if not self._truncated and len(self._complete) + len(value) <= self.max_bytes:
-            self._complete.extend(value)
-            return
-        if not self._truncated:
-            self._begin_truncation(value)
-            return
-        self._append_tail(value)
+        with self._lock:
+            if not self._accepting:
+                return
+            self.total_bytes += len(value)
+            self._digest.update(value)
+            if not self._truncated and len(self._complete) + len(value) <= self.max_bytes:
+                self._complete.extend(value)
+                return
+            if not self._truncated:
+                self._begin_truncation(value)
+                return
+            self._append_tail(value)
 
     def value_bytes(self) -> bytes:
-        if not self._truncated:
-            return bytes(self._complete)
-        return bytes(self._head) + _CAPTURE_MARKER + bytes(self._tail)
+        with self._lock:
+            if not self._truncated:
+                return bytes(self._complete)
+            return bytes(self._head) + _CAPTURE_MARKER + bytes(self._tail)
+
+    def freeze(self) -> None:
+        """Stop accepting late drain bytes so result metadata stays immutable."""
+
+        with self._lock:
+            self._accepting = False
 
     def text(self) -> str:
         return self.value_bytes().decode("utf-8", errors="replace")
@@ -325,20 +358,38 @@ def run_command(
     except OSError as exc:
         return ToolResult(False, "", f"command could not start: {exc}", duration_ms=elapsed_ms(started))
 
+    stdout = process.stdout
+    stderr = process.stderr
+    stdin = process.stdin
+    if not isinstance(stdout, _ReadableBinaryPipe) or not isinstance(stderr, _ReadableBinaryPipe):
+        _terminate_process_group(process)
+        return ToolResult(
+            False,
+            "",
+            "command could not start: subprocess output pipes are unavailable",
+            duration_ms=elapsed_ms(started),
+        )
+    if encoded_input is not None and not isinstance(stdin, _WritableBinaryPipe):
+        _terminate_process_group(process)
+        return ToolResult(
+            False,
+            "",
+            "command could not start: subprocess input pipe is unavailable",
+            duration_ms=elapsed_ms(started),
+        )
+
     stdout_capture = BoundedByteCapture(output_limit)
     stderr_capture = BoundedByteCapture(output_limit)
-    assert process.stdout is not None
-    assert process.stderr is not None
     drain_threads = [
         threading.Thread(
             target=_drain_pipe,
-            args=(process.stdout, stdout_capture),
+            args=(stdout, stdout_capture),
             daemon=True,
             name="deep-agent-stdout",
         ),
         threading.Thread(
             target=_drain_pipe,
-            args=(process.stderr, stderr_capture),
+            args=(stderr, stderr_capture),
             daemon=True,
             name="deep-agent-stderr",
         ),
@@ -347,16 +398,16 @@ def run_command(
         thread.start()
     writer: threading.Thread | None = None
     if encoded_input is not None:
-        assert process.stdin is not None
         writer = threading.Thread(
             target=_write_stdin,
-            args=(process.stdin, encoded_input),
+            args=(stdin, encoded_input),
             daemon=True,
             name="deep-agent-stdin",
         )
         writer.start()
 
     timed_out = False
+    drain_incomplete = False
     try:
         process.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
@@ -373,7 +424,16 @@ def run_command(
         if writer is not None:
             writer.join(timeout=1)
         for thread in drain_threads:
-            thread.join()
+            thread.join(timeout=_DRAIN_JOIN_TIMEOUT_SECONDS)
+            if thread.is_alive():
+                drain_incomplete = True
+                _LOG.warning(
+                    "subprocess drain thread %s did not stop within %s seconds",
+                    thread.name,
+                    _DRAIN_JOIN_TIMEOUT_SECONDS,
+                )
+        stdout_capture.freeze()
+        stderr_capture.freeze()
 
     output, error, result_allocation_truncated = _render_command_streams(
         stdout_capture,
@@ -384,9 +444,12 @@ def run_command(
     output = output.strip()
     error = error.strip()
     source_data = _command_source_metadata(stdout_capture, stderr_capture)
+    source_data["drain_incomplete"] = drain_incomplete
+    if drain_incomplete:
+        source_data["source_original_bytes_known"] = False
     source_data["source_truncated"] = bool(source_data["source_truncated"] or result_allocation_truncated)
     source_data["source_captured_bytes"] = len(output.encode("utf-8")) + len(error.encode("utf-8"))
-    source_data.update({"returncode": process.returncode, "args": args})
+    source_data.update({"returncode": process.returncode, "args": args, "timed_out": timed_out})
     if timed_out:
         timeout_error = f"timeout after {timeout}s"
         if error:

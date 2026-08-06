@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 
-from .memory import GLOBAL_KNOWLEDGE_KINDS, MemoryItem, MemoryKind, MemoryStore
+from .contracts import MemoryStoreProtocol
+from .memory import GLOBAL_KNOWLEDGE_KINDS, MemoryItem, MemoryKind
 
 
 class GlobalKnowledgeBase:
@@ -15,7 +16,7 @@ class GlobalKnowledgeBase:
 
     ALLOWED_KINDS = GLOBAL_KNOWLEDGE_KINDS
 
-    def __init__(self, store: MemoryStore, *, allow_mutation: bool = False) -> None:
+    def __init__(self, store: MemoryStoreProtocol, *, allow_mutation: bool = False) -> None:
         if not isinstance(allow_mutation, bool):
             raise ValueError("global knowledge allow_mutation must be a boolean")
         self.store = store

@@ -2,9 +2,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from .config import AppConfig
+
+if TYPE_CHECKING:
+    from .contracts import RecoveryControllerProtocol
 
 
 class ErrorCategory(StrEnum):
@@ -38,28 +41,28 @@ class ResiliencePolicy:
     @classmethod
     def from_config(cls, config: AppConfig) -> "ResiliencePolicy":
         return cls(
-            max_corrective_rounds=_bounded_int(
-                config.get("runtime.resilience.max_corrective_rounds", 2),
-                default=2,
+            max_corrective_rounds=config.get_int(
+                "runtime.resilience.max_corrective_rounds",
+                2,
                 minimum=0,
                 maximum=8,
             ),
-            max_abnormal_finish_recoveries=_bounded_int(
-                config.get("runtime.resilience.max_abnormal_finish_recoveries", 1),
-                default=1,
+            max_abnormal_finish_recoveries=config.get_int(
+                "runtime.resilience.max_abnormal_finish_recoveries",
+                1,
                 minimum=0,
                 maximum=4,
             ),
             capability_backoff_enabled=bool(config.get("runtime.resilience.capability_backoff_enabled", True)),
-            max_capability_backoff_rounds=_bounded_int(
-                config.get("runtime.resilience.max_capability_backoff_rounds", 8),
-                default=8,
+            max_capability_backoff_rounds=config.get_int(
+                "runtime.resilience.max_capability_backoff_rounds",
+                8,
                 minimum=1,
                 maximum=32,
             ),
-            circuit_recovery_rounds=_bounded_int(
-                config.get("runtime.resilience.circuit_recovery_rounds", 4),
-                default=4,
+            circuit_recovery_rounds=config.get_int(
+                "runtime.resilience.circuit_recovery_rounds",
+                4,
                 minimum=1,
                 maximum=64,
             ),
@@ -100,7 +103,12 @@ class CapabilityRecoveryDecision:
 
 
 class CapabilityRecoveryController:
-    """Connect persisted capability health to deterministic Runtime recovery."""
+    """Concrete structural implementation of the Runtime recovery contract.
+
+    Protocol inheritance is intentionally avoided so an omitted concrete
+    method can never fall through to a Protocol stub at runtime.  A type-only
+    conformance witness below keeps the implementation declaration explicit.
+    """
 
     MAX_RECORDS = 64
 
@@ -182,9 +190,19 @@ def _bounded_int(value: Any, *, default: int, minimum: int, maximum: int) -> int
         return default
     try:
         parsed = int(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return default
     return max(minimum, min(maximum, parsed))
+
+
+if TYPE_CHECKING:
+
+    def _recovery_controller_protocol_contract(
+        controller: CapabilityRecoveryController,
+    ) -> RecoveryControllerProtocol:
+        """Static conformance witness; intentionally absent from the runtime MRO."""
+
+        return controller
 
 
 __all__ = [

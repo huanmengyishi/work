@@ -137,16 +137,17 @@ class RuntimeResponseMixin:
             round_number=round_number,
             request_phase="main_loop",
         )
-        response = self._complete_length_response(
-            state,
-            messages,
-            response,
-            chat_kwargs,
-            strategy=setup.strategy,
-            round_number=round_number,
-            request_phase="main_loop",
-        )
-        if response.finish_reason != "length":
+        if isinstance(response.message, dict):
+            response = self._complete_length_response(
+                state,
+                messages,
+                response,
+                chat_kwargs,
+                strategy=setup.strategy,
+                round_number=round_number,
+                request_phase="main_loop",
+            )
+        if response.finish_reason != "length" or not isinstance(response.message, dict):
             state.record_model_response(response)
         return ModelRound(
             round_number=round_number,
@@ -164,9 +165,50 @@ class RuntimeResponseMixin:
         loop: ExecutionLoopState,
         model_round: ModelRound,
     ) -> ModelResponseOutcome:
+        if not isinstance(model_round.response.message, dict):
+            return self._reject_incompatible_message(state, messages, model_round)
         if not _has_usable_finish_reason(model_round.response.finish_reason):
             return self._reject_unusable_finish(state, messages, setup, loop, model_round)
         return self._accept_model_response(state, messages, setup, loop, model_round)
+
+    def _reject_incompatible_message(
+        self,
+        state: AgentState,
+        messages: list[dict[str, Any]],
+        model_round: ModelRound,
+    ) -> ModelResponseOutcome:
+        message_type = type(model_round.response.message).__name__
+        reason = f"DeepSeek returned an incompatible assistant message type={message_type}"
+        messages.append(
+            {
+                "role": "assistant",
+                "content": (
+                    "[Deep Agent rejected an incompatible model response with "
+                    f"message type={message_type}; no tool call was executed]"
+                ),
+            }
+        )
+        self._publish_model_response(
+            state,
+            round_number=model_round.round_number,
+            tool_call_count=0,
+            discarded_incompatible_message=True,
+            message_type=message_type,
+        )
+        self._checkpoint_convergence_transition(
+            state,
+            messages,
+            transition="incompatible_model_message",
+            phase="main_loop",
+        )
+        final = self._incomplete_answer(state, reason)
+        self._finish_failed_execution(
+            state,
+            messages,
+            final=final,
+            error=f"incompatible model message type: {message_type}",
+        )
+        return ModelResponseOutcome("terminal", final=final)
 
     def _reject_unusable_finish(
         self,
@@ -320,7 +362,14 @@ class RuntimeResponseMixin:
                 "thinking.content",
                 state,
                 round=round_number,
-                content=reasoning[: int(self.config.get("runtime.max_reasoning_display_chars", 4000))],
+                content=reasoning[
+                    : self.config.get_int(
+                        "runtime.max_reasoning_display_chars",
+                        4_000,
+                        minimum=0,
+                        maximum=1_000_000,
+                    )
+                ],
             )
         self._publish_model_response(
             state,

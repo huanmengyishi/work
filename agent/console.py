@@ -21,6 +21,7 @@ COMMANDS = (
     "/resume",
     "/sessions",
     "/status",
+    "/vector-retry",
     "/undo",
     "/yolo",
     "/super-yolo",
@@ -190,6 +191,13 @@ class ConsoleUI:
             estimated_tokens = self._progress_count(value.get("estimated_tokens"), default=0)
             token_suffix = f"；预计上下文 {estimated_tokens} tokens" if estimated_tokens else ""
             label = f"{self._mode_label(mode)}；恢复阶段：{stage}完成；工具轮次不增加{token_suffix}"
+        elif event == "model.length_continuation_requested":
+            attempt = self._progress_count(value.get("attempt"), default=1)
+            max_attempts = max(attempt, self._progress_count(value.get("max_attempts"), default=attempt))
+            label = (
+                f"{self._mode_label(mode)}；恢复阶段：正在续写截断输出"
+                f"（第 {attempt}/{max_attempts} 次）；工具轮次不增加"
+            )
         elif event == "model.length_continued":
             attempt = self._progress_count(value.get("attempt"), default=1)
             label = f"{self._mode_label(mode)}；恢复阶段：续写截断输出（第 {attempt} 次）；工具轮次不增加"
@@ -377,6 +385,7 @@ class ConsoleUI:
                         "  /resume [session-id]   选择最近或指定的未完成会话；再次输入继续要求即可执行",
                         "  /sessions              列出保存的会话",
                         "  /status                查看项目、活动会话、预览和快照状态",
+                        "  /vector-retry          安装/修复 ChromaDB 后重置一次加载失败",
                         "",
                         "修改与权限：",
                         "  /undo [snapshot-id]    回滚最近或指定的文件快照",

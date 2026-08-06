@@ -31,7 +31,12 @@ class CapabilityHealthManager:
         self.project_id = project_id
         self.path = config.data_dir / "capability-health" / f"{storage_key(project_id)}.json"
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.failure_threshold = max(1, int(config.get("runtime.capability_failure_threshold", 3)))
+        self.failure_threshold = config.get_int(
+            "runtime.capability_failure_threshold",
+            3,
+            minimum=1,
+            maximum=1_000,
+        )
         self.records = self._read()
 
     def evaluate(self, capability: ToolCapability) -> CapabilityHealth:

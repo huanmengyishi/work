@@ -12,13 +12,16 @@ from enum import StrEnum
 from pathlib import Path
 from threading import RLock
 from time import monotonic
-from typing import Any, Iterable, Sequence
+from typing import TYPE_CHECKING, Any, Iterable, Sequence
 
 from . import paths
 from .config import AppConfig
 from .project import Project
 from .timeutil import utc_now_iso
 from .vector import OptionalChromaStore
+
+if TYPE_CHECKING:
+    from .contracts import MemoryStoreProtocol
 
 
 _MEMORY_PAYLOAD_BYTES_SQL = """(
@@ -107,6 +110,14 @@ _QueryCacheKey = tuple[bytes, str | None, int, bool, tuple[str, ...] | None]
 
 
 class MemoryStore:
+    """SQLite/optional-vector implementation of the structural Memory contract.
+
+    The implementation deliberately does not inherit from the Protocol: doing
+    so could place Protocol stub methods in the runtime MRO.  The type-only
+    conformance declaration at the end of this module keeps that contract
+    explicit without changing runtime dispatch.
+    """
+
     def __init__(self, config: AppConfig, db_path: Path | None = None) -> None:
         self.config = config
         self.data_dir = config.data_dir
@@ -410,7 +421,12 @@ class MemoryStore:
         )
         protected = self._protected_kinds()
         if expires_at is None and kind_value not in protected:
-            expiry_days = max(0, int(self.config.get("memory.expiry_days", 365)))
+            expiry_days = self.config.get_int(
+                "memory.expiry_days",
+                365,
+                minimum=0,
+                maximum=36_500,
+            )
             if expiry_days:
                 expires_at = (datetime.now(UTC) + timedelta(days=expiry_days)).replace(microsecond=0).isoformat()
         with self._cache_lock:
@@ -1796,3 +1812,11 @@ def slugify(value: str) -> str:
     while "--" in slug:
         slug = slug.replace("--", "-")
     return slug[:80] or "memory"
+
+
+if TYPE_CHECKING:
+
+    def _memory_store_protocol_contract(store: MemoryStore) -> MemoryStoreProtocol:
+        """Static conformance witness; intentionally absent from the runtime MRO."""
+
+        return store

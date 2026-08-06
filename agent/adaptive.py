@@ -37,8 +37,8 @@ class StrategyAdjuster:
         self.strategy_adjustment_enabled = bool(config.get("optimizer.strategy_adjustment_enabled", False))
         self.adaptive_convergence_enabled = bool(config.get("optimizer.adaptive_convergence_enabled", False))
         self.enabled = self.strategy_adjustment_enabled or self.adaptive_convergence_enabled
-        self.min_samples = _bounded_int(config.get("optimizer.min_samples", 8), 8, 3, 100)
-        self.history_limit = _bounded_int(config.get("optimizer.history_limit", 100), 100, 3, 200)
+        self.min_samples = config.get_int("optimizer.min_samples", 8, minimum=3, maximum=100)
+        self.history_limit = config.get_int("optimizer.history_limit", 100, minimum=3, maximum=200)
         self.failure_upgrade_threshold = _bounded_float(
             config.get("optimizer.failure_upgrade_threshold", 0.4),
             0.4,
@@ -122,16 +122,6 @@ class StrategyAdjuster:
             exploration_limit,
             tier,
         )
-
-
-def _bounded_int(value: object, default: int, minimum: int, maximum: int) -> int:
-    if isinstance(value, bool):
-        return default
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError, OverflowError):
-        parsed = default
-    return max(minimum, min(maximum, parsed))
 
 
 def _has_observed_exploration_rounds(schema_version: object, value: object) -> bool:

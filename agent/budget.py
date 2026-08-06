@@ -48,22 +48,22 @@ class ExecutionBudgetController:
 
     def __init__(self, config: AppConfig, *, clock: Any = time.monotonic) -> None:
         self.enabled = bool(config.get("runtime.budget.enabled", True))
-        self.max_model_requests = self._bounded_int(
-            config.get("runtime.budget.max_model_requests_per_turn", 64),
-            default=64,
+        self.max_model_requests = config.get_int(
+            "runtime.budget.max_model_requests_per_turn",
+            64,
             minimum=1,
             maximum=self._MAX_REQUEST_LIMIT,
         )
-        self.max_total_tokens = self._bounded_int(
-            config.get("runtime.budget.max_total_tokens_per_turn", 1_000_000),
-            default=1_000_000,
+        self.max_total_tokens = config.get_int(
+            "runtime.budget.max_total_tokens_per_turn",
+            1_000_000,
             minimum=1_024,
             maximum=self._MAX_TOKEN_LIMIT,
         )
         self.max_elapsed_seconds = float(
-            self._bounded_int(
-                config.get("runtime.budget.max_elapsed_seconds_per_turn", 3_600),
-                default=3_600,
+            config.get_int(
+                "runtime.budget.max_elapsed_seconds_per_turn",
+                3_600,
                 minimum=1,
                 maximum=self._MAX_SECONDS_LIMIT,
             )
@@ -231,16 +231,6 @@ class ExecutionBudgetController:
     def _tokens_used(state: AgentState) -> int:
         value = (state.model_metrics or {}).get("total_tokens", 0)
         return max(0, int(value)) if isinstance(value, int) and not isinstance(value, bool) else 0
-
-    @staticmethod
-    def _bounded_int(value: Any, *, default: int, minimum: int, maximum: int) -> int:
-        if isinstance(value, bool):
-            return default
-        try:
-            parsed = int(value)
-        except (TypeError, ValueError):
-            return default
-        return max(minimum, min(maximum, parsed))
 
 
 __all__ = [

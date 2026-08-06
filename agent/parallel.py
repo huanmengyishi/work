@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import shutil
 import subprocess
@@ -12,6 +13,10 @@ from uuid import uuid4
 from .project import Project
 from .paths import storage_key
 from .timeutil import utc_now_iso
+from .tools.base import run_command
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -28,10 +33,11 @@ class ParallelTaskResult:
 
 
 class ParallelWorktreeRunner:
-    def __init__(self, project: Project, data_dir: Path) -> None:
+    def __init__(self, project: Project, data_dir: Path, *, task_timeout_seconds: int | float = 3_600) -> None:
         self.project = project
         self.base_dir = data_dir / "worktrees" / storage_key(project.id)
         self.report_dir = project.agent_dir / "parallel"
+        self.task_timeout_seconds = max(0.1, min(float(task_timeout_seconds), 86_400.0))
         self.base_dir.mkdir(parents=True, exist_ok=True)
         self.report_dir.mkdir(parents=True, exist_ok=True)
 
@@ -168,14 +174,19 @@ class ParallelWorktreeRunner:
         patch_dir: Path,
         base_commit: str,
     ) -> ParallelTaskResult:
-        completed = subprocess.run(
+        completed = run_command(
             [agent_command, *flags, "--", prompt],
             cwd=worktree,
-            text=True,
-            capture_output=True,
-            check=False,
+            timeout=self.task_timeout_seconds,
             env=self._task_environment(index, prompt),
+            max_output_bytes=20_000,
         )
+        metadata = completed.data if isinstance(completed.data, dict) else {}
+        timed_out = bool(metadata.get("timed_out")) or f"timeout after {self.task_timeout_seconds}s" in completed.stderr
+        status = "completed" if completed.success else "timed_out" if timed_out else "failed"
+        stdout = completed.stdout
+        stderr = completed.stderr
+        returncode = 124 if timed_out else int(metadata.get("returncode") or (0 if completed.success else 1))
         subprocess.run(
             ["git", "add", "-N", ".", ":(exclude).project-agent"],
             cwd=worktree,
@@ -203,12 +214,12 @@ class ParallelWorktreeRunner:
         return ParallelTaskResult(
             index=index,
             prompt=prompt,
-            status="completed" if completed.returncode == 0 else "failed",
+            status=status,
             worktree=str(worktree),
             patch_path=str(patch_path),
-            stdout=completed.stdout[-20_000:],
-            stderr=completed.stderr[-20_000:],
-            returncode=completed.returncode,
+            stdout=stdout[-20_000:],
+            stderr=stderr[-20_000:],
+            returncode=returncode,
         )
 
     def _task_environment(self, index: int, prompt: str) -> dict[str, str]:
@@ -236,19 +247,43 @@ class ParallelWorktreeRunner:
 
     def _cleanup_worktrees(self, specs: list[tuple[int, str, Path, str]], run_dir: Path) -> None:
         for _, _, worktree, branch in specs:
-            subprocess.run(
-                ["git", "worktree", "remove", "--force", str(worktree)],
+            self._cleanup_git("worktree_remove", "worktree", "remove", "--force", str(worktree))
+            self._cleanup_git("branch_delete", "branch", "-D", branch)
+        try:
+            shutil.rmtree(run_dir)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            logger.warning(
+                "parallel_cleanup_failed operation=run_directory_remove errno=%s",
+                getattr(exc, "errno", None),
+            )
+
+    def _cleanup_git(self, operation: str, *args: str) -> None:
+        try:
+            completed = subprocess.run(
+                ["git", *args],
                 cwd=self.project.root,
                 capture_output=True,
                 check=False,
+                timeout=120,
             )
-            subprocess.run(
-                ["git", "branch", "-D", branch],
-                cwd=self.project.root,
-                capture_output=True,
-                check=False,
+        except subprocess.TimeoutExpired:
+            logger.warning("parallel_cleanup_failed operation=%s reason=timeout", operation)
+            return
+        except OSError as exc:
+            logger.warning(
+                "parallel_cleanup_failed operation=%s errno=%s",
+                operation,
+                getattr(exc, "errno", None),
             )
-        shutil.rmtree(run_dir, ignore_errors=True)
+            return
+        if completed.returncode != 0:
+            logger.warning(
+                "parallel_cleanup_failed operation=%s returncode=%s",
+                operation,
+                completed.returncode,
+            )
 
     def _git(self, *args: str) -> str:
         completed = subprocess.run(

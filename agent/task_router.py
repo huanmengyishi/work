@@ -395,15 +395,15 @@ class TaskRouter:
             score += 3 if engineering_action or mutation or large_signal else 1
             reasons.append("deep-reasoning" if engineering_action or mutation or large_signal else "deep-topic")
 
-        large_source_threshold = _bounded_int(
-            self.config.get("runtime.large_project_source_files", 500),
-            default=500,
+        large_source_threshold = self.config.get_int(
+            "runtime.large_project_source_files",
+            500,
             minimum=1,
             maximum=10_000_000,
         )
-        large_file_threshold = _bounded_int(
-            self.config.get("runtime.large_project_files", 2_000),
-            default=2_000,
+        large_file_threshold = self.config.get_int(
+            "runtime.large_project_files",
+            2_000,
             minimum=1,
             maximum=10_000_000,
         )
@@ -652,9 +652,9 @@ class TaskRouter:
 
     def _round_limit(self, mode: str) -> int:
         defaults = {"simple": 4, "standard": 8, "large": 16, "deep": 24}
-        configured = _bounded_int(
-            self.config.get("runtime.max_tool_rounds", 8),
-            default=8,
+        configured = self.config.get_int(
+            "runtime.max_tool_rounds",
+            8,
             minimum=1,
             maximum=10_000,
         )
@@ -664,9 +664,9 @@ class TaskRouter:
             rounds = configured
         else:
             rounds = max(defaults[mode], configured)
-        hard_limit = _bounded_int(
-            self.config.get("runtime.max_tool_rounds_hard_limit", 32),
-            default=32,
+        hard_limit = self.config.get_int(
+            "runtime.max_tool_rounds_hard_limit",
+            32,
             minimum=1,
             maximum=10_000,
         )
@@ -804,6 +804,8 @@ def _enum_value(value: Any, allowed: set[str], default: str) -> str:
 
 
 def _bounded_int(value: Any, *, default: int, minimum: int, maximum: int) -> int:
+    if isinstance(value, bool):
+        return default
     try:
         parsed = int(value)
     except (TypeError, ValueError, OverflowError):

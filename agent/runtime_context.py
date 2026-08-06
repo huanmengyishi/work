@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from .convergence import (
@@ -12,6 +13,9 @@ from .history_snip import HistorySnipper
 from .model_router import ModelRoute
 from .state import AgentState
 from .task_strategy import TaskStrategy
+
+
+logger = logging.getLogger(__name__)
 
 
 class RuntimeContextMixin:
@@ -62,6 +66,7 @@ class RuntimeContextMixin:
             return False
 
         messages[:] = result.messages
+        self._restore_static_context(state, messages)
         metadata = state.convergence if isinstance(state.convergence, dict) else {}
         state.convergence = metadata
         prior_count = metadata.get("history_snip_count", 0)
@@ -130,6 +135,33 @@ class RuntimeContextMixin:
                 phase=phase,
             )
         return history_result.changed
+
+    def _session_notes(self, state: AgentState) -> str:
+        builder = getattr(self, "session_memory_builder", None)
+        if builder is None:
+            return ""
+        try:
+            return str(builder.load(state.session_id) or "")
+        except Exception as exc:
+            logger.warning(
+                "session_notes_load_failed exception=%s errno=%s",
+                type(exc).__name__,
+                getattr(exc, "errno", None),
+            )
+            return ""
+
+    def _restore_static_context(
+        self,
+        state: AgentState,
+        messages: list[dict[str, Any]],
+        *,
+        session_notes: str | None = None,
+    ) -> bool:
+        restorer = getattr(self, "static_context_restorer", None)
+        if restorer is None:
+            return False
+        notes = self._session_notes(state) if session_notes is None else session_notes
+        return bool(restorer.restore(state, messages, session_notes=notes))
 
     def _compact_tool_batch(
         self,

@@ -10,9 +10,8 @@ from uuid import uuid4
 
 from .capability_health import CapabilityHealthManager
 from .config import AppConfig
-from .contracts import SessionStoreProtocol
+from .contracts import MemoryStoreProtocol, SessionStoreProtocol
 from .events import AuditEventSubscriber, Event, EventBus
-from .memory import MemoryStore
 from .memory_pipeline import MemoryPipeline
 from .optimizer import PerformanceAnalysisPipeline, PerformanceHistory
 from .paths import storage_key
@@ -58,7 +57,7 @@ class SessionEventPipeline:
 class MemoryUsageEventPipeline:
     """Record only Memory IDs that entered a ContextPackage."""
 
-    def __init__(self, memory: MemoryStore, events: EventBus) -> None:
+    def __init__(self, memory: MemoryStoreProtocol, events: EventBus) -> None:
         self.memory = memory
         events.subscribe(
             MEMORY_USAGE_RECORDED,
@@ -262,7 +261,7 @@ class RuntimeEventPipelines:
         config: AppConfig,
         project: Project,
         sessions: SessionStoreProtocol,
-        memory: MemoryStore,
+        memory: MemoryStoreProtocol,
         health: CapabilityHealthManager,
         events: EventBus,
         progress_handler: Any = None,

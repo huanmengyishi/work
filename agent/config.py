@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import difflib
+import logging
 import os
 import shlex
 from dataclasses import dataclass
@@ -11,6 +13,9 @@ import yaml
 
 from . import paths
 from .file_lock import lock_exclusive
+
+
+logger = logging.getLogger(__name__)
 
 
 DEFAULT_CONFIG: dict[str, Any] = {
@@ -67,6 +72,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "queue_stop_on_failure": True,
         "parallel_min_tasks": 8,
         "parallel_max_workers": 4,
+        "parallel_subprocess_timeout_seconds": 3_600,
         "capability_failure_threshold": 3,
         "convergence": {
             "enabled": True,
@@ -104,6 +110,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "python": {"enabled": True, "timeout_seconds": 120},
         "git": {"enabled": True, "timeout_seconds": 120},
         "document": {"enabled": True, "timeout_seconds": 180, "max_input_bytes": 25_000_000},
+        "document_generator": {"enabled": True, "timeout_seconds": 180},
         "ocr": {"enabled": True, "timeout_seconds": 180},
         "docker": {"enabled": True, "timeout_seconds": 180},
         "browser": {"enabled": True, "timeout_seconds": 180, "max_download_bytes": 100_000_000},
@@ -241,6 +248,7 @@ DEFAULT_TOOLS = {
         "allow_python": True,
         "allow_git": True,
         "allow_document": True,
+        "allow_document_generator": True,
         "allow_ocr": True,
         "allow_docker": True,
         "allow_browser": True,
@@ -250,6 +258,7 @@ DEFAULT_TOOLS = {
             "max_input_bytes": 25_000_000,
             "max_render_chars": 250_000,
         },
+        "document_generator": {"timeout_seconds": 180},
         "capabilities": {
             "shell": {
                 "run": {
@@ -290,6 +299,49 @@ DEFAULT_TOOLS = {
                     "timeout_seconds": 180,
                     "input": ["markdown"],
                     "output": ["docx-preview"],
+                },
+            },
+            "document_generator": {
+                "create_outline": {
+                    "enabled": True,
+                    "permissions": ["state"],
+                    "timeout_seconds": 180,
+                },
+                "confirm_outline": {
+                    "enabled": True,
+                    "permissions": ["state"],
+                    "timeout_seconds": 180,
+                    "requires_confirmation": True,
+                },
+                "next_chapter": {
+                    "enabled": True,
+                    "permissions": ["state"],
+                    "timeout_seconds": 180,
+                },
+                "save_chapter": {
+                    "enabled": True,
+                    "permissions": ["state"],
+                    "timeout_seconds": 180,
+                },
+                "rollback_chapter": {
+                    "enabled": True,
+                    "permissions": ["state"],
+                    "timeout_seconds": 180,
+                },
+                "status": {
+                    "enabled": True,
+                    "permissions": ["read"],
+                    "timeout_seconds": 180,
+                },
+                "render": {
+                    "enabled": True,
+                    "permissions": ["read", "write"],
+                    "timeout_seconds": 180,
+                },
+                "finalize": {
+                    "enabled": True,
+                    "permissions": ["read", "state"],
+                    "timeout_seconds": 180,
                 },
             },
             "ocr": {
@@ -400,9 +452,10 @@ DEFAULT_MCP = {
                 "name": "sqlite-example",
                 "enabled": False,
                 "transport": "stdio",
-                "command": str(paths.program_dir() / ".venv" / "bin" / "python"),
+                "command": "{python}",
                 "args": [
-                    str(paths.program_dir() / "scripts" / "mcp_sqlite_server.py"),
+                    "-m",
+                    "agent.tools.mcp_sqlite_server",
                     str(paths.data_dir() / "sqlite" / "mcp-example.db"),
                 ],
                 "tool_allowlist": ["sqlite_query", "sqlite_execute"],
@@ -430,13 +483,46 @@ class AppConfig:
     config_dir: Path
     data_dir: Path
 
-    def get(self, dotted: str, default: Any = None) -> Any:
+    def get(self, dotted: str, default: Any = None, *, warn_on_missing: bool = False) -> Any:
         cur: Any = self.values
         for part in dotted.split("."):
             if not isinstance(cur, dict) or part not in cur:
+                if warn_on_missing:
+                    logger.warning("config_missing_key key=%s", dotted)
                 return default
             cur = cur[part]
         return cur
+
+    def get_int(
+        self,
+        dotted: str,
+        default: int,
+        *,
+        minimum: int | None = None,
+        maximum: int | None = None,
+    ) -> int:
+        """Read one external integer safely and clamp it to explicit bounds."""
+
+        value = self.get(dotted, default)
+        if isinstance(value, bool):
+            parsed = default
+            valid = False
+        else:
+            try:
+                parsed = int(value)
+                valid = True
+            except (TypeError, ValueError, OverflowError):
+                parsed = default
+                valid = False
+        if not valid:
+            logger.warning("config_invalid_integer key=%s action=use_default", dotted)
+        if minimum is not None and parsed < minimum:
+            logger.warning("config_integer_below_minimum key=%s action=clamp", dotted)
+            parsed = minimum
+        if maximum is not None and parsed > maximum:
+            logger.warning("config_integer_above_maximum key=%s action=clamp", dotted)
+            parsed = maximum
+        return parsed
 
     @property
     def api_key(self) -> str | None:
@@ -474,6 +560,27 @@ def deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]
         else:
             merged[key] = value
     return merged
+
+
+def warn_unknown_config_keys(
+    values: dict[str, Any],
+    schema: dict[str, Any],
+    *,
+    source: str,
+    prefix: str = "",
+) -> None:
+    """Warn once per unknown mapping key without logging its configured value."""
+
+    for key, value in values.items():
+        dotted = f"{prefix}.{key}" if prefix else str(key)
+        if key not in schema:
+            suggestion = difflib.get_close_matches(str(key), [str(item) for item in schema], n=1, cutoff=0.72)
+            suffix = f" suggestion={suggestion[0]}" if suggestion else ""
+            logger.warning("config_unknown_key source=%s key=%s%s", source, dotted, suffix)
+            continue
+        expected = schema[key]
+        if isinstance(value, dict) and isinstance(expected, dict) and expected:
+            warn_unknown_config_keys(value, expected, source=source, prefix=dotted)
 
 
 def remove_default_shadows(
@@ -588,7 +695,7 @@ def migrate_http_activation(path: Path) -> None:
 
 
 def ensure_mcp_examples(path: Path) -> None:
-    """Add disabled built-in examples without changing existing MCP servers."""
+    """Add or safely migrate the exact disabled built-in SQLite example."""
     current = read_yaml(path)
     mcp = current.get("mcp")
     if not isinstance(mcp, dict):
@@ -597,14 +704,50 @@ def ensure_mcp_examples(path: Path) -> None:
     if not isinstance(servers, list):
         return
     example = DEFAULT_MCP["mcp"]["servers"][0]
-    if any(isinstance(item, dict) and item.get("name") == example["name"] for item in servers):
-        return
     updated = deep_merge({}, current)
-    updated["mcp"]["servers"] = [*servers, example]
+    replacement = list(servers)
+    matching_indexes = [
+        index for index, item in enumerate(servers) if isinstance(item, dict) and item.get("name") == example["name"]
+    ]
+    if matching_indexes:
+        index = matching_indexes[0]
+        item = servers[index]
+        if not isinstance(item, dict) or not _is_managed_sqlite_example(item, example):
+            return
+        if item == example:
+            return
+        replacement[index] = example
+    else:
+        replacement.append(example)
+    updated["mcp"]["servers"] = replacement
     temp = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
     with temp.open("w", encoding="utf-8") as fh:
         yaml.safe_dump(updated, fh, sort_keys=False, allow_unicode=True)
     temp.replace(path)
+
+
+def _is_managed_sqlite_example(value: dict[str, Any], current: dict[str, Any]) -> bool:
+    if (
+        value.get("name") != current.get("name")
+        or value.get("enabled") is not False
+        or value.get("transport") != "stdio"
+        or value.get("tool_allowlist") != current.get("tool_allowlist")
+        or value.get("env", {}) != {}
+        or value.get("env_passthrough", []) != []
+        or value.get("tool_overrides") != current.get("tool_overrides")
+    ):
+        return False
+    args = value.get("args")
+    if not isinstance(args, list):
+        return False
+    database = str(current.get("args", ["", "", ""])[-1])
+    packaged = len(args) == 3 and args[:2] == ["-m", "agent.tools.mcp_sqlite_server"]
+    legacy_script = (
+        len(args) == 2
+        and Path(str(args[0])).name == "mcp_sqlite_server.py"
+        and Path(str(args[0])).parent.name == "scripts"
+    )
+    return (packaged or legacy_script) and str(args[-1]) == database
 
 
 def ensure_secrets_file(path: Path) -> None:
@@ -638,15 +781,38 @@ def load_secrets_file(path: Path) -> None:
         os.environ[key] = value
 
 
+def _config_schemas() -> dict[str, dict[str, Any]]:
+    all_known = deep_merge(DEFAULT_CONFIG, DEFAULT_TOOLS)
+    all_known = deep_merge(all_known, DEFAULT_MEMORY)
+    all_known = deep_merge(all_known, DEFAULT_MCP)
+    all_known = deep_merge(all_known, {"model": {"api_key": None}})
+    model_schema = deep_merge({"model": DEFAULT_CONFIG["model"]}, {"model": {"api_key": None}})
+    tools_schema = deep_merge({"tools": DEFAULT_CONFIG["tools"]}, DEFAULT_TOOLS)
+    memory_schema = deep_merge({"memory": DEFAULT_CONFIG["memory"]}, DEFAULT_MEMORY)
+    return {
+        "config.yaml": all_known,
+        "model.yaml": model_schema,
+        "tools.yaml": tools_schema,
+        "memory.yaml": memory_schema,
+        "mcp.yaml": DEFAULT_MCP,
+    }
+
+
 def load_config() -> AppConfig:
     ensure_default_config()
     cfg = paths.config_dir()
     load_secrets_file(cfg / "secrets.env")
+    raw_files = {
+        filename: read_yaml(cfg / filename)
+        for filename in ("config.yaml", "model.yaml", "tools.yaml", "memory.yaml", "mcp.yaml")
+    }
+    for filename, raw in raw_files.items():
+        warn_unknown_config_keys(raw, _config_schemas()[filename], source=filename)
     values = dict(DEFAULT_CONFIG)
-    primary = read_yaml(cfg / "config.yaml")
+    primary = raw_files["config.yaml"]
     values = deep_merge(values, primary)
-    model_overlay = remove_default_shadows(read_yaml(cfg / "model.yaml"), primary, DEFAULT_CONFIG)
+    model_overlay = remove_default_shadows(raw_files["model.yaml"], primary, DEFAULT_CONFIG)
     values = deep_merge(values, model_overlay)
     for filename in ("tools.yaml", "memory.yaml", "mcp.yaml"):
-        values = deep_merge(values, read_yaml(cfg / filename))
+        values = deep_merge(values, raw_files[filename])
     return AppConfig(values=values, config_dir=cfg, data_dir=paths.data_dir())

@@ -4,6 +4,7 @@ import ast
 import fnmatch
 import hashlib
 import json
+import logging
 import os
 import re
 from dataclasses import dataclass, replace
@@ -12,6 +13,7 @@ from typing import TYPE_CHECKING, Any, Sequence
 from uuid import uuid4
 
 from .config import AppConfig
+from .events import sanitize_for_log
 from .project import Project
 from .timeutil import utc_now_iso
 from .workspace_memory import WorkspaceMemoryManager
@@ -19,6 +21,9 @@ from .workspace_memory import WorkspaceMemoryManager
 if TYPE_CHECKING:
     from .memory import MemoryItem
     from .state import AgentState
+
+
+logger = logging.getLogger(__name__)
 
 
 CONTEXT_FILENAMES = (
@@ -134,6 +139,7 @@ class ContextPackage:
 
 
 class ContextBuilder:
+    MAX_WALK_ERROR_WARNINGS = 8
     SECTION_LIMITS = {
         "task": 8_000,
         "project_instructions": 12_000,
@@ -215,9 +221,11 @@ class ContextBuilder:
             raise ValueError("context package max_chars must be positive")
 
         original_user_request = str(request.state.user_request)
-        request_limit = self._positive_limit(
-            self.config.get("context.max_user_request_chars", 32_000),
-            default=32_000,
+        request_limit = self.config.get_int(
+            "context.max_user_request_chars",
+            32_000,
+            minimum=1,
+            maximum=1_000_000,
         )
         request_budget = min(request_limit, max(1, max_chars // 2))
         bounded_user_request = self._head_tail(original_user_request, request_budget)
@@ -291,11 +299,39 @@ class ContextBuilder:
         )
 
     def _scan_files(self, project: Project) -> list[dict[str, Any]]:
-        max_files = int(self.config.get("context.max_files", 5000))
-        max_file_size = int(self.config.get("context.max_index_file_bytes", 1_000_000))
+        max_files = self.config.get_int("context.max_files", 5_000, minimum=1, maximum=100_000)
+        max_file_size = self.config.get_int(
+            "context.max_index_file_bytes",
+            1_000_000,
+            minimum=1,
+            maximum=100_000_000,
+        )
         patterns = self._ignore_patterns(project)
         records: list[dict[str, Any]] = []
-        for current, dirs, files in os.walk(project.root, followlinks=False):
+        walk_error_count = 0
+
+        def on_walk_error(error: OSError) -> None:
+            nonlocal walk_error_count
+            if walk_error_count < self.MAX_WALK_ERROR_WARNINGS:
+                raw_path = str(error.filename or "[unknown]")
+                safe_path = str(sanitize_for_log(raw_path))
+                error_name = type(error).__name__[:80]
+                error_number = error.errno if isinstance(error.errno, int) else "unknown"
+                logger.warning(
+                    "context scan skipped inaccessible path type=%s errno=%s path=%s",
+                    error_name,
+                    error_number,
+                    safe_path,
+                )
+            elif walk_error_count == self.MAX_WALK_ERROR_WARNINGS:
+                logger.warning("additional context scan path errors suppressed")
+            walk_error_count += 1
+
+        for current, dirs, files in os.walk(
+            project.root,
+            followlinks=False,
+            onerror=on_walk_error,
+        ):
             current_path = Path(current)
             rel_dir = current_path.relative_to(project.root).as_posix()
             dirs[:] = sorted(
@@ -336,7 +372,12 @@ class ContextBuilder:
         fingerprint: str,
     ) -> dict[str, Any]:
         source_records = [item for item in records if item["suffix"] in SOURCE_SUFFIXES]
-        max_symbol_files = int(self.config.get("context.max_symbol_files", 500))
+        max_symbol_files = self.config.get_int(
+            "context.max_symbol_files",
+            500,
+            minimum=1,
+            maximum=10_000,
+        )
         symbols: list[dict[str, Any]] = []
         for item in source_records[:max_symbol_files]:
             symbols.extend(self._extract_symbols(project.root / item["path"], item["path"]))
@@ -378,8 +419,18 @@ class ContextBuilder:
         semantic_index: dict[str, Any] | None = None,
         workspace_memory: dict[str, Any] | None = None,
     ) -> tuple[str, list[str], tuple[ContextSection, ...]]:
-        max_total = int(self.config.get("context.max_prompt_chars", 32_000))
-        max_per_file = int(self.config.get("context.max_context_file_chars", 8_000))
+        max_total = self.config.get_int(
+            "context.max_prompt_chars",
+            32_000,
+            minimum=1,
+            maximum=1_000_000,
+        )
+        max_per_file = self.config.get_int(
+            "context.max_context_file_chars",
+            8_000,
+            minimum=1,
+            maximum=1_000_000,
+        )
         summary_content = "\n".join(
             [
                 f"- Project ID: `{project.id}`",
@@ -771,18 +822,14 @@ class ContextBuilder:
             "recovery": "context.max_recovery_context_chars",
         }
         default = self.SECTION_LIMITS.get(key, fallback)
-        configured = self.config.get(config_keys[key], default) if key in config_keys else default
-        try:
-            return max(0, int(configured))
-        except (TypeError, ValueError, OverflowError):
-            return default
-
-    @staticmethod
-    def _positive_limit(value: Any, *, default: int) -> int:
-        try:
-            return max(1, int(value))
-        except (TypeError, ValueError, OverflowError):
-            return default
+        if key not in config_keys:
+            return min(1_000_000, max(0, default))
+        return self.config.get_int(
+            config_keys[key],
+            default,
+            minimum=0,
+            maximum=1_000_000,
+        )
 
     @classmethod
     def _fit_section(cls, section: ContextSection, max_chars: int) -> ContextSection:
@@ -876,25 +923,38 @@ class ContextBuilder:
     ) -> dict[str, Any]:
         path = project.agent_dir / "index.semantic.json"
         old = self._read_json(path)
-        if not refresh and old.get("fingerprint") == fingerprint:
+        old_is_valid = old.get("enabled") is True
+        if not refresh and old_is_valid and old.get("fingerprint") == fingerprint:
             old["cache_hit"] = True
             return old
         try:
             from tree_sitter_language_pack import ProcessConfig, process
         except Exception as exc:
+            diagnostic = str(sanitize_for_log(f"{type(exc).__name__}: {exc}"))
             value = {
                 "schema_version": 1,
                 "enabled": False,
-                "reason": f"tree-sitter language pack unavailable: {exc}",
+                "reason": f"tree-sitter language pack unavailable: {diagnostic}",
                 "fingerprint": fingerprint,
                 "generated_at": utc_now_iso(),
             }
-            self._write_json(path, value)
+            # Preserve a previously valid sidecar.  It may be stale for this
+            # build, so return the bounded unavailable projection instead of
+            # rendering it, but leave it available for inspection and retry
+            # the optional dependency on the next Context build.  A disabled
+            # sidecar is also retried even when its fingerprint is unchanged.
+            if not old_is_valid:
+                self._write_json(path, value)
             return value
 
         allowed = self.config.get("context.semantic_languages", [])
         allowed_languages = {str(item) for item in allowed} if isinstance(allowed, list) else set()
-        max_files = int(self.config.get("context.max_symbol_files", 500))
+        max_files = self.config.get_int(
+            "context.max_symbol_files",
+            500,
+            minimum=1,
+            maximum=10_000,
+        )
         files: list[dict[str, Any]] = []
         failures: list[dict[str, str]] = []
         for record in records:

@@ -13,13 +13,25 @@ from dataclasses import dataclass
 from typing import Any
 
 from ..config import AppConfig
-from .registry import ToolCapability
+from .registry import MAX_CAPABILITY_TIMEOUT_SECONDS, ToolCapability
 
 
 @dataclass(frozen=True)
 class CapabilityDeclaration:
     capability: ToolCapability
     handler_name: str
+
+
+DOCUMENT_GENERATOR_MODEL_NAMES = {
+    "create_outline": "document_generator_create_outline",
+    "confirm_outline": "document_generator_confirm_outline",
+    "next_chapter": "document_generator_next_chapter",
+    "save_chapter": "document_generator_save_chapter",
+    "rollback_chapter": "document_generator_rollback_chapter",
+    "status": "document_generator_status",
+    "render": "document_generator_render",
+    "finalize": "document_generator_finalize",
+}
 
 
 def _declare(
@@ -79,6 +91,10 @@ def _lsp_availability() -> tuple[bool, str]:
         engines = [name for name, path in (("Pyright", pyright), ("TypeScript", tsc)) if path]
         return True, f"available diagnostics engines: {', '.join(engines)}"
     return False, "missing diagnostics engine: pyright, tsc"
+
+
+def _timeout(config: AppConfig, dotted: str, default: int, *, maximum: int = MAX_CAPABILITY_TIMEOUT_SECONDS) -> int:
+    return config.get_int(dotted, default, minimum=1, maximum=maximum)
 
 
 def builtin_capability_declarations(
@@ -251,7 +267,7 @@ def builtin_capability_declarations(
                 "path": {"type": "string"},
             },
             permissions=("read", "execute"),
-            timeout_seconds=int(config.get("tools.template.timeout_seconds", 300)),
+            timeout_seconds=_timeout(config, "tools.template.timeout_seconds", 300),
         ),
         _declare(
             "_shell_run",
@@ -262,7 +278,7 @@ def builtin_capability_declarations(
             {"command": {"type": "string"}, "cwd": cwd_property, "timeout": timeout_property},
             ("command",),
             ("read", "write", "execute"),
-            int(config.get("tools.shell.timeout_seconds", 120)),
+            _timeout(config, "tools.shell.timeout_seconds", 120),
             available=shutil.which("bash") is not None,
             unavailable_reason="bash is not installed",
             requires_confirmation=True,
@@ -276,7 +292,7 @@ def builtin_capability_declarations(
             {"code": {"type": "string"}, "cwd": cwd_property, "timeout": timeout_property},
             ("code",),
             ("read", "write", "execute"),
-            int(config.get("tools.python.timeout_seconds", 120)),
+            _timeout(config, "tools.python.timeout_seconds", 120),
             requires_confirmation=True,
         ),
         _declare(
@@ -339,7 +355,7 @@ def builtin_capability_declarations(
             {"path": {"type": "string"}, "ocr": {"type": "boolean"}},
             ("path",),
             ("read",),
-            int(config.get("tools.document.timeout_seconds", 180)),
+            _timeout(config, "tools.document.timeout_seconds", 180),
             input_formats=("text", "pdf", "image", "word"),
             output_formats=("markdown",),
         ),
@@ -356,9 +372,160 @@ def builtin_capability_declarations(
             },
             ("path", "title", "markdown"),
             ("write",),
-            int(config.get("tools.document.timeout_seconds", 180)),
+            _timeout(config, "tools.document.timeout_seconds", 180),
             input_formats=("markdown",),
             output_formats=("docx-preview",),
+        ),
+        _declare(
+            "_document_generator_create_outline",
+            "document_generator",
+            "create_outline",
+            DOCUMENT_GENERATOR_MODEL_NAMES["create_outline"],
+            (
+                "Create a bounded, durable large-document outline with per-chapter token estimates. "
+                "This does not call a model or write the final output; confirm the returned outline hash before drafting."
+            ),
+            {
+                "title": {"type": "string", "minLength": 1, "maxLength": 500},
+                "output_path": {"type": "string", "minLength": 1, "maxLength": 4096},
+                "chapters": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 64,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "id": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 64,
+                                "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$",
+                            },
+                            "title": {"type": "string", "minLength": 1, "maxLength": 300},
+                            "estimated_tokens": {"type": "integer", "minimum": 1, "maximum": 100000},
+                        },
+                        "required": ["id", "title", "estimated_tokens"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            ("title", "output_path", "chapters"),
+            ("state",),
+            _timeout(config, "tools.document_generator.timeout_seconds", 180),
+            input_formats=("outline",),
+            output_formats=("document-workflow",),
+        ),
+        _declare(
+            "_document_generator_confirm_outline",
+            "document_generator",
+            "confirm_outline",
+            DOCUMENT_GENERATOR_MODEL_NAMES["confirm_outline"],
+            "Request user approval for the exact durable outline hash before any chapter drafting begins.",
+            {
+                "workflow_id": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
+                "outline_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+            },
+            ("workflow_id", "outline_hash"),
+            ("state",),
+            _timeout(config, "tools.document_generator.timeout_seconds", 180),
+            requires_confirmation=True,
+        ),
+        _declare(
+            "_document_generator_next_chapter",
+            "document_generator",
+            "next_chapter",
+            DOCUMENT_GENERATOR_MODEL_NAMES["next_chapter"],
+            "Start or resume exactly one chapter and return only its bounded independent drafting context.",
+            {"workflow_id": {"type": "string", "pattern": "^[0-9a-f]{32}$"}},
+            ("workflow_id",),
+            ("state",),
+            _timeout(config, "tools.document_generator.timeout_seconds", 180),
+        ),
+        _declare(
+            "_document_generator_save_chapter",
+            "document_generator",
+            "save_chapter",
+            DOCUMENT_GENERATOR_MODEL_NAMES["save_chapter"],
+            "Checkpoint exactly the current chapter and its bounded summary for process-independent resume.",
+            {
+                "workflow_id": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
+                "chapter_id": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 64,
+                    "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$",
+                },
+                "markdown": {"type": "string", "minLength": 1, "maxLength": 100000},
+                "summary": {"type": "string", "minLength": 1, "maxLength": 2000},
+            },
+            ("workflow_id", "chapter_id", "markdown", "summary"),
+            ("state",),
+            _timeout(config, "tools.document_generator.timeout_seconds", 180),
+            input_formats=("markdown",),
+            output_formats=("chapter-checkpoint",),
+        ),
+        _declare(
+            "_document_generator_rollback_chapter",
+            "document_generator",
+            "rollback_chapter",
+            DOCUMENT_GENERATOR_MODEL_NAMES["rollback_chapter"],
+            "Roll back only the current in-progress chapter; completed chapter checkpoints remain unchanged.",
+            {
+                "workflow_id": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
+                "chapter_id": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 64,
+                    "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$",
+                },
+            },
+            ("workflow_id", "chapter_id"),
+            ("state",),
+            _timeout(config, "tools.document_generator.timeout_seconds", 180),
+        ),
+        _declare(
+            "_document_generator_status",
+            "document_generator",
+            "status",
+            DOCUMENT_GENERATOR_MODEL_NAMES["status"],
+            "Read bounded chapter progress and whether the rendered FileEdit preview has been applied.",
+            {"workflow_id": {"type": "string", "pattern": "^[0-9a-f]{32}$"}},
+            ("workflow_id",),
+            ("read",),
+            _timeout(config, "tools.document_generator.timeout_seconds", 180),
+            output_formats=("document-workflow",),
+        ),
+        _declare(
+            "_document_generator_render",
+            "document_generator",
+            "render",
+            DOCUMENT_GENERATOR_MODEL_NAMES["render"],
+            (
+                "Assemble verified chapter checkpoints into a FileEdit preview. This never writes the final output; "
+                "apply the returned preview_id with file_apply. For Word output, re-open it with document_parse, "
+                "then call document_generator_finalize."
+            ),
+            {"workflow_id": {"type": "string", "pattern": "^[0-9a-f]{32}$"}},
+            ("workflow_id",),
+            ("read", "write"),
+            _timeout(config, "tools.document_generator.timeout_seconds", 180),
+            input_formats=("chapter-checkpoints",),
+            output_formats=("markdown-preview", "docx-preview"),
+        ),
+        _declare(
+            "_document_generator_finalize",
+            "document_generator",
+            "finalize",
+            DOCUMENT_GENERATOR_MODEL_NAMES["finalize"],
+            (
+                "Verify the applied output hash matches the rendered FileEdit preview and mark the workflow complete. "
+                "Word output must have a matching managed document_parse receipt created after file_apply."
+            ),
+            {"workflow_id": {"type": "string", "pattern": "^[0-9a-f]{32}$"}},
+            ("workflow_id",),
+            ("read", "state"),
+            _timeout(config, "tools.document_generator.timeout_seconds", 180),
+            output_formats=("document-workflow",),
         ),
         _declare(
             "_document_parse",
@@ -369,7 +536,7 @@ def builtin_capability_declarations(
             {"path": {"type": "string"}, "ocr": {"type": "boolean"}},
             ("path",),
             ("read",),
-            int(config.get("tools.ocr.timeout_seconds", 180)),
+            _timeout(config, "tools.ocr.timeout_seconds", 180),
             input_formats=("pdf", "png", "jpg", "jpeg", "tiff", "webp"),
             output_formats=("markdown",),
         ),
@@ -382,7 +549,7 @@ def builtin_capability_declarations(
             {"args": {"type": "array", "items": {"type": "string"}}},
             ("args",),
             ("read", "write", "execute"),
-            int(config.get("tools.docker.timeout_seconds", 180)),
+            _timeout(config, "tools.docker.timeout_seconds", 180),
             available=shutil.which("docker") is not None,
             unavailable_reason="docker CLI/engine is not installed or not on PATH",
             requires_confirmation=True,
@@ -396,7 +563,7 @@ def builtin_capability_declarations(
             {"url": {"type": "string"}, "session_name": {"type": "string"}},
             ("url",),
             ("network", "read"),
-            int(config.get("tools.browser.timeout_seconds", 180)),
+            _timeout(config, "tools.browser.timeout_seconds", 180),
             available=playwright_available,
             unavailable_reason="the Playwright Python package is not installed",
         ),
@@ -414,7 +581,7 @@ def builtin_capability_declarations(
             },
             ("url", "selector"),
             ("network", "write"),
-            int(config.get("tools.browser.timeout_seconds", 180)),
+            _timeout(config, "tools.browser.timeout_seconds", 180),
             available=playwright_available,
             unavailable_reason="the Playwright Python package is not installed",
         ),
@@ -458,7 +625,7 @@ def builtin_capability_declarations(
             },
             ("url",),
             ("network", "read", "write"),
-            min(int(config.get("tools.http.timeout_seconds", 30)), 30),
+            _timeout(config, "tools.http.timeout_seconds", 30, maximum=30),
             requires_confirmation=True,
         ),
         _declare(
@@ -469,7 +636,7 @@ def builtin_capability_declarations(
             "Run bounded Python, JavaScript, or TypeScript diagnostics and return file/line messages.",
             {"path": {"type": "string"}},
             permissions=("read", "execute"),
-            timeout_seconds=int(config.get("tools.lsp.timeout_seconds", 60)),
+            timeout_seconds=_timeout(config, "tools.lsp.timeout_seconds", 60),
             available=lsp_available,
             unavailable_reason=lsp_reason,
         ),
@@ -626,4 +793,8 @@ def builtin_capability_declarations(
     )
 
 
-__all__ = ["CapabilityDeclaration", "builtin_capability_declarations"]
+__all__ = [
+    "CapabilityDeclaration",
+    "DOCUMENT_GENERATOR_MODEL_NAMES",
+    "builtin_capability_declarations",
+]

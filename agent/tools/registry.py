@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+import logging
 from typing import Any, Callable
 from uuid import uuid4
 
@@ -9,6 +10,8 @@ from .base import ToolRequest, ToolResult
 
 
 ToolHandler = Callable[..., ToolResult]
+logger = logging.getLogger(__name__)
+MAX_CAPABILITY_TIMEOUT_SECONDS = 86_400
 
 
 @dataclass(frozen=True)
@@ -138,7 +141,11 @@ class ToolCapabilityRegistry:
         return replace(
             capability,
             enabled=base_enabled and legacy_enabled and bool(override.get("enabled", capability.enabled)),
-            timeout_seconds=int(override.get("timeout_seconds", capability.timeout_seconds)),
+            timeout_seconds=self._timeout_seconds(
+                override.get("timeout_seconds"),
+                default=capability.timeout_seconds,
+                capability=capability.name,
+            ),
             supports_stream=bool(override.get("supports_stream", capability.supports_stream)),
             permissions=tuple(str(item) for item in permissions),
             input_formats=self._string_tuple(override.get("input", capability.input_formats)),
@@ -151,3 +158,23 @@ class ToolCapabilityRegistry:
         if not isinstance(value, (list, tuple)):
             return ()
         return tuple(str(item) for item in value)
+
+    @staticmethod
+    def _timeout_seconds(value: Any, *, default: int, capability: str) -> int:
+        if value is None:
+            return default
+        if isinstance(value, bool):
+            logger.warning("capability_invalid_timeout capability=%s action=use_default", capability)
+            return default
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError, OverflowError):
+            logger.warning("capability_invalid_timeout capability=%s action=use_default", capability)
+            return default
+        if parsed < 1:
+            logger.warning("capability_invalid_timeout capability=%s action=use_default", capability)
+            return default
+        if parsed > MAX_CAPABILITY_TIMEOUT_SECONDS:
+            logger.warning("capability_timeout_above_limit capability=%s action=clamp", capability)
+            return MAX_CAPABILITY_TIMEOUT_SECONDS
+        return parsed
